@@ -57,6 +57,28 @@ class MaterialInfo:
     duration: int = 0
 
 
+@pydantic.dataclasses.dataclass(config=_Config)
+class ProviderVideoCandidate:
+    """Rich provider result shared by scene retrieval and the legacy path."""
+
+    provider: str
+    provider_video_id: str
+    provider_page_url: str = ""
+    preview_url: str = ""
+    url: str = ""
+    duration: float = 0
+    width: int = 0
+    height: int = 0
+    provider_rank: int = 0
+
+    def to_material_info(self) -> MaterialInfo:
+        return MaterialInfo(
+            provider=self.provider,
+            url=self.url,
+            duration=int(self.duration),
+        )
+
+
 class VideoParams(BaseModel):
     """
     {
@@ -87,7 +109,7 @@ class VideoParams(BaseModel):
     video_materials: Optional[List[MaterialInfo]] = (
         None  # Materials used to generate the video
     )
-    
+
     custom_audio_file: Optional[str] = None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles
     video_language: Optional[str] = ""  # auto detect
 

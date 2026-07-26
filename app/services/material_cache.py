@@ -14,12 +14,13 @@ from typing import Iterable
 
 from loguru import logger
 
-from app.models.schema import MaterialInfo, VideoAspect
+from app.models.schema import MaterialInfo, ProviderVideoCandidate, VideoAspect
 from app.utils import utils
 
 
 MATERIAL_SEARCH_CACHE_TTL_SECONDS = 24 * 60 * 60
 _CACHE_FORMAT_VERSION = 1
+_RICH_CACHE_FORMAT_VERSION = 2
 _CACHE_CLEANUP_INTERVAL_SECONDS = 60 * 60
 _CACHE_FILE_PATTERN = re.compile(r"^[0-9a-f]{64}\.json$")
 
@@ -164,7 +165,8 @@ def load_material_search_cache(
 
         if (
             not isinstance(payload, dict)
-            or payload.get("version") != _CACHE_FORMAT_VERSION
+            or payload.get("version")
+            not in (_CACHE_FORMAT_VERSION, _RICH_CACHE_FORMAT_VERSION)
             or not isinstance(payload.get("items"), list)
             or not payload["items"]
         ):
@@ -196,8 +198,7 @@ def load_material_search_cache(
             )
     except (OSError, ValueError, TypeError) as exc:
         logger.warning(
-            f"failed to load material search cache: "
-            f"file={cache_path.name}, error={exc}"
+            f"failed to load material search cache: file={cache_path.name}, error={exc}"
         )
         _remove_invalid_cache(cache_path)
         return None
@@ -207,6 +208,96 @@ def load_material_search_cache(
         f"term={search_term!r}, items={len(items)}"
     )
     return items
+
+
+def load_material_candidate_search_cache(
+    provider: str,
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect | str,
+    *,
+    now: float | None = None,
+) -> list[ProviderVideoCandidate] | None:
+    """Load rich v2 results; a valid legacy v1 entry is an upgrade-only miss."""
+    cache_path = _cache_path(provider, search_term, minimum_duration, video_aspect)
+    try:
+        stat_result = cache_path.stat()
+    except (FileNotFoundError, OSError):
+        return None
+    current_time = time.time() if now is None else now
+    age = current_time - stat_result.st_mtime
+    if age < 0 or age >= MATERIAL_SEARCH_CACHE_TTL_SECONDS:
+        _remove_invalid_cache(cache_path)
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        if payload.get("version") == 1:
+            # Do not delete or rewrite it: legacy callers can still use it.
+            return None
+        if payload.get("version") != _RICH_CACHE_FORMAT_VERSION or not payload.get(
+            "items"
+        ):
+            raise ValueError("invalid rich cache payload")
+        return [ProviderVideoCandidate(**item) for item in payload["items"]]
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning(f"failed to load rich material search cache: {exc}")
+        _remove_invalid_cache(cache_path)
+        return None
+
+
+def save_material_candidate_search_cache(
+    provider: str,
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect | str,
+    items: Iterable[ProviderVideoCandidate],
+) -> bool:
+    """Atomically publish rich results using the existing cache key and path."""
+    serialized = [
+        {
+            "provider": item.provider,
+            "provider_video_id": item.provider_video_id,
+            "provider_page_url": item.provider_page_url,
+            "preview_url": item.preview_url,
+            "url": item.url,
+            "duration": item.duration,
+            "width": item.width,
+            "height": item.height,
+            "provider_rank": item.provider_rank,
+        }
+        for item in items
+        if item.url and item.duration > 0
+    ]
+    if not serialized:
+        return False
+    cache_path = _cache_path(provider, search_term, minimum_duration, video_aspect)
+    cleanup_expired_material_search_cache()
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=cache_path.parent,
+            prefix=f".{cache_path.stem}-",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            json.dump(
+                {"version": _RICH_CACHE_FORMAT_VERSION, "items": serialized},
+                temp_file,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, cache_path)
+        return True
+    except Exception as exc:
+        logger.warning(f"failed to save rich material search cache: {exc}")
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        return False
 
 
 def save_material_search_cache(

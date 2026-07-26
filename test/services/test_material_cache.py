@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from app.models.schema import MaterialInfo, VideoAspect
+from app.models.schema import MaterialInfo, ProviderVideoCandidate, VideoAspect
 from app.services import material, material_cache
 
 
@@ -60,6 +60,70 @@ class TestMaterialSearchCache(unittest.TestCase):
         self.assertEqual(loaded[0].provider, "pixabay")
         self.assertEqual(loaded[0].url, "https://example.com/video.mp4")
         self.assertEqual(loaded[0].duration, 12)
+
+    def test_rich_v2_cache_is_reused_by_legacy_loader(self):
+        candidate = ProviderVideoCandidate(
+            provider="pixabay",
+            provider_video_id="42",
+            provider_page_url="https://pixabay.test/videos/42",
+            preview_url="https://pixabay.test/preview.jpg",
+            url="https://example.com/video.mp4",
+            duration=12,
+            width=1080,
+            height=1920,
+            provider_rank=1,
+        )
+        self.assertTrue(
+            material_cache.save_material_candidate_search_cache(
+                provider="pixabay",
+                search_term="nature",
+                minimum_duration=5,
+                video_aspect=VideoAspect.portrait,
+                items=[candidate],
+            )
+        )
+
+        rich = material_cache.load_material_candidate_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+        )
+        legacy = material_cache.load_material_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+        )
+
+        self.assertEqual(rich[0].provider_video_id, "42")
+        self.assertEqual(legacy, [self._item()])
+
+    def test_legacy_v1_is_hit_for_legacy_but_upgrade_miss_for_rich(self):
+        material_cache.save_material_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+            items=[self._item()],
+        )
+
+        legacy = material_cache.load_material_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+        )
+        rich = material_cache.load_material_candidate_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+        )
+
+        self.assertEqual(legacy, [self._item()])
+        self.assertIsNone(rich)
+        self.assertTrue(self._cache_path().exists())
 
     def test_expired_cache_is_removed_and_treated_as_miss(self):
         """

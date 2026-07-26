@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import re
@@ -19,6 +20,7 @@ from app.services import (
     elevenlabs_music,
     llm,
     material,
+    scene_candidate,
     scene_timeline,
     sonilo,
     subtitle,
@@ -1175,6 +1177,7 @@ def _run_pipeline(
     # timeline before any material provider is consulted.  The disabled path is
     # intentionally untouched for backward-compatible task state/results.
     scene_timeline_path = ""
+    scene_candidates_path = ""
     if params.match_materials_to_script:
         scene_timeline_path = scene_timeline.create_scene_timeline(
             task_dir=utils.task_dir(task_id),
@@ -1183,6 +1186,27 @@ def _run_pipeline(
             subtitle_path=subtitle_path,
             max_clip_duration=params.video_clip_duration,
         )
+        if params.video_source in scene_candidate.SUPPORTED_SOURCES:
+            try:
+                with open(scene_timeline_path, encoding="utf-8") as timeline_file:
+                    timeline_data = json.load(timeline_file)
+                scenes = [
+                    scene_timeline.NarrationScene.model_validate(item)
+                    for item in timeline_data
+                ]
+                scene_candidates_path = scene_candidate.retrieve_scene_candidates(
+                    task_dir=utils.task_dir(task_id),
+                    video_subject=params.video_subject,
+                    scenes=scenes,
+                    source=params.video_source,
+                    video_aspect=params.video_aspect,
+                    minimum_duration=params.video_clip_duration,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "scene candidate preparation failed; continuing with the "
+                    f"existing material path: {type(exc).__name__}: {exc}"
+                )
 
     # 5. Get video materials
     downloaded_videos = get_video_materials(
@@ -1199,6 +1223,8 @@ def _run_pipeline(
         material_result = {"materials": downloaded_videos}
         if scene_timeline_path:
             material_result["scene_timeline_path"] = scene_timeline_path
+        if scene_candidates_path:
+            material_result["scene_candidates_path"] = scene_candidates_path
         sm.state.update_task(
             task_id, state=const.TASK_STATE_COMPLETE, progress=100, **material_result
         )
@@ -1267,6 +1293,8 @@ def _run_pipeline(
     }
     if scene_timeline_path:
         kwargs["scene_timeline_path"] = scene_timeline_path
+    if scene_candidates_path:
+        kwargs["scene_candidates_path"] = scene_candidates_path
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )

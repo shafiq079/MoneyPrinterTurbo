@@ -9,7 +9,12 @@ from loguru import logger
 from moviepy.video.io.VideoFileClip import VideoFileClip
 
 from app.config import config
-from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
+from app.models.schema import (
+    MaterialInfo,
+    ProviderVideoCandidate,
+    VideoAspect,
+    VideoConcatMode,
+)
 from app.services import material_cache
 from app.utils import utils
 
@@ -97,6 +102,19 @@ def search_videos_pexels(
     minimum_duration: int,
     video_aspect: VideoAspect = VideoAspect.portrait,
 ) -> List[MaterialInfo]:
+    return [
+        item.to_material_info()
+        for item in search_video_candidates_pexels(
+            search_term, minimum_duration, video_aspect
+        )
+    ]
+
+
+def search_video_candidates_pexels(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+) -> List[ProviderVideoCandidate]:
     aspect = VideoAspect(video_aspect)
     video_orientation = aspect.name
     video_width, video_height = aspect.to_resolution()
@@ -125,7 +143,7 @@ def search_videos_pexels(
             return video_items
         videos = response["videos"]
         # loop through each video in the result
-        for v in videos:
+        for rank, v in enumerate(videos, start=1):
             duration = v["duration"]
             # check if video has desired minimum duration
             if duration < minimum_duration:
@@ -136,10 +154,18 @@ def search_videos_pexels(
                 w = int(video["width"])
                 h = int(video["height"])
                 if w == video_width and h == video_height:
-                    item = MaterialInfo()
-                    item.provider = "pexels"
-                    item.url = video["link"]
-                    item.duration = duration
+                    video_id = str(v.get("id") or utils.md5(video["link"]))
+                    item = ProviderVideoCandidate(
+                        provider="pexels",
+                        provider_video_id=video_id,
+                        provider_page_url=str(v.get("url") or ""),
+                        preview_url=str(v.get("image") or ""),
+                        url=video["link"],
+                        duration=duration,
+                        width=w,
+                        height=h,
+                        provider_rank=rank,
+                    )
                     video_items.append(item)
                     break
         return video_items
@@ -154,6 +180,19 @@ def search_videos_pixabay(
     minimum_duration: int,
     video_aspect: VideoAspect = VideoAspect.portrait,
 ) -> List[MaterialInfo]:
+    return [
+        item.to_material_info()
+        for item in search_video_candidates_pixabay(
+            search_term, minimum_duration, video_aspect
+        )
+    ]
+
+
+def search_video_candidates_pixabay(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+) -> List[ProviderVideoCandidate]:
     aspect = VideoAspect(video_aspect)
 
     video_width, video_height = aspect.to_resolution()
@@ -219,7 +258,7 @@ def search_videos_pixabay(
             return video_items
         videos = response["hits"]
         # loop through each video in the result
-        for v in videos:
+        for rank, v in enumerate(videos, start=1):
             duration = v["duration"]
             # check if video has desired minimum duration
             if duration < minimum_duration:
@@ -231,10 +270,24 @@ def search_videos_pixabay(
                 w = int(video["width"])
                 # h = int(video["height"])
                 if w >= video_width:
-                    item = MaterialInfo()
-                    item.provider = "pixabay"
-                    item.url = video["url"]
-                    item.duration = duration
+                    h = int(video.get("height") or video_height)
+                    video_id = str(v.get("id") or utils.md5(video["url"]))
+                    item = ProviderVideoCandidate(
+                        provider="pixabay",
+                        provider_video_id=video_id,
+                        provider_page_url=str(v.get("pageURL") or ""),
+                        preview_url=str(
+                            v.get("largeImageURL")
+                            or v.get("webformatURL")
+                            or v.get("previewURL")
+                            or ""
+                        ),
+                        url=video["url"],
+                        duration=duration,
+                        width=w,
+                        height=h,
+                        provider_rank=rank,
+                    )
                     video_items.append(item)
                     break
         return video_items
@@ -451,6 +504,46 @@ def _search_videos_with_cache(
                     f"provider={provider}, error={type(exc).__name__}, detail={exc}"
                 )
         return items
+
+
+def search_video_candidates_with_cache(
+    source: str,
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect,
+) -> tuple[List[ProviderVideoCandidate], bool]:
+    """Search rich provider metadata through the shared versioned cache."""
+    searches = {
+        "pexels": search_video_candidates_pexels,
+        "pixabay": search_video_candidates_pixabay,
+    }
+    remote_search = searches.get(source)
+    if remote_search is None:
+        return [], False
+    cache_args = {
+        "provider": source,
+        "search_term": search_term,
+        "minimum_duration": minimum_duration,
+        "video_aspect": video_aspect,
+    }
+    cached = material_cache.load_material_candidate_search_cache(**cache_args)
+    if cached is not None:
+        return cached, False
+    lock = material_cache.get_material_search_cache_lock(**cache_args)
+    with lock:
+        cached = material_cache.load_material_candidate_search_cache(**cache_args)
+        if cached is not None:
+            return cached, False
+        items = remote_search(
+            search_term=search_term,
+            minimum_duration=minimum_duration,
+            video_aspect=video_aspect,
+        )
+        if items:
+            material_cache.save_material_candidate_search_cache(
+                **cache_args, items=items
+            )
+        return items, True
 
 
 def download_videos(
