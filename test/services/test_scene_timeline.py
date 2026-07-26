@@ -33,7 +33,7 @@ def test_valid_srt_timestamps_and_multiline_text(tmp_path):
         "2\n00:00:02,500 --> 00:00:04,000\nLast scene\n",
     )
 
-    scenes = build_scenes("unused fallback", 5, subtitle, 10)
+    scenes = build_scenes("First line second line. Last scene.", 5, subtitle, 10)
 
     assert [(scene.start_time, scene.end_time, scene.text) for scene in scenes] == [
         (0.25, 2.0, "First line second line"),
@@ -46,7 +46,7 @@ def test_srt_without_trailing_blank_line_is_included(tmp_path):
     subtitle = write_srt(
         tmp_path, "1\n00:00:00,000 --> 00:00:01,000\nNo trailing blank"
     )
-    scenes = build_scenes("fallback", 2, subtitle)
+    scenes = build_scenes("No trailing blank", 2, subtitle)
     assert len(scenes) == 1
     assert scenes[0].text == "No trailing blank"
 
@@ -61,7 +61,7 @@ def test_malformed_zero_reversed_negative_and_overlapping_entries_are_safe(tmp_p
         "5\n00:00:01,000 --> 00:00:03,000\nGood\n\n"
         "6\n00:00:02,000 --> 00:00:04,000\nOverlap trimmed\n",
     )
-    scenes = build_scenes("fallback text", 4, subtitle, 10)
+    scenes = build_scenes("Good. Overlap trimmed.", 4, subtitle, 10)
     assert [(scene.text, scene.start_time, scene.end_time) for scene in scenes] == [
         ("Good", 1.0, 3.0),
         ("Overlap trimmed", 3.0, 4.0),
@@ -84,13 +84,59 @@ def test_long_segment_is_split_to_maximum_clip_duration(tmp_path):
         "1\n00:00:00,000 --> 00:00:12,000\n"
         "one two three four five six seven eight nine\n",
     )
-    scenes = build_scenes("unused", 12, subtitle, 5)
+    scenes = build_scenes(
+        "one two three four five six seven eight nine", 12, subtitle, 5
+    )
     assert len(scenes) == 3
     assert " ".join(scene.text for scene in scenes) == (
         "one two three four five six seven eight nine"
     )
     assert max(scene.duration for scene in scenes) <= 5
     assert_valid_timeline(scenes, 12)
+
+
+def test_uneven_word_lengths_never_exceed_maximum_clip_duration(tmp_path):
+    text = "a extraordinarilylongword another tiny word"
+    subtitle = write_srt(tmp_path, f"1\n00:00:00,000 --> 00:00:10,000\n{text}\n")
+
+    scenes = build_scenes(text, 10, subtitle, 3)
+
+    assert len(scenes) == 4
+    assert all(scene.duration <= 3 for scene in scenes)
+    assert " ".join(scene.text for scene in scenes) == text
+    assert_valid_timeline(scenes, 10)
+
+
+def test_indivisible_short_text_still_honors_maximum_clip_duration():
+    scenes = build_scenes("好", 10, max_clip_duration=3)
+
+    assert len(scenes) == 4
+    assert all(scene.duration <= 3 for scene in scenes)
+    assert "".join(scene.text for scene in scenes) == "好"
+    assert scenes[-1].end_time == 10
+
+
+def test_partially_valid_srt_falls_back_without_losing_narration(tmp_path):
+    narration = "Opening scene. Missing middle narration. Closing scene."
+    subtitle = write_srt(
+        tmp_path,
+        "1\n00:00:00,000 --> 00:00:02,000\nOpening scene\n\n"
+        "2\nmalformed timestamp\nMissing middle narration\n",
+    )
+
+    scenes = build_scenes(narration, 9, subtitle, 10)
+
+    assert [scene.text for scene in scenes] == [
+        "Opening scene",
+        "Missing middle narration",
+        "Closing scene",
+    ]
+    assert "".join(
+        character for scene in scenes for character in scene.text if character.isalnum()
+    ) == ("".join(character for character in narration if character.isalnum()))
+    assert scenes[0].start_time == 0
+    assert scenes[-1].end_time == 9
+    assert_valid_timeline(scenes, 9)
 
 
 def test_unspaced_multilingual_text_splits_without_losing_order():

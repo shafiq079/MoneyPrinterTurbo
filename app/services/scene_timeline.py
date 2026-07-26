@@ -45,6 +45,14 @@ def _text_weight(text: str) -> int:
     return max(len(re.sub(r"\s+", "", text)), 1)
 
 
+def _canonical_text(text: str) -> str:
+    """Normalize spoken content for complete-subtitle validation."""
+    normalized = utils.normalize_script_for_subtitle_matching(text)
+    return "".join(
+        character.casefold() for character in normalized if character.isalnum()
+    )
+
+
 def _split_text(text: str, count: int) -> list[str]:
     """Split text into ordered, approximately equal pieces.
 
@@ -57,7 +65,6 @@ def _split_text(text: str, count: int) -> list[str]:
 
     words = text.split()
     units = words if len(words) >= count else list(text.replace(" ", ""))
-    count = min(count, len(units))
     chunks: list[str] = []
     start = 0
     for part in range(count):
@@ -65,7 +72,10 @@ def _split_text(text: str, count: int) -> list[str]:
         chunk_units = units[start:end]
         chunks.append(" ".join(chunk_units) if units is words else "".join(chunk_units))
         start = end
-    return [chunk for chunk in chunks if chunk]
+    # Keep exactly ``count`` chunks even when a very short utterance spans a
+    # long interval.  Empty chunks represent the remaining timed hold/silence;
+    # dropping them would recreate an overlong scene or leave time uncovered.
+    return chunks
 
 
 def _append_segment(
@@ -84,14 +94,16 @@ def _append_segment(
     if math.isfinite(max_clip_duration) and max_clip_duration > 0:
         split_count = max(1, math.ceil(duration / max_clip_duration))
     chunks = _split_text(text, split_count)
-    weights = [_text_weight(chunk) for chunk in chunks]
-    total_weight = sum(weights)
+    # Time is divided evenly rather than by chunk text length.  Natural word
+    # boundaries can make text chunks quite uneven; weighting time by those
+    # lengths could therefore exceed max_clip_duration even though split_count
+    # was calculated correctly.
     cursor = start
-    for position, (chunk, weight) in enumerate(zip(chunks, weights)):
+    for position, chunk in enumerate(chunks):
         chunk_end = (
             end
             if position == len(chunks) - 1
-            else cursor + duration * weight / total_weight
+            else start + duration * (position + 1) / len(chunks)
         )
         scenes.append(
             NarrationScene(
@@ -138,6 +150,13 @@ def build_scenes(
         return []
 
     segments = _subtitle_segments(subtitle_path, audio_duration)
+    narration_content = _canonical_text(narration)
+    subtitle_content = _canonical_text(" ".join(text for text, _, _ in segments))
+    # A partially parseable SRT must not silently discard the narration cues
+    # represented by malformed or missing blocks.  Subtitle timing is trusted
+    # only when its ordered spoken content accounts for the complete script.
+    if narration_content and subtitle_content != narration_content:
+        segments = []
     if not segments:
         normalized = utils.normalize_script_for_subtitle_matching(narration)
         texts = utils.split_string_by_punctuations(normalized)
