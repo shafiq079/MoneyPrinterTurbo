@@ -116,6 +116,21 @@ def test_indivisible_short_text_still_honors_maximum_clip_duration():
     assert scenes[-1].end_time == 10
 
 
+def test_short_spaced_phrase_keeps_words_and_uses_timed_holds():
+    narration = "short phrase"
+
+    scenes = build_scenes(narration, 12, max_clip_duration=3)
+
+    nonempty_text = [scene.text for scene in scenes if scene.text]
+    assert len(scenes) == 4
+    assert nonempty_text == ["short", "phrase"]
+    assert all(scene.duration <= 3 for scene in scenes)
+    assert " ".join(nonempty_text) == narration
+    assert scenes[0].start_time == 0
+    assert scenes[-1].end_time == 12
+    assert_valid_timeline(scenes, 12)
+
+
 def test_partially_valid_srt_falls_back_without_losing_narration(tmp_path):
     narration = "Opening scene. Missing middle narration. Closing scene."
     subtitle = write_srt(

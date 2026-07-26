@@ -64,7 +64,11 @@ def _split_text(text: str, count: int) -> list[str]:
         return [text] if text else []
 
     words = text.split()
-    units = words if len(words) >= count else list(text.replace(" ", ""))
+    # The presence of whitespace identifies a word-delimited language even
+    # when there are fewer words than timed chunks.  Keep those words intact
+    # and let the remaining chunks become holds; character splitting is only
+    # appropriate for genuinely unspaced narration.
+    units = words if re.search(r"\s", text) else list(text)
     chunks: list[str] = []
     start = 0
     for part in range(count):
