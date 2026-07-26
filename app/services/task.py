@@ -19,6 +19,7 @@ from app.services import (
     elevenlabs_music,
     llm,
     material,
+    scene_timeline,
     sonilo,
     subtitle,
     twelvelabs,
@@ -1170,6 +1171,19 @@ def _run_pipeline(
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
+    # Script matching gets a deterministic, provider-independent narration
+    # timeline before any material provider is consulted.  The disabled path is
+    # intentionally untouched for backward-compatible task state/results.
+    scene_timeline_path = ""
+    if params.match_materials_to_script:
+        scene_timeline_path = scene_timeline.create_scene_timeline(
+            task_dir=utils.task_dir(task_id),
+            narration=video_script,
+            audio_duration=audio_duration,
+            subtitle_path=subtitle_path,
+            max_clip_duration=params.video_clip_duration,
+        )
+
     # 5. Get video materials
     downloaded_videos = get_video_materials(
         task_id, params, video_terms, audio_duration
@@ -1182,13 +1196,13 @@ def _run_pipeline(
         )
 
     if stop_at == "materials":
+        material_result = {"materials": downloaded_videos}
+        if scene_timeline_path:
+            material_result["scene_timeline_path"] = scene_timeline_path
         sm.state.update_task(
-            task_id,
-            state=const.TASK_STATE_COMPLETE,
-            progress=100,
-            materials=downloaded_videos,
+            task_id, state=const.TASK_STATE_COMPLETE, progress=100, **material_result
         )
-        return {"materials": downloaded_videos}
+        return material_result
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=50)
 
@@ -1251,6 +1265,8 @@ def _run_pipeline(
         "cross_post_owner": _cross_post_process_owner if should_cross_post else None,
         "warnings": generation_warnings or None,
     }
+    if scene_timeline_path:
+        kwargs["scene_timeline_path"] = scene_timeline_path
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )
