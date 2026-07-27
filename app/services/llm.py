@@ -686,6 +686,83 @@ Please note that you must use English for generating video search terms; Chinese
     return search_terms
 
 
+def generate_scene_queries(
+    video_subject: str, scenes: list, max_queries_per_scene: int = 3
+) -> tuple[dict[int, list[str]], str | None]:
+    """Generate queries for all meaningful scenes in one batched LLM request."""
+    meaningful = [scene for scene in scenes if scene.text.strip()]
+    if not meaningful:
+        return {}, None
+    scene_payload = [
+        {"scene_index": scene.index, "text": scene.text} for scene in meaningful
+    ]
+    prompt = f"""
+# Role: Scene Stock-Footage Query Generator
+Generate 1-{max_queries_per_scene} concrete English stock-footage search queries for
+every narration scene. Describe visible subjects, actions, settings, or shots; do
+not summarize abstract ideas. Return JSON only in this exact shape:
+{{"scenes":[{{"scene_index":1,"queries":["concrete visible footage"]}}]}}
+
+Video subject: {video_subject}
+Scenes: {json.dumps(scene_payload, ensure_ascii=False)}
+""".strip()
+    response = ""
+    for attempt in range(_max_retries):
+        try:
+            response = _generate_response(prompt)
+            if response.startswith("Error: "):
+                raise ValueError(response)
+            payload = json.loads(_strip_code_fence(response))
+            entries = payload.get("scenes") if isinstance(payload, dict) else None
+            if not isinstance(entries, list):
+                raise ValueError("scene query response has no scenes list")
+            valid_indices = {scene.index for scene in meaningful}
+            result: dict[int, list[str]] = {}
+            duplicate_indices = set()
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                index = entry.get("scene_index")
+                queries = entry.get("queries")
+                if index not in valid_indices or not isinstance(queries, list):
+                    continue
+                if index in result:
+                    duplicate_indices.add(index)
+                    continue
+                normalized = []
+                seen = set()
+                for query in queries:
+                    if not isinstance(query, str):
+                        continue
+                    query = " ".join(query.split()).strip(" ,.;:!?\n\t")
+                    key = query.casefold()
+                    if query and key not in seen:
+                        normalized.append(query)
+                        seen.add(key)
+                result[index] = normalized[:max_queries_per_scene]
+            for index in duplicate_indices:
+                result.pop(index, None)
+            warning = None
+            if set(result) != valid_indices or any(
+                not value for value in result.values()
+            ):
+                warning = (
+                    "LLM output was incomplete; deterministic fallbacks were used."
+                )
+            return result, warning
+        except Exception as exc:
+            logger.warning(f"failed to generate batched scene queries: {exc}")
+            if attempt + 1 == _max_retries:
+                return (
+                    {},
+                    "Batched scene-query generation failed; deterministic fallbacks were used.",
+                )
+    return (
+        {},
+        "Batched scene-query generation failed; deterministic fallbacks were used.",
+    )
+
+
 # =============================================================================
 # Social publishing metadata
 #

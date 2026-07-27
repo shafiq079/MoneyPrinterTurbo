@@ -594,3 +594,53 @@ class TestCoverrProvider(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_pexels_candidate_normalization_and_legacy_projection():
+    from app.models.schema import VideoAspect
+
+    original = dict(config.app)
+    config.app["pexels_api_keys"] = ["pexels-key"]
+    response = SimpleNamespace(json=lambda: {"videos": [{
+        "id": 2468, "url": "https://www.pexels.com/video/2468/",
+        "image": "https://images.pexels.com/videos/2468/poster.jpg", "duration": 9,
+        "video_files": [{"width": 1080, "height": 1920, "link": "https://video.pexels.com/2468.mp4"}],
+    }]})
+    try:
+        with patch("app.services.material.requests.get", return_value=response):
+            rich = material.search_video_candidates_pexels("city", 5, VideoAspect.portrait)
+            legacy = material.search_videos_pexels("city", 5, VideoAspect.portrait)
+    finally:
+        config.app.clear()
+        config.app.update(original)
+    candidate = rich[0]
+    assert (candidate.provider_video_id, candidate.provider_page_url) == ("2468", "https://www.pexels.com/video/2468/")
+    assert candidate.preview_url == "https://images.pexels.com/videos/2468/poster.jpg"
+    assert candidate.url == "https://video.pexels.com/2468.mp4"
+    assert (candidate.duration, candidate.width, candidate.height, candidate.provider_rank) == (9, 1080, 1920, 1)
+    assert legacy[0] == candidate.to_material_info()
+
+
+def test_pixabay_candidate_normalization_and_legacy_projection():
+    from app.models.schema import VideoAspect
+
+    original = dict(config.app)
+    config.app["pixabay_api_keys"] = ["pixabay-key"]
+    response = SimpleNamespace(status_code=200, headers={"content-type": "application/json"}, text="", json=lambda: {"hits": [{
+        "id": 9753, "pageURL": "https://pixabay.com/videos/id-9753/",
+        "largeImageURL": "https://cdn.pixabay.com/9753.jpg", "duration": 11,
+        "videos": {"large": {"width": 1920, "height": 1080, "url": "https://cdn.pixabay.com/9753.mp4"}},
+    }]})
+    try:
+        with patch("app.services.material.requests.get", return_value=response):
+            rich = material.search_video_candidates_pixabay("coast", 5, VideoAspect.landscape)
+            legacy = material.search_videos_pixabay("coast", 5, VideoAspect.landscape)
+    finally:
+        config.app.clear()
+        config.app.update(original)
+    candidate = rich[0]
+    assert (candidate.provider_video_id, candidate.provider_page_url) == ("9753", "https://pixabay.com/videos/id-9753/")
+    assert candidate.preview_url == "https://cdn.pixabay.com/9753.jpg"
+    assert candidate.url == "https://cdn.pixabay.com/9753.mp4"
+    assert (candidate.duration, candidate.width, candidate.height, candidate.provider_rank) == (11, 1920, 1080, 1)
+    assert legacy[0] == candidate.to_material_info()

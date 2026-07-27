@@ -171,8 +171,10 @@ def test_create_scene_timeline_writes_utf8_json(tmp_path):
     assert set(data[0]) == {"index", "start_time", "end_time", "duration", "text"}
 
 
-def _run_material_pipeline(match_enabled, timeline_mock):
-    from unittest.mock import patch
+def _run_material_pipeline(
+    match_enabled, timeline_mock, candidate_mock=None, video_source="pexels"
+):
+    from unittest.mock import Mock, patch
 
     from app.models.schema import VideoParams
     from app.services import task
@@ -181,6 +183,7 @@ def _run_material_pipeline(match_enabled, timeline_mock):
         video_subject="Scenes",
         match_materials_to_script=match_enabled,
         video_clip_duration=6,
+        video_source=video_source,
     )
     with (
         patch.object(task, "generate_script", return_value="First. Second."),
@@ -190,6 +193,11 @@ def _run_material_pipeline(match_enabled, timeline_mock):
         patch.object(task, "generate_subtitle", return_value="subtitle.srt"),
         patch.object(task, "get_video_materials", return_value=["clip.mp4"]),
         patch.object(task.scene_timeline, "create_scene_timeline", timeline_mock),
+        patch.object(
+            task.scene_candidate,
+            "retrieve_scene_candidates",
+            candidate_mock or Mock(return_value=""),
+        ),
         patch.object(task.sm.state, "update_task"),
     ):
         return task.start("timeline-pipeline", params, stop_at="materials")
@@ -200,12 +208,30 @@ def test_pipeline_creates_timeline_before_materials_when_matching_enabled(tmp_pa
 
     timeline_path = str(tmp_path / "scenes.json")
     create_timeline = Mock(return_value=timeline_path)
-    result = _run_material_pipeline(True, create_timeline)
+    candidate_path = str(tmp_path / "scene_candidates.json")
+    retrieve_candidates = Mock(return_value=candidate_path)
+    Path(timeline_path).write_text(
+        json.dumps(
+            [
+                {
+                    "index": 1,
+                    "start_time": 0,
+                    "end_time": 8,
+                    "duration": 8,
+                    "text": "First",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    result = _run_material_pipeline(True, create_timeline, retrieve_candidates)
 
     assert result == {
         "materials": ["clip.mp4"],
         "scene_timeline_path": timeline_path,
+        "scene_candidates_path": candidate_path,
     }
+    retrieve_candidates.assert_called_once()
     create_timeline.assert_called_once()
     assert create_timeline.call_args.kwargs == {
         "task_dir": str(Path(create_timeline.call_args.kwargs["task_dir"])),
@@ -220,7 +246,52 @@ def test_pipeline_does_not_create_or_expose_timeline_when_matching_disabled():
     from unittest.mock import Mock
 
     create_timeline = Mock(return_value="must-not-be-used.json")
-    result = _run_material_pipeline(False, create_timeline)
+    retrieve_candidates = Mock(return_value="must-not-be-used-candidates.json")
+    result = _run_material_pipeline(False, create_timeline, retrieve_candidates)
 
     assert result == {"materials": ["clip.mp4"]}
     create_timeline.assert_not_called()
+    retrieve_candidates.assert_not_called()
+
+
+def test_unsupported_source_skips_candidate_generation():
+    from unittest.mock import Mock
+
+    create_timeline = Mock(return_value="scenes.json")
+    retrieve_candidates = Mock(return_value="must-not-be-used.json")
+    result = _run_material_pipeline(
+        True, create_timeline, retrieve_candidates, video_source="coverr"
+    )
+
+    assert result == {"materials": ["clip.mp4"], "scene_timeline_path": "scenes.json"}
+    retrieve_candidates.assert_not_called()
+
+
+def test_candidate_failure_keeps_existing_material_path(tmp_path):
+    from unittest.mock import Mock
+
+    timeline_path = tmp_path / "scenes.json"
+    timeline_path.write_text(
+        json.dumps(
+            [
+                {
+                    "index": 1,
+                    "start_time": 0,
+                    "end_time": 2,
+                    "duration": 2,
+                    "text": "Scene",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    retrieve_candidates = Mock(side_effect=RuntimeError("candidate failure"))
+    result = _run_material_pipeline(
+        True, Mock(return_value=str(timeline_path)), retrieve_candidates
+    )
+
+    assert result == {
+        "materials": ["clip.mp4"],
+        "scene_timeline_path": str(timeline_path),
+    }
+    retrieve_candidates.assert_called_once()

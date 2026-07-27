@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from app.models.schema import MaterialInfo, VideoAspect
+from app.models.schema import MaterialInfo, ProviderVideoCandidate, VideoAspect
 from app.services import material, material_cache
 
 
@@ -60,6 +60,70 @@ class TestMaterialSearchCache(unittest.TestCase):
         self.assertEqual(loaded[0].provider, "pixabay")
         self.assertEqual(loaded[0].url, "https://example.com/video.mp4")
         self.assertEqual(loaded[0].duration, 12)
+
+    def test_rich_v2_cache_is_reused_by_legacy_loader(self):
+        candidate = ProviderVideoCandidate(
+            provider="pixabay",
+            provider_video_id="42",
+            provider_page_url="https://pixabay.test/videos/42",
+            preview_url="https://pixabay.test/preview.jpg",
+            url="https://example.com/video.mp4",
+            duration=12,
+            width=1080,
+            height=1920,
+            provider_rank=1,
+        )
+        self.assertTrue(
+            material_cache.save_material_candidate_search_cache(
+                provider="pixabay",
+                search_term="nature",
+                minimum_duration=5,
+                video_aspect=VideoAspect.portrait,
+                items=[candidate],
+            )
+        )
+
+        rich = material_cache.load_material_candidate_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+        )
+        legacy = material_cache.load_material_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+        )
+
+        self.assertEqual(rich[0].provider_video_id, "42")
+        self.assertEqual(legacy, [self._item()])
+
+    def test_legacy_v1_is_hit_for_legacy_but_upgrade_miss_for_rich(self):
+        material_cache.save_material_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+            items=[self._item()],
+        )
+
+        legacy = material_cache.load_material_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+        )
+        rich = material_cache.load_material_candidate_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+        )
+
+        self.assertEqual(legacy, [self._item()])
+        self.assertIsNone(rich)
+        self.assertTrue(self._cache_path().exists())
 
     def test_expired_cache_is_removed_and_treated_as_miss(self):
         """
@@ -400,3 +464,39 @@ class TestMaterialSearchCache(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_rich_upgrade_and_cache_safety(tmp_path):
+    from app.config import config
+    from app.models.schema import ProviderVideoCandidate
+
+    with patch("app.services.material_cache.utils.storage_dir", return_value=str(tmp_path)), patch.dict(
+        config.app, {"pixabay_api_keys": ["api-key-secret"]}
+    ), patch.dict(config.proxy, {"http": "http://user:proxy-password@proxy.test"}, clear=True):
+        args = dict(provider="pixabay", search_term="upgrade", minimum_duration=5, video_aspect=VideoAspect.portrait)
+        legacy_item = MaterialInfo(provider="pixabay", url="https://old.test/video.mp4", duration=8)
+        assert material_cache.save_material_search_cache(**args, items=[legacy_item])
+        cache_path = material_cache._cache_path(**args)
+        assert material_cache.load_material_search_cache(**args) == [legacy_item]
+        assert material_cache.load_material_candidate_search_cache(**args) is None
+        assert cache_path.exists()
+
+        rich_item = ProviderVideoCandidate(provider="pixabay", provider_video_id="99", provider_page_url="https://pixabay.test/99", preview_url="https://pixabay.test/99.jpg", url="https://cdn.test/99.mp4", duration=10, width=1080, height=1920, provider_rank=1)
+        with patch.object(material, "search_video_candidates_pixabay", return_value=[rich_item]) as remote:
+            rich, used_remote = material.search_video_candidates_with_cache(source="pixabay", search_term="upgrade", minimum_duration=5, video_aspect=VideoAspect.portrait)
+        assert used_remote and rich == [rich_item]
+        remote.assert_called_once()
+        assert json.loads(cache_path.read_text(encoding="utf-8"))["version"] == 2
+        assert material_cache.load_material_search_cache(**args) == [rich_item.to_material_info()]
+        serialized = cache_path.read_text(encoding="utf-8")
+        assert "api-key-secret" not in serialized
+        assert "proxy-password" not in serialized
+
+
+def test_corrupt_rich_cache_falls_back_safely(tmp_path):
+    with patch("app.services.material_cache.utils.storage_dir", return_value=str(tmp_path)):
+        args = dict(provider="pixabay", search_term="corrupt", minimum_duration=5, video_aspect=VideoAspect.portrait)
+        cache_path = material_cache._cache_path(**args)
+        cache_path.write_text(json.dumps({"version": 2, "items": [{"provider": "pixabay"}]}), encoding="utf-8")
+        assert material_cache.load_material_candidate_search_cache(**args) is None
+        assert not cache_path.exists()
