@@ -16,6 +16,8 @@ from app.utils import utils
 # 在线素材使用 URL 的 MD5 作为稳定文件名。缓存管理只接受该命名格式，避免把
 # 用户误放到目录中的视频、说明文件或其它业务文件当作缓存删除。
 _VIDEO_CACHE_FILE_PATTERN = re.compile(r"^vid-[0-9a-f]{32}\.mp4$")
+_PREVIEW_OBJECT_PATTERN = re.compile(r"^poster-jpeg-v1-[0-9a-f]{64}\.jpg$")
+_PREVIEW_SOURCE_PATTERN = re.compile(r"^source-v1-[0-9a-f]{64}\.json$")
 _SECONDS_PER_DAY = 24 * 60 * 60
 
 
@@ -54,7 +56,16 @@ def video_cache_dir() -> str:
     return os.path.realpath(utils.storage_dir("cache_videos"))
 
 
-def _iter_video_cache_entries() -> Iterator[_VideoCacheEntry]:
+def _managed_cache_directories():
+    preview_root = os.path.realpath(utils.storage_dir("cache_candidate_previews"))
+    return (
+        (video_cache_dir(), _VIDEO_CACHE_FILE_PATTERN),
+        (os.path.join(preview_root, "objects"), _PREVIEW_OBJECT_PATTERN),
+        (os.path.join(preview_root, "sources"), _PREVIEW_SOURCE_PATTERN),
+    )
+
+
+def _iter_managed_directory(cache_dir, pattern) -> Iterator[_VideoCacheEntry]:
     """
     顺序扫描默认缓存目录第一层。
 
@@ -63,7 +74,6 @@ def _iter_video_cache_entries() -> Iterator[_VideoCacheEntry]:
     FFmpeg，因此耗时主要与文件数量线性相关，而不是与视频总容量相关。
     """
 
-    cache_dir = video_cache_dir()
     try:
         entries = os.scandir(cache_dir)
     except FileNotFoundError:
@@ -76,7 +86,7 @@ def _iter_video_cache_entries() -> Iterator[_VideoCacheEntry]:
 
     with entries:
         for entry in entries:
-            if not _VIDEO_CACHE_FILE_PATTERN.fullmatch(entry.name):
+            if not pattern.fullmatch(entry.name):
                 continue
 
             try:
@@ -96,6 +106,12 @@ def _iter_video_cache_entries() -> Iterator[_VideoCacheEntry]:
                 size=stat_result.st_size,
                 mtime=stat_result.st_mtime,
             )
+
+
+def _iter_video_cache_entries() -> Iterator[_VideoCacheEntry]:
+    """Scan every backend-registered generated-media cache."""
+    for cache_dir, pattern in _managed_cache_directories():
+        yield from _iter_managed_directory(cache_dir, pattern)
 
 
 def _is_cleanup_candidate(
@@ -175,7 +191,6 @@ def clean_video_cache(max_age_days: int | None = None) -> VideoCacheCleanupResul
     deleted_count = 0
     deleted_size = 0
     failed_count = 0
-    cache_dir = video_cache_dir()
 
     # 边扫描边删除，不在内存中保留完整候选列表。即使目录增长到几十万个文件，
     # 清理过程的额外内存仍保持常量级；执行时使用统一 now，避免长清理过程中
@@ -188,11 +203,12 @@ def clean_video_cache(max_age_days: int | None = None) -> VideoCacheCleanupResul
         try:
             # entry.path 来自默认目录的第一层 scandir；删除前再次校验父目录和
             # 文件名，防止未来修改扫描逻辑时意外扩大可删除范围。
-            if (
-                os.path.realpath(os.path.dirname(entry.path)) != cache_dir
-                or not _VIDEO_CACHE_FILE_PATTERN.fullmatch(entry.name)
-                or os.path.islink(entry.path)
-            ):
+            managed = any(
+                os.path.realpath(os.path.dirname(entry.path)) == directory
+                and pattern.fullmatch(entry.name)
+                for directory, pattern in _managed_cache_directories()
+            )
+            if not managed or os.path.islink(entry.path):
                 raise ValueError("cache file is outside the managed directory")
             os.unlink(entry.path)
             deleted_count += 1
