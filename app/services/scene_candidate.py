@@ -72,8 +72,16 @@ def fallback_scene_query(text: str) -> str:
     if not normalized:
         return ""
     if re.search(r"\s", normalized):
-        normalized = " ".join(normalized.split()[:12])
-    return normalized[:80].rstrip()
+        selected: list[str] = []
+        for word in normalized.split()[:12]:
+            proposed = " ".join([*selected, word])
+            if len(proposed) > 80:
+                break
+            selected.append(word)
+        # A pathological first token longer than the complete query bound has no
+        # usable word boundary. Keep the hard storage/provider limit deterministic.
+        return " ".join(selected) or normalized.split()[0][:80]
+    return normalized[:80]
 
 
 def _reuse_scene_index(scenes: list[NarrationScene], position: int) -> int | None:

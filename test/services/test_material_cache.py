@@ -464,3 +464,39 @@ class TestMaterialSearchCache(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_rich_upgrade_and_cache_safety(tmp_path):
+    from app.config import config
+    from app.models.schema import ProviderVideoCandidate
+
+    with patch("app.services.material_cache.utils.storage_dir", return_value=str(tmp_path)), patch.dict(
+        config.app, {"pixabay_api_keys": ["api-key-secret"]}
+    ), patch.dict(config.proxy, {"http": "http://user:proxy-password@proxy.test"}, clear=True):
+        args = dict(provider="pixabay", search_term="upgrade", minimum_duration=5, video_aspect=VideoAspect.portrait)
+        legacy_item = MaterialInfo(provider="pixabay", url="https://old.test/video.mp4", duration=8)
+        assert material_cache.save_material_search_cache(**args, items=[legacy_item])
+        cache_path = material_cache._cache_path(**args)
+        assert material_cache.load_material_search_cache(**args) == [legacy_item]
+        assert material_cache.load_material_candidate_search_cache(**args) is None
+        assert cache_path.exists()
+
+        rich_item = ProviderVideoCandidate(provider="pixabay", provider_video_id="99", provider_page_url="https://pixabay.test/99", preview_url="https://pixabay.test/99.jpg", url="https://cdn.test/99.mp4", duration=10, width=1080, height=1920, provider_rank=1)
+        with patch.object(material, "search_video_candidates_pixabay", return_value=[rich_item]) as remote:
+            rich, used_remote = material.search_video_candidates_with_cache(source="pixabay", search_term="upgrade", minimum_duration=5, video_aspect=VideoAspect.portrait)
+        assert used_remote and rich == [rich_item]
+        remote.assert_called_once()
+        assert json.loads(cache_path.read_text(encoding="utf-8"))["version"] == 2
+        assert material_cache.load_material_search_cache(**args) == [rich_item.to_material_info()]
+        serialized = cache_path.read_text(encoding="utf-8")
+        assert "api-key-secret" not in serialized
+        assert "proxy-password" not in serialized
+
+
+def test_corrupt_rich_cache_falls_back_safely(tmp_path):
+    with patch("app.services.material_cache.utils.storage_dir", return_value=str(tmp_path)):
+        args = dict(provider="pixabay", search_term="corrupt", minimum_duration=5, video_aspect=VideoAspect.portrait)
+        cache_path = material_cache._cache_path(**args)
+        cache_path.write_text(json.dumps({"version": 2, "items": [{"provider": "pixabay"}]}), encoding="utf-8")
+        assert material_cache.load_material_candidate_search_cache(**args) is None
+        assert not cache_path.exists()
