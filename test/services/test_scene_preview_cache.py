@@ -1,4 +1,5 @@
 import hashlib
+import json
 import threading
 from io import BytesIO
 from unittest.mock import patch
@@ -147,3 +148,169 @@ def test_prepare_caches_source_and_normalized_object(tmp_path):
     assert first.image_sha256 == second.image_sha256
     assert second.cache_hit
     assert len(session.calls) == 1
+
+
+def normalized_object_bytes():
+    return cache.normalize_image(image_bytes(image_format="PNG"))[0]
+
+
+def write_source_record(tmp_path, data, **overrides):
+    digest = hashlib.sha256(data).hexdigest()
+    with Image.open(BytesIO(data)) as image:
+        payload = {
+            "version": 1,
+            "normalization_version": cache.NORMALIZATION_VERSION,
+            "image_sha256": digest,
+            "media_type": "image/jpeg",
+            "width": image.width,
+            "height": image.height,
+            "byte_size": len(data),
+            **overrides,
+        }
+    key = cache._source_key("pexels", "1", "https://images.pexels.com/a.jpg")
+    objects = tmp_path / "objects"
+    sources = tmp_path / "sources"
+    objects.mkdir(parents=True, exist_ok=True)
+    sources.mkdir(parents=True, exist_ok=True)
+    object_path = objects / cache.object_name(digest)
+    object_path.write_bytes(data)
+    source_path = sources / f"source-v1-{key}.json"
+    source_path.write_text(json.dumps(payload), encoding="utf-8")
+    return object_path, source_path
+
+
+@pytest.mark.parametrize("corruption", ["bytes", "metadata", "non_jpeg"])
+def test_corrupt_cached_object_or_source_metadata_is_rejected(tmp_path, corruption):
+    data = normalized_object_bytes()
+    if corruption == "non_jpeg":
+        data = image_bytes(image_format="PNG")
+    overrides = {"width": 999} if corruption == "metadata" else {}
+    object_path, source_path = write_source_record(tmp_path, data, **overrides)
+    if corruption == "bytes":
+        object_path.write_bytes(b"corrupt")
+
+    with patch.object(cache, "_cache_root", return_value=tmp_path):
+        result = cache.find_cached("pexels", "1", "https://images.pexels.com/a.jpg")
+
+    assert result is None
+    assert not source_path.exists()
+    assert not object_path.exists()
+
+
+def test_symlink_cached_object_is_rejected_without_touching_target(tmp_path):
+    data = normalized_object_bytes()
+    object_path, source_path = write_source_record(tmp_path, data)
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(data)
+    object_path.unlink()
+    try:
+        object_path.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable")
+
+    with patch.object(cache, "_cache_root", return_value=tmp_path):
+        result = cache.find_cached("pexels", "1", "https://images.pexels.com/a.jpg")
+
+    assert result is None
+    assert outside.read_bytes() == data
+    assert not object_path.exists()
+    assert not source_path.exists()
+
+
+def test_valid_existing_content_object_is_reused(tmp_path):
+    normalized = normalized_object_bytes()
+    digest = hashlib.sha256(normalized).hexdigest()
+    objects = tmp_path / "objects"
+    objects.mkdir(parents=True)
+    object_path = objects / cache.object_name(digest)
+    object_path.write_bytes(normalized)
+    original_stat = object_path.stat()
+    session = Session([Response([image_bytes()])])
+
+    with patch.object(cache, "_cache_root", return_value=tmp_path):
+        result = cache.prepare_preview(
+            "pexels",
+            "1",
+            "https://images.pexels.com/a.jpg",
+            cache.AggregateByteBudget(100_000),
+            session=session,
+        )
+
+    assert result.image_sha256 == digest
+    assert object_path.stat().st_ino == original_stat.st_ino
+
+
+def test_corrupt_existing_destination_is_atomically_repaired(tmp_path):
+    normalized = normalized_object_bytes()
+    digest = hashlib.sha256(normalized).hexdigest()
+    objects = tmp_path / "objects"
+    objects.mkdir(parents=True)
+    object_path = objects / cache.object_name(digest)
+    object_path.write_bytes(b"corrupt")
+
+    with patch.object(cache, "_cache_root", return_value=tmp_path):
+        result = cache.prepare_preview(
+            "pexels",
+            "1",
+            "https://images.pexels.com/a.jpg",
+            cache.AggregateByteBudget(100_000),
+            session=Session([Response([image_bytes()])]),
+        )
+
+    assert result.image_sha256 == digest
+    assert object_path.read_bytes() == normalized
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_owned_session_is_closed_after_success_and_failure(tmp_path, fails):
+    response = Response([b"not-an-image"] if fails else [image_bytes()])
+
+    class OwnedSession(Session):
+        instances = []
+
+        def __init__(self):
+            super().__init__([response])
+            self.closed = False
+            self.instances.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.closed = True
+
+    with (
+        patch.object(cache, "_cache_root", return_value=tmp_path),
+        patch.object(cache.requests, "Session", OwnedSession),
+    ):
+        if fails:
+            with pytest.raises(cache.PreviewError):
+                cache.prepare_preview(
+                    "pexels",
+                    "1",
+                    "https://images.pexels.com/a.jpg",
+                    cache.AggregateByteBudget(100_000),
+                )
+        else:
+            cache.prepare_preview(
+                "pexels",
+                "1",
+                "https://images.pexels.com/a.jpg",
+                cache.AggregateByteBudget(100_000),
+            )
+    assert OwnedSession.instances[0].closed
+
+
+def test_injected_session_is_not_closed(tmp_path):
+    session = Session([Response([image_bytes()])])
+    session.closed = False
+    session.close = lambda: setattr(session, "closed", True)
+    with patch.object(cache, "_cache_root", return_value=tmp_path):
+        cache.prepare_preview(
+            "pexels",
+            "1",
+            "https://images.pexels.com/a.jpg",
+            cache.AggregateByteBudget(100_000),
+            session=session,
+        )
+    assert not session.closed

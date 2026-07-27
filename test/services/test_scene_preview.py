@@ -2,8 +2,11 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from app.services import scene_preview
 from app.services.scene_preview_cache import PreparedPreview, PreviewError
+from app.services.scene_candidate import SceneCandidateManifest
 
 
 def candidate(index, rank=1):
@@ -168,3 +171,101 @@ def test_invalid_provider_url_is_recorded_without_aborting_manifest(tmp_path):
     assert result["status"] == "no_previews"
     assert result["candidates"][0]["status"] == "invalid_url"
     assert result["candidates"][0]["failure_reason"] == "provider_host_not_allowed"
+
+
+def test_same_round_duplicate_identity_uses_one_slot_without_starving_unique(tmp_path):
+    source = tmp_path / "scene_candidates.json"
+    manifest(source, [1, 1, 1])
+    payload = json.loads(source.read_text())
+    payload["scenes"][1]["candidates"][0] = payload["scenes"][0]["candidates"][0]
+    source.write_text(json.dumps(payload), encoding="utf-8")
+    calls = []
+
+    def prepare(provider, provider_video_id, preview_url, budget):
+        del provider, preview_url, budget
+        calls.append(provider_video_id)
+        return prepared(provider_video_id)
+
+    with (
+        patch.object(
+            scene_preview.scene_preview_cache, "find_cached", return_value=None
+        ),
+        patch.object(
+            scene_preview.scene_preview_cache, "prepare_preview", side_effect=prepare
+        ),
+    ):
+        target = scene_preview.prepare_scene_previews(
+            str(source), max_remote_downloads=2, concurrency=1
+        )
+
+    data = json.loads(Path(target).read_text())
+    assert calls == ["1-0", "3-0"]
+    assert data["usage"]["remote_downloads_started"] == 2
+    assert data["usage"]["in_task_reuses"] == 1
+    assert [scene["candidates"][0]["status"] for scene in data["scenes"]] == [
+        "ready",
+        "ready",
+        "ready",
+    ]
+
+
+def test_incomplete_internal_results_cannot_be_finalized(tmp_path):
+    source = tmp_path / "scene_candidates.json"
+    manifest(source, [2])
+    parsed = SceneCandidateManifest.model_validate_json(source.read_bytes())
+    with pytest.raises(ValueError, match="incomplete"):
+        scene_preview._complete_scene_results(parsed, [[None, None]])
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "hold_candidates",
+        "hold_queries",
+        "provider",
+        "candidate_id",
+        "duplicate_scene",
+        "out_of_order",
+        "declared_limit",
+        "hard_limit",
+    ],
+)
+def test_invalid_source_invariants_do_no_cache_or_network_work(tmp_path, mutation):
+    source = tmp_path / "scene_candidates.json"
+    manifest(source, [1, 1])
+    payload = json.loads(source.read_text())
+    if mutation.startswith("hold_"):
+        scene = payload["scenes"][0]
+        scene["status"] = "hold_no_search"
+        scene["text"] = ""
+        scene["query_source"] = "none"
+        scene["reuse_scene_index"] = 2
+        if mutation == "hold_queries":
+            scene["candidates"] = []
+        else:
+            scene["queries"] = []
+    elif mutation == "provider":
+        payload["scenes"][0]["candidates"][0]["provider"] = "pixabay"
+    elif mutation == "candidate_id":
+        payload["scenes"][0]["candidates"][0]["candidate_id"] = "pexels:wrong"
+    elif mutation == "duplicate_scene":
+        payload["scenes"][1]["scene_index"] = 1
+    elif mutation == "out_of_order":
+        payload["scenes"][0]["scene_index"] = 3
+    elif mutation == "declared_limit":
+        payload["candidates_per_scene"] = 1
+        payload["scenes"][0]["candidates"].append(candidate("1-extra", 2))
+    else:
+        payload["candidates_per_scene"] = 13
+    source.write_text(json.dumps(payload), encoding="utf-8")
+
+    with (
+        patch.object(scene_preview.scene_preview_cache, "find_cached") as cached,
+        patch.object(scene_preview.scene_preview_cache, "prepare_preview") as remote,
+        pytest.raises(ValueError),
+    ):
+        scene_preview.prepare_scene_previews(str(source))
+
+    cached.assert_not_called()
+    remote.assert_not_called()
+    assert not (tmp_path / "scene_previews.json").exists()

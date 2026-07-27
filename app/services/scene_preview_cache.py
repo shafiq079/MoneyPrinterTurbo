@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -33,6 +34,7 @@ ALLOWED_HOSTS = {
     "pixabay": frozenset({"cdn.pixabay.com"}),
 }
 _SOURCE_LOCKS = tuple(threading.Lock() for _ in range(128))
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class PreviewError(Exception):
@@ -140,30 +142,67 @@ def _atomic_write(path: Path, data: bytes) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def _remove_managed_file(path: Path, directory: Path) -> None:
+    try:
+        if path.parent.resolve() == directory.resolve() and (
+            path.is_symlink() or path.is_file()
+        ):
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _validate_object(path: Path, payload: dict) -> bool:
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False
+        data = path.read_bytes()
+        if len(data) != payload["byte_size"]:
+            return False
+        if hashlib.sha256(data).hexdigest() != payload["image_sha256"]:
+            return False
+        with Image.open(BytesIO(data)) as image:
+            if image.format != "JPEG" or getattr(image, "n_frames", 1) != 1:
+                return False
+            image.load()
+            if image.width * image.height > MAX_DECODED_PIXELS:
+                return False
+            if max(image.size) > MAX_NORMALIZED_EDGE:
+                return False
+            if image.mode != "RGB":
+                return False
+            if (image.width, image.height) != (payload["width"], payload["height"]):
+                return False
+        return payload.get("media_type") == "image/jpeg"
+    except (OSError, ValueError, KeyError, TypeError, UnidentifiedImageError):
+        return False
+
+
 def _load_cached(source_path: Path) -> PreparedPreview | None:
     try:
         payload = json.loads(source_path.read_text(encoding="utf-8"))
         if payload.get("normalization_version") != NORMALIZATION_VERSION:
             return None
         digest = payload["image_sha256"]
+        if not isinstance(digest, str) or not _SHA256_PATTERN.fullmatch(digest):
+            _remove_managed_file(source_path, source_dir())
+            return None
         path = object_dir() / object_name(digest)
-        if path.is_symlink() or not path.is_file():
-            return None
-        data = path.read_bytes()
-        if len(data) != payload["byte_size"]:
-            return None
-        if hashlib.sha256(data).hexdigest() != digest:
+        if not _validate_object(path, payload):
+            _remove_managed_file(path, object_dir())
+            _remove_managed_file(source_path, source_dir())
             return None
         return PreparedPreview(
             image_sha256=digest,
             media_type="image/jpeg",
             width=payload["width"],
             height=payload["height"],
-            byte_size=len(data),
+            byte_size=payload["byte_size"],
             cache_reference=cache_reference(digest),
             cache_hit=True,
         )
     except (OSError, ValueError, KeyError, TypeError):
+        _remove_managed_file(source_path, source_dir())
         return None
 
 
@@ -314,24 +353,34 @@ def prepare_preview(
         cached = _load_cached(source_path)
         if cached:
             return cached
-        wire_bytes = _download(
-            provider, url, byte_budget, session or requests.Session(), monotonic
-        )
+        if session is None:
+            with requests.Session() as owned_session:
+                wire_bytes = _download(
+                    provider, url, byte_budget, owned_session, monotonic
+                )
+        else:
+            wire_bytes = _download(provider, url, byte_budget, session, monotonic)
         normalized, width, height = normalize_image(wire_bytes)
         digest = hashlib.sha256(normalized).hexdigest()
         object_path = object_dir() / object_name(digest)
+        object_payload = {
+            "image_sha256": digest,
+            "media_type": "image/jpeg",
+            "width": width,
+            "height": height,
+            "byte_size": len(normalized),
+        }
         try:
-            if not object_path.exists():
+            if not _validate_object(object_path, object_payload):
+                _remove_managed_file(object_path, object_dir())
                 _atomic_write(object_path, normalized)
+            if not _validate_object(object_path, object_payload):
+                raise OSError("normalized preview object validation failed")
             payload = json.dumps(
                 {
                     "version": 1,
                     "normalization_version": NORMALIZATION_VERSION,
-                    "image_sha256": digest,
-                    "media_type": "image/jpeg",
-                    "width": width,
-                    "height": height,
-                    "byte_size": len(normalized),
+                    **object_payload,
                 },
                 sort_keys=True,
                 separators=(",", ":"),

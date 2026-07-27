@@ -99,6 +99,61 @@ def _scene_status(group, results: list[CandidatePreviewResult]) -> str:
     return "no_previews"
 
 
+def _validate_source_manifest(source: SceneCandidateManifest) -> None:
+    if not 1 <= source.candidates_per_scene <= MAX_CANDIDATES_PER_SCENE:
+        raise ValueError("source candidates_per_scene is outside the supported range")
+    previous_index = None
+    seen_indexes = set()
+    for group in source.scenes:
+        if group.scene_index in seen_indexes or (
+            previous_index is not None and group.scene_index <= previous_index
+        ):
+            raise ValueError("scene indexes must be unique and in source order")
+        seen_indexes.add(group.scene_index)
+        previous_index = group.scene_index
+        is_hold = group.status == SceneRetrievalStatus.hold_no_search
+        if is_hold and (
+            group.candidates or group.queries or group.query_source != "none"
+        ):
+            raise ValueError("hold_no_search scene has searchable material")
+        if (
+            len(group.candidates) > source.candidates_per_scene
+            or len(group.candidates) > MAX_CANDIDATES_PER_SCENE
+        ):
+            raise ValueError("source candidate count exceeds its declared limit")
+        for candidate in group.candidates:
+            if candidate.provider != source.provider:
+                raise ValueError("candidate provider differs from manifest provider")
+            expected_id = f"{candidate.provider}:{candidate.provider_video_id}"
+            if candidate.candidate_id != expected_id:
+                raise ValueError("candidate_id is inconsistent with provider identity")
+
+
+def _complete_scene_results(source, results) -> list[ScenePreviewResult]:
+    if len(results) != len(source.scenes):
+        raise ValueError("preview result scene count is incomplete")
+    scene_results = []
+    for group, group_results in zip(source.scenes, results, strict=True):
+        if len(group_results) != len(group.candidates) or any(
+            item is None for item in group_results
+        ):
+            raise ValueError("preview candidate result matrix is incomplete")
+        finalized = list(group_results)
+        if [item.candidate_id for item in finalized] != [
+            candidate.candidate_id for candidate in group.candidates
+        ]:
+            raise ValueError("preview candidate result order is inconsistent")
+        scene_results.append(
+            ScenePreviewResult(
+                scene_index=group.scene_index,
+                status=_scene_status(group, finalized),
+                reuse_scene_index=group.reuse_scene_index,
+                candidates=finalized,
+            )
+        )
+    return scene_results
+
+
 def _atomic_manifest(path: Path, manifest: ScenePreviewManifest) -> None:
     temporary = None
     try:
@@ -139,6 +194,7 @@ def prepare_scene_previews(
     source = SceneCandidateManifest.model_validate_json(source_bytes)
     if source.provider not in scene_preview_cache.ALLOWED_HOSTS:
         return ""
+    _validate_source_manifest(source)
 
     results = [[None for _ in group.candidates] for group in source.scenes]
     budget = scene_preview_cache.AggregateByteBudget(max_aggregate_bytes)
@@ -150,7 +206,7 @@ def prepare_scene_previews(
     max_candidates = max((len(group.candidates) for group in source.scenes), default=0)
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         for position in range(max_candidates):
-            misses = []
+            misses_by_identity = {}
             for scene_pos, group in enumerate(source.scenes):
                 if position >= len(group.candidates):
                     continue
@@ -214,21 +270,34 @@ def prepare_scene_previews(
                     identities[identity] = outcome
                     cache_hits += 1
                 else:
-                    misses.append((scene_pos, position, candidate, identity))
+                    occurrence = (scene_pos, position, candidate)
+                    if identity in misses_by_identity:
+                        misses_by_identity[identity][1].append(occurrence)
+                        in_task_reuses += 1
+                    else:
+                        misses_by_identity[identity] = [occurrence, []]
 
             remaining = max_remote_downloads - remote_started
+            misses = list(misses_by_identity.items())
             selected_indexes = set(
                 centered_stratified_indices(len(misses), min(remaining, len(misses)))
             )
             futures = {}
             for miss_index, item in enumerate(misses):
-                scene_pos, candidate_pos, candidate, identity = item
+                identity, (leader, followers) = item
+                scene_pos, candidate_pos, candidate = leader
                 if miss_index not in selected_indexes:
-                    results[scene_pos][candidate_pos] = _failure(
+                    outcome = _failure(
                         candidate.candidate_id,
                         "budget_exhausted",
                         "remote_download_budget_exhausted",
                     )
+                    results[scene_pos][candidate_pos] = outcome
+                    for follower_scene, follower_position, follower in followers:
+                        results[follower_scene][follower_position] = outcome.model_copy(
+                            update={"candidate_id": follower.candidate_id}, deep=True
+                        )
+                    identities[identity] = outcome
                     continue
                 remote_started += 1
                 future = executor.submit(
@@ -238,9 +307,10 @@ def prepare_scene_previews(
                     candidate.preview_url,
                     budget,
                 )
-                futures[future] = item
+                futures[future] = (identity, leader, followers)
             for future in as_completed(futures):
-                scene_pos, candidate_pos, candidate, identity = futures[future]
+                identity, leader, followers = futures[future]
+                scene_pos, candidate_pos, candidate = leader
                 try:
                     prepared = future.result()
                     outcome = CandidatePreviewResult(
@@ -262,19 +332,13 @@ def prepare_scene_previews(
                         candidate.candidate_id, "download_failed", "network_error"
                     )
                 results[scene_pos][candidate_pos] = outcome
+                for follower_scene, follower_position, follower in followers:
+                    results[follower_scene][follower_position] = outcome.model_copy(
+                        update={"candidate_id": follower.candidate_id}, deep=True
+                    )
                 identities[identity] = outcome
 
-    scene_results = []
-    for group, group_results in zip(source.scenes, results, strict=True):
-        finalized = [item for item in group_results if item is not None]
-        scene_results.append(
-            ScenePreviewResult(
-                scene_index=group.scene_index,
-                status=_scene_status(group, finalized),
-                reuse_scene_index=group.reuse_scene_index,
-                candidates=finalized,
-            )
-        )
+    scene_results = _complete_scene_results(source, results)
 
     limits = {
         "candidates_per_scene": candidates_per_scene,

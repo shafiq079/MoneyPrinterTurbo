@@ -4,6 +4,7 @@ import shutil
 import sys
 import tempfile
 from concurrent.futures import Future
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -33,6 +34,151 @@ class TestTaskService(unittest.TestCase):
     def tearDown(self):
         with tm._cross_post_registry_lock:
             tm._cross_post_futures.clear()
+
+    def _run_preview_pipeline(
+        self,
+        tmp_path,
+        *,
+        matching=True,
+        source="pexels",
+        candidate_path=None,
+        preview_result="scene_previews.json",
+        preview_error=None,
+        stop_at="materials",
+    ):
+        timeline_path = Path(tmp_path) / "scenes.json"
+        timeline_path.write_text("[]", encoding="utf-8")
+        if candidate_path is None:
+            candidate_file = Path(tmp_path) / "scene_candidates.json"
+            candidate_file.write_text("{}", encoding="utf-8")
+            candidate_path = str(candidate_file)
+        state = MemoryState()
+        params = VideoParams(
+            video_subject="subject",
+            video_script="script",
+            match_materials_to_script=matching,
+            video_source=source,
+            bgm_type="",
+        )
+        materials = ["ordered-1.mp4", "ordered-2.mp4"]
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(tm, "generate_script", return_value="script"))
+            stack.enter_context(patch.object(tm, "generate_terms", return_value=["term"]))
+            stack.enter_context(patch.object(tm, "save_script_data"))
+            stack.enter_context(
+                patch.object(tm, "generate_audio", return_value=("audio.mp3", 5, object()))
+            )
+            stack.enter_context(
+                patch.object(tm, "generate_subtitle", return_value="subtitle.srt")
+            )
+            stack.enter_context(
+                patch.object(
+                    tm.scene_timeline,
+                    "create_scene_timeline",
+                    return_value=str(timeline_path),
+                )
+            )
+            retrieve = stack.enter_context(
+                patch.object(
+                    tm.scene_candidate,
+                    "retrieve_scene_candidates",
+                    return_value=candidate_path,
+                )
+            )
+            preview = stack.enter_context(
+                patch.object(
+                    tm.scene_preview,
+                    "prepare_scene_previews",
+                    return_value=preview_result,
+                    side_effect=preview_error,
+                )
+            )
+            get_materials = stack.enter_context(
+                patch.object(tm, "get_video_materials", return_value=materials)
+            )
+            render = stack.enter_context(
+                patch.object(
+                    tm,
+                    "generate_final_videos",
+                    return_value=(["final.mp4"], ["combined.mp4"], []),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    tm.upload_post.upload_post_service,
+                    "is_configured",
+                    return_value=False,
+                )
+            )
+            stack.enter_context(patch.object(tm.sm, "state", state))
+            result = tm.start("preview-pipeline", params, stop_at=stop_at)
+        return result, state, retrieve, preview, get_materials, render, materials
+
+    def test_preview_pipeline_gating_and_material_stop_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, retrieve, preview, get_materials, _, materials = (
+                self._run_preview_pipeline(tmp, matching=False)
+            )
+            retrieve.assert_not_called()
+            preview.assert_not_called()
+            get_materials.assert_called_once()
+            self.assertEqual(result, {"materials": materials})
+
+            result, _, retrieve, preview, get_materials, _, _ = (
+                self._run_preview_pipeline(tmp, source="local")
+            )
+            retrieve.assert_not_called()
+            preview.assert_not_called()
+            get_materials.assert_called_once()
+            self.assertNotIn("scene_previews_path", result)
+
+            result, _, _, preview, _, _, _ = self._run_preview_pipeline(
+                tmp, candidate_path=""
+            )
+            preview.assert_not_called()
+            self.assertNotIn("scene_previews_path", result)
+
+            result, _, _, preview, _, _, _ = self._run_preview_pipeline(tmp)
+            preview.assert_called_once()
+            self.assertTrue(
+                preview.call_args.args[0].endswith("scene_candidates.json")
+            )
+            self.assertEqual(result["scene_previews_path"], "scene_previews.json")
+
+            result, _, _, preview, _, _, _ = self._run_preview_pipeline(
+                tmp, candidate_path=str(Path(tmp) / "missing.json")
+            )
+            preview.assert_not_called()
+            self.assertNotIn("scene_previews_path", result)
+
+    def test_preview_failure_is_nonfatal_and_preserves_renderer_arguments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, state, _, preview, get_materials, render, materials = (
+                self._run_preview_pipeline(
+                    tmp,
+                    preview_error=RuntimeError("preview failed"),
+                    stop_at="video",
+                )
+            )
+        preview.assert_called_once()
+        get_materials.assert_called_once()
+        render.assert_called_once()
+        self.assertIs(render.call_args.args[2], materials)
+        self.assertEqual(result["materials"], materials)
+        self.assertNotIn("scene_previews_path", result)
+        self.assertNotIn("scene_previews_path", state.get_task("preview-pipeline"))
+
+    def test_successful_preview_is_exposed_in_final_task_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, state, _, _, _, render, materials = self._run_preview_pipeline(
+                tmp, stop_at="video"
+            )
+        self.assertEqual(result["scene_previews_path"], "scene_previews.json")
+        self.assertEqual(
+            state.get_task("preview-pipeline")["scene_previews_path"],
+            "scene_previews.json",
+        )
+        self.assertIs(render.call_args.args[2], materials)
 
     def test_is_task_busy_covers_generation_and_cross_posting(self):
         """删除入口必须同时识别视频生成和跨平台发布的活跃状态。"""

@@ -1204,7 +1204,7 @@ def _run_pipeline(
                     video_aspect=params.video_aspect,
                     minimum_duration=params.video_clip_duration,
                 )
-                if scene_candidates_path:
+                if scene_candidates_path and os.path.isfile(scene_candidates_path):
                     try:
                         scene_previews_path = scene_preview.prepare_scene_previews(
                             scene_candidates_path
