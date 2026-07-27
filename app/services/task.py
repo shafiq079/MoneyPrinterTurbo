@@ -21,6 +21,7 @@ from app.services import (
     llm,
     material,
     scene_candidate,
+    scene_preview,
     scene_timeline,
     sonilo,
     subtitle,
@@ -1178,6 +1179,7 @@ def _run_pipeline(
     # intentionally untouched for backward-compatible task state/results.
     scene_timeline_path = ""
     scene_candidates_path = ""
+    scene_previews_path = ""
     if params.match_materials_to_script:
         scene_timeline_path = scene_timeline.create_scene_timeline(
             task_dir=utils.task_dir(task_id),
@@ -1202,6 +1204,16 @@ def _run_pipeline(
                     video_aspect=params.video_aspect,
                     minimum_duration=params.video_clip_duration,
                 )
+                if scene_candidates_path and os.path.isfile(scene_candidates_path):
+                    try:
+                        scene_previews_path = scene_preview.prepare_scene_previews(
+                            scene_candidates_path
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "scene preview preparation failed; continuing with the "
+                            f"existing material path: {type(exc).__name__}"
+                        )
             except Exception as exc:
                 logger.warning(
                     "scene candidate preparation failed; continuing with the "
@@ -1225,6 +1237,8 @@ def _run_pipeline(
             material_result["scene_timeline_path"] = scene_timeline_path
         if scene_candidates_path:
             material_result["scene_candidates_path"] = scene_candidates_path
+        if scene_previews_path:
+            material_result["scene_previews_path"] = scene_previews_path
         sm.state.update_task(
             task_id, state=const.TASK_STATE_COMPLETE, progress=100, **material_result
         )
@@ -1295,6 +1309,8 @@ def _run_pipeline(
         kwargs["scene_timeline_path"] = scene_timeline_path
     if scene_candidates_path:
         kwargs["scene_candidates_path"] = scene_candidates_path
+    if scene_previews_path:
+        kwargs["scene_previews_path"] = scene_previews_path
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )

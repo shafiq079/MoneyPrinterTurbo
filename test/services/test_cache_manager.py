@@ -101,3 +101,32 @@ class TestVideoCacheManager(unittest.TestCase):
             cache_manager.clean_video_cache(-1)
         with self.assertRaises(ValueError):
             cache_manager.clean_video_cache(1.5)
+
+    def test_preview_objects_and_source_records_use_existing_cleanup(self):
+        preview_root = self.cache_dir / "cache_candidate_previews"
+        objects = preview_root / "objects"
+        sources = preview_root / "sources"
+        objects.mkdir(parents=True)
+        sources.mkdir()
+        image = objects / f"poster-jpeg-v1-{'a' * 64}.jpg"
+        source = sources / f"source-v1-{'b' * 64}.json"
+        ignored = objects / "personal.jpg"
+        image.write_bytes(b"image")
+        source.write_bytes(b"source")
+        ignored.write_bytes(b"personal")
+
+        def storage_dir(name, **_kwargs):
+            if name == "cache_candidate_previews":
+                return str(preview_root)
+            return str(self.cache_dir)
+
+        with patch.object(cache_manager.utils, "storage_dir", side_effect=storage_dir):
+            stats = cache_manager.get_video_cache_stats()
+            result = cache_manager.clean_video_cache()
+
+        self.assertEqual(stats.file_count, 2)
+        self.assertEqual(stats.total_size, 11)
+        self.assertEqual(result.deleted_count, 2)
+        self.assertFalse(image.exists())
+        self.assertFalse(source.exists())
+        self.assertTrue(ignored.exists())
