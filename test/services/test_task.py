@@ -44,6 +44,8 @@ class TestTaskService(unittest.TestCase):
         candidate_path=None,
         preview_result="scene_previews.json",
         preview_error=None,
+        selection_result="scene_selections.json",
+        selection_error=None,
         stop_at="materials",
     ):
         timeline_path = Path(tmp_path) / "scenes.json"
@@ -93,6 +95,14 @@ class TestTaskService(unittest.TestCase):
                     side_effect=preview_error,
                 )
             )
+            selection = stack.enter_context(
+                patch.object(
+                    tm.scene_selection,
+                    "create_scene_selections",
+                    return_value=selection_result,
+                    side_effect=selection_error,
+                )
+            )
             get_materials = stack.enter_context(
                 patch.object(tm, "get_video_materials", return_value=materials)
             )
@@ -112,48 +122,62 @@ class TestTaskService(unittest.TestCase):
             )
             stack.enter_context(patch.object(tm.sm, "state", state))
             result = tm.start("preview-pipeline", params, stop_at=stop_at)
-        return result, state, retrieve, preview, get_materials, render, materials
+        return (
+            result,
+            state,
+            retrieve,
+            preview,
+            selection,
+            get_materials,
+            render,
+            materials,
+        )
 
     def test_preview_pipeline_gating_and_material_stop_result(self):
         with tempfile.TemporaryDirectory() as tmp:
-            result, _, retrieve, preview, get_materials, _, materials = (
+            result, _, retrieve, preview, selection, get_materials, _, materials = (
                 self._run_preview_pipeline(tmp, matching=False)
             )
             retrieve.assert_not_called()
             preview.assert_not_called()
+            selection.assert_not_called()
             get_materials.assert_called_once()
             self.assertEqual(result, {"materials": materials})
 
-            result, _, retrieve, preview, get_materials, _, _ = (
+            result, _, retrieve, preview, selection, get_materials, _, _ = (
                 self._run_preview_pipeline(tmp, source="local")
             )
             retrieve.assert_not_called()
             preview.assert_not_called()
+            selection.assert_not_called()
             get_materials.assert_called_once()
             self.assertNotIn("scene_previews_path", result)
 
-            result, _, _, preview, _, _, _ = self._run_preview_pipeline(
+            result, _, _, preview, selection, _, _, _ = self._run_preview_pipeline(
                 tmp, candidate_path=""
             )
             preview.assert_not_called()
+            selection.assert_not_called()
             self.assertNotIn("scene_previews_path", result)
 
-            result, _, _, preview, _, _, _ = self._run_preview_pipeline(tmp)
+            result, _, _, preview, selection, _, _, _ = self._run_preview_pipeline(tmp)
             preview.assert_called_once()
+            selection.assert_not_called()
             self.assertTrue(
                 preview.call_args.args[0].endswith("scene_candidates.json")
             )
             self.assertEqual(result["scene_previews_path"], "scene_previews.json")
 
-            result, _, _, preview, _, _, _ = self._run_preview_pipeline(
+            result, _, _, preview, selection, _, _, _ = self._run_preview_pipeline(
                 tmp, candidate_path=str(Path(tmp) / "missing.json")
             )
             preview.assert_not_called()
+            selection.assert_not_called()
             self.assertNotIn("scene_previews_path", result)
 
     def test_preview_failure_is_nonfatal_and_preserves_renderer_arguments(self):
         with tempfile.TemporaryDirectory() as tmp:
-            result, state, _, preview, get_materials, render, materials = (
+            result, state, _, preview, selection, get_materials, render, materials = (
                 self._run_preview_pipeline(
                     tmp,
                     preview_error=RuntimeError("preview failed"),
@@ -161,6 +185,7 @@ class TestTaskService(unittest.TestCase):
                 )
             )
         preview.assert_called_once()
+        selection.assert_not_called()
         get_materials.assert_called_once()
         render.assert_called_once()
         self.assertIs(render.call_args.args[2], materials)
@@ -170,7 +195,7 @@ class TestTaskService(unittest.TestCase):
 
     def test_successful_preview_is_exposed_in_final_task_state(self):
         with tempfile.TemporaryDirectory() as tmp:
-            result, state, _, _, _, render, materials = self._run_preview_pipeline(
+            result, state, _, _, _, _, render, materials = self._run_preview_pipeline(
                 tmp, stop_at="video"
             )
         self.assertEqual(result["scene_previews_path"], "scene_previews.json")
@@ -179,6 +204,43 @@ class TestTaskService(unittest.TestCase):
             "scene_previews.json",
         )
         self.assertIs(render.call_args.args[2], materials)
+
+    def test_scene_selection_is_additive_and_nonfatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            preview_path = Path(tmp) / "scene_previews.json"
+            preview_path.write_text("{}", encoding="utf-8")
+            result, _, _, _, selection, get_materials, _, materials = (
+                self._run_preview_pipeline(
+                    tmp,
+                    preview_result=str(preview_path),
+                    selection_result=str(Path(tmp) / "scene_selections.json"),
+                )
+            )
+            selection.assert_called_once()
+            self.assertEqual(
+                selection.call_args.args,
+                (str(Path(tmp) / "scene_candidates.json"), str(preview_path)),
+            )
+            self.assertEqual(
+                result["scene_selections_path"],
+                str(Path(tmp) / "scene_selections.json"),
+            )
+            get_materials.assert_called_once()
+            self.assertEqual(result["materials"], materials)
+
+            result, _, _, _, selection, get_materials, render, materials = (
+                self._run_preview_pipeline(
+                    tmp,
+                    preview_result=str(preview_path),
+                    selection_error=RuntimeError("secret path must not escape"),
+                    stop_at="video",
+                )
+            )
+            selection.assert_called_once()
+            get_materials.assert_called_once()
+            render.assert_called_once()
+            self.assertIs(render.call_args.args[2], materials)
+            self.assertNotIn("scene_selections_path", result)
 
     def test_is_task_busy_covers_generation_and_cross_posting(self):
         """删除入口必须同时识别视频生成和跨平台发布的活跃状态。"""
