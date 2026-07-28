@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import socket
 import tempfile
@@ -366,6 +367,8 @@ _SCENE_RANKING_INTEGER_BOUNDS = {
     "total_deadline_seconds": (1, 900),
     "max_attempts_per_scene": (1, 2),
 }
+_SCENE_RANKING_API_KEY_MAX_BYTES = 4096
+_SCENE_RANKING_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def get_scene_ranking_config(environ=None) -> SceneRankingConfig:
@@ -388,6 +391,11 @@ def get_scene_ranking_config(environ=None) -> SceneRankingConfig:
             raise ValueError(f"scene_ranking.{name} is outside the supported range")
     environment = os.environ if environ is None else environ
     api_key = environment.get("NVIDIA_API_KEY", values["api_key"])
-    if type(api_key) is not str:
-        raise ValueError("NVIDIA_API_KEY must be a string")
+    if (
+        type(api_key) is not str
+        or api_key != api_key.strip()
+        or len(api_key.encode("utf-8")) > _SCENE_RANKING_API_KEY_MAX_BYTES
+        or _SCENE_RANKING_CONTROL.search(api_key)
+    ):
+        raise ValueError("scene ranking API key is invalid")
     return SceneRankingConfig(**{**values, "api_key": api_key})

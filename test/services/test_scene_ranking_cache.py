@@ -1,6 +1,8 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from app.services import scene_ranking, scene_ranking_cache
 
 
@@ -64,3 +66,48 @@ def test_atomic_write_failure_leaves_no_temporary(tmp_path):
         except OSError:
             pass
     assert list(Path(tmp_path).glob("*.tmp")) == []
+
+
+@pytest.mark.parametrize("digest", ["", "A" * 64, "g" * 64, "../" + "a" * 64, "a" * 63])
+def test_invalid_digests_are_rejected_without_filesystem_access(digest):
+    with patch.object(scene_ranking_cache, "cache_dir") as directory:
+        assert scene_ranking_cache.load(digest, lambda value: value) == (None, True)
+        directory.assert_not_called()
+    with pytest.raises(ValueError):
+        scene_ranking_cache.object_name(digest)
+
+
+def test_duplicate_keys_oversize_symlink_and_invalid_response_are_corrupt(tmp_path):
+    key = "d" * 64
+
+    def validator(value):
+        return scene_ranking.validate_response(value, 1, ("C01",))
+
+    with patch.object(
+        scene_ranking_cache, "cache_dir", side_effect=lambda create=True: tmp_path
+    ):
+        path = tmp_path / scene_ranking_cache.object_name(key)
+        path.write_text(
+            '{"cache_version":"scene-ranking-cache-v1","identity":"'
+            + key
+            + '","identity":"'
+            + key
+            + '","response":{}}',
+            encoding="utf-8",
+        )
+        assert scene_ranking_cache.load(key, validator) == (None, True)
+        assert not path.exists()
+
+        path.write_bytes(b"x" * (scene_ranking_cache.MAX_CACHE_BYTES + 1))
+        assert scene_ranking_cache.load(key, validator) == (None, True)
+        assert not path.exists()
+
+        target = tmp_path / "target.json"
+        target.write_text("{}", encoding="utf-8")
+        path.symlink_to(target)
+        assert scene_ranking_cache.load(key, validator) == (None, True)
+        assert not path.exists()
+
+        scene_ranking_cache.store(key, {"scene_index": 1, "assessments": []})
+        assert scene_ranking_cache.load(key, validator) == (None, True)
+        assert not path.exists()

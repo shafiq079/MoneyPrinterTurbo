@@ -197,3 +197,14 @@ class TestConfigPersistence:
                 pytest.raises(ValueError),
             ):
                 config.get_scene_ranking_config({})
+
+    @pytest.mark.parametrize(
+        "api_key",
+        [" leading", "trailing ", "line\nbreak", "x" * 4097, 123],
+    )
+    def test_scene_ranking_rejects_malformed_api_keys(self, api_key):
+        with (
+            patch.object(config, "scene_ranking", {"enabled": True}),
+            pytest.raises(ValueError),
+        ):
+            config.get_scene_ranking_config({"NVIDIA_API_KEY": api_key})

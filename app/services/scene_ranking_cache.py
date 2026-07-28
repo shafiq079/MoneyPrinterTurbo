@@ -14,6 +14,7 @@ from app.utils import utils
 CACHE_VERSION = "scene-ranking-cache-v1"
 MAX_CACHE_BYTES = 64_000
 _NAME = re.compile(r"^ranking-v1-[0-9a-f]{64}\.json$")
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
 def cache_dir(create: bool = True) -> Path:
@@ -32,7 +33,18 @@ def identity(payload: dict) -> str:
 
 
 def object_name(digest: str) -> str:
+    if type(digest) is not str or not _DIGEST.fullmatch(digest):
+        raise ValueError("invalid ranking cache digest")
     return f"ranking-v1-{digest}.json"
+
+
+def _no_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate cache key")
+        result[key] = value
+    return result
 
 
 def _remove(path: Path) -> None:
@@ -46,6 +58,8 @@ def _remove(path: Path) -> None:
 
 
 def load(digest: str, validator):
+    if type(digest) is not str or not _DIGEST.fullmatch(digest):
+        return None, True
     directory = cache_dir(create=False)
     if directory.is_symlink():
         return None, True
@@ -62,6 +76,7 @@ def load(digest: str, validator):
             return None, True
         payload = json.loads(
             raw.decode("utf-8"),
+            object_pairs_hook=_no_duplicates,
             parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
         )
         if (
@@ -79,6 +94,7 @@ def load(digest: str, validator):
 
 
 def store(digest: str, response: dict) -> None:
+    object_filename = object_name(digest)
     directory = cache_dir(create=True)
     if directory.is_symlink() or not directory.is_dir():
         raise OSError("ranking cache directory is invalid")
@@ -98,7 +114,7 @@ def store(digest: str, response: dict) -> None:
             output.write(data)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, directory / object_name(digest))
+        os.replace(temporary, directory / object_filename)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

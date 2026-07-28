@@ -487,6 +487,9 @@ def test_enabled_ranking_selects_safe_candidate_and_counts_usage(artifacts):
     assert ranked["visual_safety_evaluated"] is True
     assert data["usage"]["vlm_requests_started"] == 1
     assert data["usage"]["vlm_attempts_started"] == 1
+    assert data["selection_policy_version"] == "nvidia-poster-rank-v1"
+    assert "_preview_bytes" not in Path(target).read_text(encoding="utf-8")
+    assert '"_source"' not in Path(target).read_text(encoding="utf-8")
     request.assert_called_once()
     store.assert_called_once()
 
@@ -513,6 +516,141 @@ def test_all_unsafe_cache_hit_needs_no_key_or_fallback(artifacts):
     assert ranked["fallback_reason"] is None
     assert all(item["safety_excluded"] is True for item in ranked["candidates"])
     request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("attempts", "expected_requests", "expected_attempts"),
+    [(0, 0, 0), (1, 1, 1), (2, 1, 2)],
+)
+def test_failed_remote_request_usage_is_exact(
+    artifacts, attempts, expected_requests, expected_attempts
+):
+    candidates, previews, objects, _, _ = artifacts
+    error = scene_selection.scene_ranking.RankingError(
+        "ranking_deadline_exhausted" if attempts == 0 else "vlm_request_failed",
+        attempts=attempts,
+    )
+    with (
+        patch.object(
+            scene_selection.utils, "storage_dir", return_value=str(objects.parent)
+        ),
+        patch.object(
+            scene_selection.scene_ranking_cache, "load", return_value=(None, False)
+        ),
+        patch.object(
+            scene_selection.scene_ranking, "request_remote", side_effect=error
+        ),
+    ):
+        target = scene_selection.create_scene_selections(
+            str(candidates), str(previews), ranking_config=_ranking_config()
+        )
+    usage = json.loads(Path(target).read_text(encoding="utf-8"))["usage"]
+    assert usage["vlm_requests_started"] == expected_requests
+    assert usage["vlm_attempts_started"] == expected_attempts
+
+
+@pytest.mark.parametrize(
+    "invalid_setting",
+    [
+        {"provider": "unsupported"},
+        {"model": "unsupported"},
+        {"api_key": "malformed\nvalue"},
+    ],
+)
+def test_invalid_requested_config_skips_derivative_cache_and_network(
+    artifacts, invalid_setting
+):
+    candidates, previews, objects, _, _ = artifacts
+    with (
+        patch.object(
+            scene_selection.utils, "storage_dir", return_value=str(objects.parent)
+        ),
+        patch.object(
+            scene_selection.config,
+            "scene_ranking",
+            {"enabled": True, **invalid_setting},
+        ),
+        patch.object(scene_selection.scene_ranking, "prepare") as prepare,
+        patch.object(scene_selection.scene_ranking_cache, "load") as cache_load,
+        patch.object(scene_selection.scene_ranking, "request_remote") as request,
+    ):
+        target = scene_selection.create_scene_selections(str(candidates), str(previews))
+    raw = Path(target).read_text(encoding="utf-8")
+    data = json.loads(raw)
+    assert data["scenes"][0]["status"] == "provider_rank_fallback"
+    assert data["scenes"][0]["fallback_reason"] == "ranking_not_configured"
+    assert data["scenes"][1]["status"] == "hold_no_search"
+    assert data["scenes"][2]["status"] == "no_candidates"
+    assert data["selection_policy_version"] == "nvidia-poster-rank-v1"
+    assert "unsupported" not in raw
+    assert "malformed" not in raw
+    prepare.assert_not_called()
+    cache_load.assert_not_called()
+    request.assert_not_called()
+
+
+def test_incomplete_preview_coverage_skips_cache_and_network(artifacts):
+    candidates, previews, objects, _, _ = artifacts
+    next(objects.glob("poster-*.jpg")).unlink()
+    with (
+        patch.object(
+            scene_selection.utils, "storage_dir", return_value=str(objects.parent)
+        ),
+        patch.object(scene_selection.scene_ranking_cache, "load") as cache_load,
+        patch.object(scene_selection.scene_ranking, "request_remote") as request,
+    ):
+        target = scene_selection.create_scene_selections(
+            str(candidates), str(previews), ranking_config=_ranking_config()
+        )
+    data = json.loads(Path(target).read_text(encoding="utf-8"))
+    assert data["scenes"][0]["fallback_reason"] == "incomplete_preview_coverage"
+    assert data["usage"]["vlm_requests_started"] == 0
+    assert data["usage"]["vlm_attempts_started"] == 0
+    cache_load.assert_not_called()
+    request.assert_not_called()
+
+
+def test_mixed_safety_and_all_tie_breaks():
+    def source(identifier, rank):
+        return {
+            "candidate_id": identifier,
+            "provider": "pexels",
+            "provider_video_id": identifier,
+            "provider_page_url": "https://example.invalid",
+            "video_url": "https://example.invalid/video.mp4",
+            "provider_rank": rank,
+        }
+
+    candidates = [
+        {
+            "candidate_id": identifier,
+            "provider_rank": rank,
+            "manifest_position": position,
+            "local_order": None,
+            "preview_sha256": f"{position:064x}",
+            "_source": source(identifier, rank),
+        }
+        for position, (identifier, rank) in enumerate(
+            [("pexels:z", 2), ("pexels:b", 1), ("pexels:a", 1), ("pexels:unsafe", 0)]
+        )
+    ]
+    scene = {"candidates": candidates, "selected_candidate": None}
+    response = {
+        "assessments": [
+            {
+                "label": f"C{index:02d}",
+                "relevance": 80,
+                "visual_quality": 80,
+                "mismatch": 20,
+                "unsafe": index == 4,
+            }
+            for index in range(1, 5)
+        ]
+    }
+    scene_selection._apply_ranking(scene, response)
+    assert [row["local_order"] for row in candidates] == [3, 1, 2, None]
+    assert candidates[3]["safety_excluded"] is True
+    assert scene["selected_candidate_id"] == "pexels:b"
 
 
 def test_missing_key_cache_miss_falls_back_without_request(artifacts):

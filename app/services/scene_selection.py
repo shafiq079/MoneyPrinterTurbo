@@ -21,6 +21,7 @@ from app.utils import utils
 
 MANIFEST_VERSION = 1
 SELECTION_POLICY_VERSION = "provider-rank-v1"
+RANKING_SELECTION_POLICY_VERSION = "nvidia-poster-rank-v1"
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 MAX_NORMALIZED_PREVIEW_OBJECT_BYTES = 4 * 1024 * 1024
 MAX_CANDIDATES_PER_SCENE = 12
@@ -775,6 +776,7 @@ def create_scene_selections(
     )
     preview_digest = hashlib.sha256(preview_bytes).hexdigest()
 
+    config_invalid = False
     if ranking_config is None:
         try:
             ranking_config = config.get_scene_ranking_config()
@@ -782,6 +784,7 @@ def create_scene_selections(
         except ValueError:
             ranking_config = None
             ranking_enabled = config.scene_ranking.get("enabled") is True
+            config_invalid = ranking_enabled
     else:
         ranking_enabled = ranking_config.enabled
     scenes = []
@@ -913,10 +916,16 @@ def create_scene_selections(
     clock = monotonic or __import__("time").monotonic
     sleeper = sleep or __import__("time").sleep
     if ranking_enabled:
+        if config_invalid:
+            for scene in scenes:
+                if scene["status"] not in {"hold_no_search", "no_candidates"}:
+                    _fallback(scene, "ranking_not_configured")
         if ranking_config is not None:
             ranking_deadline = clock() + ranking_config.total_deadline_seconds
-        for source_scene, scene in zip(
-            candidate_manifest["scenes"], scenes, strict=True
+        for source_scene, scene in (
+            []
+            if config_invalid
+            else zip(candidate_manifest["scenes"], scenes, strict=True)
         ):
             if scene["status"] in {"hold_no_search", "no_candidates"}:
                 continue
@@ -945,6 +954,9 @@ def create_scene_selections(
                 )
             except scene_ranking.RankingError as exc:
                 _fallback(scene, exc.reason)
+                continue
+            except ValueError:
+                _fallback(scene, "incomplete_preview_coverage")
                 continue
 
             def validator(response, si=scene["scene_index"], labels=prepared.labels):
@@ -981,7 +993,6 @@ def create_scene_selections(
             if clock() >= ranking_deadline:
                 _fallback(scene, "ranking_deadline_exhausted")
                 continue
-            ranking_usage["vlm_requests_started"] += 1
             try:
                 response, attempts = scene_ranking.request_remote(
                     prepared,
@@ -993,6 +1004,7 @@ def create_scene_selections(
                     sleep=sleeper,
                     deadline=ranking_deadline,
                 )
+                ranking_usage["vlm_requests_started"] += int(attempts > 0)
                 ranking_usage["vlm_attempts_started"] += attempts
                 _apply_ranking(scene, response)
                 try:
@@ -1002,7 +1014,8 @@ def create_scene_selections(
                     # persistence fails; no secret or provider body is logged.
                     pass
             except scene_ranking.RankingError as exc:
-                ranking_usage["vlm_attempts_started"] += getattr(exc, "attempts", 1)
+                ranking_usage["vlm_requests_started"] += int(exc.attempts > 0)
+                ranking_usage["vlm_attempts_started"] += exc.attempts
                 _fallback(scene, exc.reason)
 
     for scene in scenes:
@@ -1016,7 +1029,11 @@ def create_scene_selections(
         "source_preview_manifest": {"version": 1, "sha256": preview_digest},
         "provider": candidate_manifest["provider"],
         "video_aspect": candidate_manifest["video_aspect"],
-        "selection_policy_version": SELECTION_POLICY_VERSION,
+        "selection_policy_version": (
+            RANKING_SELECTION_POLICY_VERSION
+            if ranking_enabled
+            else SELECTION_POLICY_VERSION
+        ),
         "ranking": {
             "provider": scene_ranking.PROVIDER if ranking_enabled else None,
             "model": scene_ranking.MODEL if ranking_enabled else None,
