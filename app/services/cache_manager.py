@@ -18,6 +18,7 @@ from app.utils import utils
 _VIDEO_CACHE_FILE_PATTERN = re.compile(r"^vid-[0-9a-f]{32}\.mp4$")
 _PREVIEW_OBJECT_PATTERN = re.compile(r"^poster-jpeg-v1-[0-9a-f]{64}\.jpg$")
 _PREVIEW_SOURCE_PATTERN = re.compile(r"^source-v1-[0-9a-f]{64}\.json$")
+_RANKING_PATTERN = re.compile(r"^ranking-v1-[0-9a-f]{64}\.json$")
 _SECONDS_PER_DAY = 24 * 60 * 60
 
 
@@ -62,6 +63,7 @@ def _managed_cache_directories():
         (video_cache_dir(), _VIDEO_CACHE_FILE_PATTERN),
         (os.path.join(preview_root, "objects"), _PREVIEW_OBJECT_PATTERN),
         (os.path.join(preview_root, "sources"), _PREVIEW_SOURCE_PATTERN),
+        (os.path.realpath(utils.storage_dir("cache_scene_rankings")), _RANKING_PATTERN),
     )
 
 
@@ -182,9 +184,7 @@ def clean_video_cache(max_age_days: int | None = None) -> VideoCacheCleanupResul
 
     _validate_max_age_days(max_age_days)
     now = time.time()
-    logger.info(
-        f"start cleaning video cache: max_age_days={max_age_days}"
-    )
+    logger.info(f"start cleaning video cache: max_age_days={max_age_days}")
 
     candidate_count = 0
     candidate_size = 0

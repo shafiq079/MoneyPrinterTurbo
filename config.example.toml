@@ -297,6 +297,23 @@ compute_type = "int8"
 # https = "http://127.0.0.1:1080"
 
 # =============================================================================
+# Optional NVIDIA Poster Ranking / 可选 NVIDIA 海报排序
+# =============================================================================
+
+# Enabling this sends scene narration, search queries, and provider poster
+# images to NVIDIA's hosted trial/development service, subject to NVIDIA terms.
+[scene_ranking]
+enabled = false
+provider = "nvidia_hosted"
+api_key = ""
+model = "nvidia/nemotron-nano-12b-v2-vl"
+max_remote_scene_requests_per_task = 12
+connect_timeout_seconds = 10
+read_timeout_seconds = 45
+total_deadline_seconds = 300
+max_attempts_per_scene = 2
+
+# =============================================================================
 # TTS Providers / 语音合成服务
 # =============================================================================
 

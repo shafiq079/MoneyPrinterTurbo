@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -84,7 +85,9 @@ def _candidate_manifest(path: Path) -> bytes:
 def _jpeg(path: Path, color: tuple[int, int, int]) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     image = Image.new("RGB", (16, 12), color)
-    image.save(path, "JPEG", quality=85, optimize=False, progressive=False, subsampling=2)
+    image.save(
+        path, "JPEG", quality=85, optimize=False, progressive=False, subsampling=2
+    )
     data = path.read_bytes()
     digest = hashlib.sha256(data).hexdigest()
     final_path = path.parent / f"poster-jpeg-v1-{digest}.jpg"
@@ -97,13 +100,14 @@ def _jpeg(path: Path, color: tuple[int, int, int]) -> dict:
         "height": 12,
         "byte_size": len(data),
         "cache_reference": (
-            "cache_candidate_previews/objects/"
-            f"poster-jpeg-v1-{digest}.jpg"
+            f"cache_candidate_previews/objects/poster-jpeg-v1-{digest}.jpg"
         ),
     }
 
 
-def _preview_manifest(path: Path, candidate_bytes: bytes, previews: list[dict]) -> bytes:
+def _preview_manifest(
+    path: Path, candidate_bytes: bytes, previews: list[dict]
+) -> bytes:
     payload = {
         "version": 1,
         "source_candidate_manifest": {
@@ -193,8 +197,14 @@ def test_complete_provider_neutral_manifest_and_deterministic_selection(artifact
     data = json.loads(Path(target).read_text(encoding="utf-8"))
     assert data["version"] == 1
     assert data["video_aspect"] == "9:16"
-    assert data["source_candidate_manifest"]["sha256"] == hashlib.sha256(candidate_bytes).hexdigest()
-    assert data["source_preview_manifest"]["sha256"] == hashlib.sha256(preview_bytes).hexdigest()
+    assert (
+        data["source_candidate_manifest"]["sha256"]
+        == hashlib.sha256(candidate_bytes).hexdigest()
+    )
+    assert (
+        data["source_preview_manifest"]["sha256"]
+        == hashlib.sha256(preview_bytes).hexdigest()
+    )
     assert data["selection_policy_version"] == "provider-rank-v1"
     assert set(data["ranking"].values()) == {None}
     assert data["usage"]["vlm_requests_started"] is None
@@ -291,7 +301,9 @@ def test_strict_manifest_validation_rejects_inconsistent_inputs(artifacts, mutat
     if mutation in {"candidate_version", "bool_rank", "hold_reference"}:
         candidate_bytes = json.dumps(candidate_payload).encode()
         candidates.write_bytes(candidate_bytes)
-        preview_payload["source_candidate_manifest"]["sha256"] = hashlib.sha256(candidate_bytes).hexdigest()
+        preview_payload["source_candidate_manifest"]["sha256"] = hashlib.sha256(
+            candidate_bytes
+        ).hexdigest()
     previews.write_text(json.dumps(preview_payload))
     with (
         patch.object(
@@ -352,9 +364,7 @@ def test_more_than_eight_warning_codes_are_bounded_and_deduplicated():
 
 def test_dimension_mismatch_is_rejected_before_pixel_decoding(artifacts):
     _, previews, objects, _, _ = artifacts
-    metadata = json.loads(previews.read_text())["scenes"][0]["candidates"][0][
-        "preview"
-    ]
+    metadata = json.loads(previews.read_text())["scenes"][0]["candidates"][0]["preview"]
     image = MagicMock()
     image.format = "JPEG"
     image.n_frames = 1
@@ -393,9 +403,134 @@ def test_atomic_publication_failure_leaves_no_partial_artifact(artifacts):
         patch.object(
             scene_selection.utils, "storage_dir", return_value=str(objects.parent)
         ),
-        patch.object(scene_selection.os, "replace", side_effect=OSError("disk failure")),
+        patch.object(
+            scene_selection.os, "replace", side_effect=OSError("disk failure")
+        ),
         pytest.raises(OSError),
     ):
         scene_selection.create_scene_selections(str(candidates), str(previews))
     assert not (candidates.parent / "scene_selections.json").exists()
     assert not list(candidates.parent.glob("*.tmp"))
+
+
+@pytest.mark.parametrize(
+    ("count", "budget", "expected"),
+    [
+        (5, 0, []),
+        (5, 1, [2]),
+        (5, 5, [0, 1, 2, 3, 4]),
+        (6, 2, [1, 4]),
+        (7, 3, [1, 3, 5]),
+    ],
+)
+def test_centered_stratified_allocation(count, budget, expected):
+    assert scene_selection._centered_allocation(count, budget) == expected
+
+
+def _ranking_config(api_key="unit-test-key"):
+    return SimpleNamespace(
+        enabled=True,
+        api_key=api_key,
+        max_remote_scene_requests_per_task=12,
+        connect_timeout_seconds=10,
+        read_timeout_seconds=45,
+        total_deadline_seconds=300,
+        max_attempts_per_scene=2,
+    )
+
+
+def _ranking_response(unsafe=False):
+    return {
+        "scene_index": 1,
+        "assessments": [
+            {
+                "label": "C01",
+                "relevance": 80,
+                "visual_quality": 80,
+                "mismatch": 20,
+                "unsafe": unsafe,
+            },
+            {
+                "label": "C02",
+                "relevance": 90,
+                "visual_quality": 90,
+                "mismatch": 10,
+                "unsafe": unsafe,
+            },
+        ],
+    }
+
+
+def test_enabled_ranking_selects_safe_candidate_and_counts_usage(artifacts):
+    candidates, previews, objects, _, _ = artifacts
+    with (
+        patch.object(
+            scene_selection.utils, "storage_dir", return_value=str(objects.parent)
+        ),
+        patch.object(
+            scene_selection.scene_ranking_cache, "load", return_value=(None, False)
+        ),
+        patch.object(scene_selection.scene_ranking_cache, "store") as store,
+        patch.object(
+            scene_selection.scene_ranking,
+            "request_remote",
+            return_value=(_ranking_response(), 1),
+        ) as request,
+    ):
+        target = scene_selection.create_scene_selections(
+            str(candidates), str(previews), ranking_config=_ranking_config()
+        )
+    data = json.loads(Path(target).read_text(encoding="utf-8"))
+    ranked = data["scenes"][0]
+    assert ranked["status"] == "vlm_selected"
+    assert ranked["selected_candidate_id"] == "pexels:winner"
+    assert ranked["visual_safety_evaluated"] is True
+    assert data["usage"]["vlm_requests_started"] == 1
+    assert data["usage"]["vlm_attempts_started"] == 1
+    request.assert_called_once()
+    store.assert_called_once()
+
+
+def test_all_unsafe_cache_hit_needs_no_key_or_fallback(artifacts):
+    candidates, previews, objects, _, _ = artifacts
+    with (
+        patch.object(
+            scene_selection.utils, "storage_dir", return_value=str(objects.parent)
+        ),
+        patch.object(
+            scene_selection.scene_ranking_cache,
+            "load",
+            return_value=(_ranking_response(True), False),
+        ),
+        patch.object(scene_selection.scene_ranking, "request_remote") as request,
+    ):
+        target = scene_selection.create_scene_selections(
+            str(candidates), str(previews), ranking_config=_ranking_config("")
+        )
+    ranked = json.loads(Path(target).read_text(encoding="utf-8"))["scenes"][0]
+    assert ranked["status"] == "no_safe_candidate"
+    assert ranked["selected_candidate_id"] is None
+    assert ranked["fallback_reason"] is None
+    assert all(item["safety_excluded"] is True for item in ranked["candidates"])
+    request.assert_not_called()
+
+
+def test_missing_key_cache_miss_falls_back_without_request(artifacts):
+    candidates, previews, objects, _, _ = artifacts
+    with (
+        patch.object(
+            scene_selection.utils, "storage_dir", return_value=str(objects.parent)
+        ),
+        patch.object(
+            scene_selection.scene_ranking_cache, "load", return_value=(None, False)
+        ),
+        patch.object(scene_selection.scene_ranking, "request_remote") as request,
+    ):
+        target = scene_selection.create_scene_selections(
+            str(candidates), str(previews), ranking_config=_ranking_config("")
+        )
+    data = json.loads(Path(target).read_text(encoding="utf-8"))
+    assert data["scenes"][0]["status"] == "provider_rank_fallback"
+    assert data["scenes"][0]["fallback_reason"] == "ranking_not_configured"
+    assert data["usage"]["vlm_requests_started"] == 0
+    request.assert_not_called()
