@@ -22,6 +22,7 @@ from app.services import (
     material,
     scene_candidate,
     scene_preview,
+    scene_selection,
     scene_timeline,
     sonilo,
     subtitle,
@@ -1180,6 +1181,7 @@ def _run_pipeline(
     scene_timeline_path = ""
     scene_candidates_path = ""
     scene_previews_path = ""
+    scene_selections_path = ""
     if params.match_materials_to_script:
         scene_timeline_path = scene_timeline.create_scene_timeline(
             task_dir=utils.task_dir(task_id),
@@ -1209,6 +1211,27 @@ def _run_pipeline(
                         scene_previews_path = scene_preview.prepare_scene_previews(
                             scene_candidates_path
                         )
+                        if scene_previews_path and os.path.isfile(
+                            scene_previews_path
+                        ):
+                            try:
+                                published_selection_path = (
+                                    scene_selection.create_scene_selections(
+                                        scene_candidates_path, scene_previews_path
+                                    )
+                                )
+                                if (
+                                    published_selection_path
+                                    and not os.path.islink(published_selection_path)
+                                    and os.path.isfile(published_selection_path)
+                                ):
+                                    scene_selections_path = published_selection_path
+                            except Exception as exc:
+                                logger.warning(
+                                    "scene selection preparation failed; continuing "
+                                    "with the existing material path: "
+                                    f"{type(exc).__name__}"
+                                )
                     except Exception as exc:
                         logger.warning(
                             "scene preview preparation failed; continuing with the "
@@ -1239,6 +1262,8 @@ def _run_pipeline(
             material_result["scene_candidates_path"] = scene_candidates_path
         if scene_previews_path:
             material_result["scene_previews_path"] = scene_previews_path
+        if scene_selections_path:
+            material_result["scene_selections_path"] = scene_selections_path
         sm.state.update_task(
             task_id, state=const.TASK_STATE_COMPLETE, progress=100, **material_result
         )
@@ -1311,6 +1336,8 @@ def _run_pipeline(
         kwargs["scene_candidates_path"] = scene_candidates_path
     if scene_previews_path:
         kwargs["scene_previews_path"] = scene_previews_path
+    if scene_selections_path:
+        kwargs["scene_selections_path"] = scene_selections_path
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )
