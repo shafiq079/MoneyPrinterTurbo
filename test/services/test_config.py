@@ -4,6 +4,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import pytest
+
 from app.config import config
 from app.models.llm_provider import LLM_PROVIDER_REGISTRY, get_llm_provider
 
@@ -152,3 +154,57 @@ class TestConfigPersistence:
 
         with config.try_runtime_config_lock() as acquired:
             assert acquired is True
+
+    def test_scene_ranking_defaults_and_environment_precedence(self):
+        with patch.object(config, "scene_ranking", {}):
+            settings = config.get_scene_ranking_config(
+                {"NVIDIA_API_KEY": "unit-test-key"}
+            )
+        assert settings.enabled is False
+        assert settings.api_key == "unit-test-key"
+        assert settings.max_remote_scene_requests_per_task == 12
+
+    def test_scene_ranking_example_has_only_empty_secret(self):
+        section = self._load_example_config()["scene_ranking"]
+        assert section["enabled"] is False
+        assert section["api_key"] == ""
+
+    def test_scene_ranking_strict_types_and_bounds(self):
+        bounds = {
+            "max_remote_scene_requests_per_task": (0, 60),
+            "connect_timeout_seconds": (1, 30),
+            "read_timeout_seconds": (1, 120),
+            "total_deadline_seconds": (1, 900),
+            "max_attempts_per_scene": (1, 2),
+        }
+        for name, (lower, upper) in bounds.items():
+            for valid in (lower, upper):
+                with patch.object(config, "scene_ranking", {name: valid}):
+                    assert getattr(config.get_scene_ranking_config({}), name) == valid
+            for invalid in (True, lower - 1, upper + 1):
+                with (
+                    patch.object(config, "scene_ranking", {name: invalid}),
+                    pytest.raises(ValueError),
+                ):
+                    config.get_scene_ranking_config({})
+        for values in (
+            {"enabled": 1},
+            {"provider": "other"},
+            {"model": "other"},
+        ):
+            with (
+                patch.object(config, "scene_ranking", values),
+                pytest.raises(ValueError),
+            ):
+                config.get_scene_ranking_config({})
+
+    @pytest.mark.parametrize(
+        "api_key",
+        [" leading", "trailing ", "line\nbreak", "x" * 4097, 123],
+    )
+    def test_scene_ranking_rejects_malformed_api_keys(self, api_key):
+        with (
+            patch.object(config, "scene_ranking", {"enabled": True}),
+            pytest.raises(ValueError),
+        ):
+            config.get_scene_ranking_config({"NVIDIA_API_KEY": api_key})

@@ -130,3 +130,24 @@ class TestVideoCacheManager(unittest.TestCase):
         self.assertFalse(image.exists())
         self.assertFalse(source.exists())
         self.assertTrue(ignored.exists())
+
+    def test_ranking_cache_is_registered_for_scan_and_cleanup(self):
+        ranking = self.cache_dir / "cache_scene_rankings"
+        ranking.mkdir()
+        record = ranking / f"ranking-v1-{'c' * 64}.json"
+        ignored = ranking / "notes.json"
+        record.write_bytes(b"rank")
+        ignored.write_bytes(b"keep")
+
+        def storage_dir(name, **_kwargs):
+            if name == "cache_scene_rankings":
+                return str(ranking)
+            return str(self.cache_dir / name)
+
+        with patch.object(cache_manager.utils, "storage_dir", side_effect=storage_dir):
+            stats = cache_manager.get_video_cache_stats()
+            result = cache_manager.clean_video_cache()
+        self.assertEqual(stats.file_count, 1)
+        self.assertEqual(result.deleted_count, 1)
+        self.assertFalse(record.exists())
+        self.assertTrue(ignored.exists())

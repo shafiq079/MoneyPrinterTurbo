@@ -1,8 +1,10 @@
 import os
+import re
 import shutil
 import socket
 import tempfile
 import threading
+from dataclasses import dataclass
 from contextlib import contextmanager
 
 import toml
@@ -149,8 +151,7 @@ def _decode_linux_route_gateway(hex_gateway: str) -> str:
         raise ValueError("invalid gateway length")
 
     octets = [
-        str(int(hex_gateway[index : index + 2], 16))
-        for index in range(6, -1, -2)
+        str(int(hex_gateway[index : index + 2], 16)) for index in range(6, -1, -2)
     ]
     return ".".join(octets)
 
@@ -259,6 +260,7 @@ def save_config():
         config_to_save["elevenlabs"] = dict(elevenlabs)
         config_to_save["chatterbox"] = dict(chatterbox)
         config_to_save["ui"] = dict(ui)
+        config_to_save["scene_ranking"] = dict(scene_ranking)
         serialized_config = toml.dumps(config_to_save)
 
         # WebUI 完整 rerun 结束时会调用保存。内容没有变化时直接返回，避免每次
@@ -299,6 +301,7 @@ azure = _SynchronizedConfig(_cfg.get("azure", {}))
 siliconflow = _SynchronizedConfig(_cfg.get("siliconflow", {}))
 elevenlabs = _SynchronizedConfig(_cfg.get("elevenlabs", {}))
 chatterbox = _SynchronizedConfig(_cfg.get("chatterbox", {}))
+scene_ranking = _SynchronizedConfig(_cfg.get("scene_ranking", {}))
 ui = _SynchronizedConfig(
     _cfg.get(
         "ui",
@@ -331,3 +334,68 @@ if ffmpeg_path and os.path.isfile(ffmpeg_path):
     os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_path
 
 logger.info(f"{project_name} v{project_version}")
+
+
+@dataclass(frozen=True)
+class SceneRankingConfig:
+    enabled: bool
+    provider: str
+    api_key: str
+    model: str
+    max_remote_scene_requests_per_task: int
+    connect_timeout_seconds: int
+    read_timeout_seconds: int
+    total_deadline_seconds: int
+    max_attempts_per_scene: int
+
+
+_SCENE_RANKING_DEFAULTS = {
+    "enabled": False,
+    "provider": "nvidia_hosted",
+    "api_key": "",
+    "model": "nvidia/nemotron-nano-12b-v2-vl",
+    "max_remote_scene_requests_per_task": 12,
+    "connect_timeout_seconds": 10,
+    "read_timeout_seconds": 45,
+    "total_deadline_seconds": 300,
+    "max_attempts_per_scene": 2,
+}
+_SCENE_RANKING_INTEGER_BOUNDS = {
+    "max_remote_scene_requests_per_task": (0, 60),
+    "connect_timeout_seconds": (1, 30),
+    "read_timeout_seconds": (1, 120),
+    "total_deadline_seconds": (1, 900),
+    "max_attempts_per_scene": (1, 2),
+}
+_SCENE_RANKING_API_KEY_MAX_BYTES = 4096
+_SCENE_RANKING_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def get_scene_ranking_config(environ=None) -> SceneRankingConfig:
+    """Return a strictly validated, secret-bearing runtime snapshot."""
+    values = {**_SCENE_RANKING_DEFAULTS, **dict(scene_ranking)}
+    if set(values) != set(_SCENE_RANKING_DEFAULTS):
+        raise ValueError("scene_ranking contains unsupported settings")
+    if type(values["enabled"]) is not bool:
+        raise ValueError("scene_ranking.enabled must be a boolean")
+    for name in ("provider", "api_key", "model"):
+        if type(values[name]) is not str:
+            raise ValueError(f"scene_ranking.{name} must be a string")
+    if values["provider"] != "nvidia_hosted":
+        raise ValueError("unsupported scene ranking provider")
+    if values["model"] != "nvidia/nemotron-nano-12b-v2-vl":
+        raise ValueError("unsupported scene ranking model")
+    for name, (minimum, maximum) in _SCENE_RANKING_INTEGER_BOUNDS.items():
+        value = values[name]
+        if type(value) is not int or not minimum <= value <= maximum:
+            raise ValueError(f"scene_ranking.{name} is outside the supported range")
+    environment = os.environ if environ is None else environ
+    api_key = environment.get("NVIDIA_API_KEY", values["api_key"])
+    if (
+        type(api_key) is not str
+        or api_key != api_key.strip()
+        or len(api_key.encode("utf-8")) > _SCENE_RANKING_API_KEY_MAX_BYTES
+        or _SCENE_RANKING_CONTROL.search(api_key)
+    ):
+        raise ValueError("scene ranking API key is invalid")
+    return SceneRankingConfig(**{**values, "api_key": api_key})
