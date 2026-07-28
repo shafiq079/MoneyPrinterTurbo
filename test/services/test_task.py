@@ -209,11 +209,26 @@ class TestTaskService(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             preview_path = Path(tmp) / "scene_previews.json"
             preview_path.write_text("{}", encoding="utf-8")
+            missing_selection_path = Path(tmp) / "missing-scene-selections.json"
             result, _, _, _, selection, get_materials, _, materials = (
                 self._run_preview_pipeline(
                     tmp,
                     preview_result=str(preview_path),
-                    selection_result=str(Path(tmp) / "scene_selections.json"),
+                    selection_result=str(missing_selection_path),
+                )
+            )
+            selection.assert_called_once()
+            self.assertNotIn("scene_selections_path", result)
+            get_materials.assert_called_once()
+            self.assertEqual(result["materials"], materials)
+
+            selection_path = Path(tmp) / "scene_selections.json"
+            selection_path.write_text("{}", encoding="utf-8")
+            result, _, _, _, selection, get_materials, _, materials = (
+                self._run_preview_pipeline(
+                    tmp,
+                    preview_result=str(preview_path),
+                    selection_result=str(selection_path),
                 )
             )
             selection.assert_called_once()
@@ -222,11 +237,28 @@ class TestTaskService(unittest.TestCase):
                 (str(Path(tmp) / "scene_candidates.json"), str(preview_path)),
             )
             self.assertEqual(
-                result["scene_selections_path"],
-                str(Path(tmp) / "scene_selections.json"),
+                result["scene_selections_path"], str(selection_path)
             )
             get_materials.assert_called_once()
             self.assertEqual(result["materials"], materials)
+
+            result, state, _, _, selection, get_materials, render, materials = (
+                self._run_preview_pipeline(
+                    tmp,
+                    preview_result=str(preview_path),
+                    selection_result=str(selection_path),
+                    stop_at="video",
+                )
+            )
+            selection.assert_called_once()
+            get_materials.assert_called_once()
+            render.assert_called_once()
+            self.assertIs(render.call_args.args[2], materials)
+            self.assertEqual(result["scene_selections_path"], str(selection_path))
+            self.assertEqual(
+                state.get_task("preview-pipeline")["scene_selections_path"],
+                str(selection_path),
+            )
 
             result, _, _, _, selection, get_materials, render, materials = (
                 self._run_preview_pipeline(

@@ -1,7 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from PIL import Image
@@ -185,7 +185,9 @@ def artifacts(tmp_path):
 
 def test_complete_provider_neutral_manifest_and_deterministic_selection(artifacts):
     candidates, previews, objects, candidate_bytes, preview_bytes = artifacts
-    with patch.object(scene_selection.scene_preview_cache, "object_dir", return_value=objects):
+    with patch.object(
+        scene_selection.utils, "storage_dir", return_value=str(objects.parent)
+    ):
         target = scene_selection.create_scene_selections(str(candidates), str(previews))
 
     data = json.loads(Path(target).read_text(encoding="utf-8"))
@@ -219,7 +221,9 @@ def test_missing_selected_object_is_truthful_but_does_not_block_selection(artifa
     payload = json.loads(previews.read_text())
     selected = payload["scenes"][0]["candidates"][1]["preview"]
     (objects / f"poster-jpeg-v1-{selected['image_sha256']}.jpg").unlink()
-    with patch.object(scene_selection.scene_preview_cache, "object_dir", return_value=objects):
+    with patch.object(
+        scene_selection.utils, "storage_dir", return_value=str(objects.parent)
+    ):
         target = scene_selection.create_scene_selections(str(candidates), str(previews))
     scene = json.loads(Path(target).read_text())["scenes"][0]
     assert scene["status"] == "provider_rank_selected"
@@ -235,7 +239,9 @@ def test_corrupt_nonselected_object_is_invalid_without_repair(artifacts):
     metadata = payload["scenes"][0]["candidates"][0]["preview"]
     object_path = objects / f"poster-jpeg-v1-{metadata['image_sha256']}.jpg"
     object_path.write_bytes(b"not a jpeg")
-    with patch.object(scene_selection.scene_preview_cache, "object_dir", return_value=objects):
+    with patch.object(
+        scene_selection.utils, "storage_dir", return_value=str(objects.parent)
+    ):
         target = scene_selection.create_scene_selections(str(candidates), str(previews))
     scene = json.loads(Path(target).read_text())["scenes"][0]
     assert scene["candidates"][0]["preview_status"] == "object_invalid"
@@ -288,7 +294,9 @@ def test_strict_manifest_validation_rejects_inconsistent_inputs(artifacts, mutat
         preview_payload["source_candidate_manifest"]["sha256"] = hashlib.sha256(candidate_bytes).hexdigest()
     previews.write_text(json.dumps(preview_payload))
     with (
-        patch.object(scene_selection.scene_preview_cache, "object_dir", return_value=objects),
+        patch.object(
+            scene_selection.utils, "storage_dir", return_value=str(objects.parent)
+        ),
         pytest.raises(ValueError),
     ):
         scene_selection.create_scene_selections(str(candidates), str(previews))
@@ -312,8 +320,23 @@ def test_bounded_regular_manifest_reads(tmp_path, kind):
         scene_selection.create_scene_selections(str(candidate), str(preview))
 
 
-def test_warning_codes_are_stable_deduplicated_and_bounded():
-    values = ["candidate_preview_not_ready"] * 3 + [
+def test_exactly_eight_warning_codes_are_retained_in_order():
+    values = [
+        "candidate_preview_not_ready",
+        "selected_preview_not_ready",
+        "source_provider_search_warning",
+        "source_provider_budget_warning",
+        "candidate_preview_object_missing",
+        "candidate_preview_object_invalid",
+        "selected_preview_object_missing",
+        "selected_preview_object_invalid",
+    ]
+    assert scene_selection._warnings([values[0], *values, "unknown"]) == values
+
+
+def test_more_than_eight_warning_codes_are_bounded_and_deduplicated():
+    values = [
+        "candidate_preview_not_ready",
         "selected_preview_not_ready",
         "source_provider_search_warning",
         "source_provider_budget_warning",
@@ -322,20 +345,54 @@ def test_warning_codes_are_stable_deduplicated_and_bounded():
         "selected_preview_object_missing",
         "selected_preview_object_invalid",
         "vlm_request_failed",
-        "raw warning must not escape",
     ]
-    result = scene_selection._warnings(values)
-    assert result[0] == "candidate_preview_not_ready"
-    assert len(result) == 8
-    assert result[-1] == "additional_warnings_omitted"
-    assert len(result) == len(set(result))
-    assert "raw warning must not escape" not in result
+    result = scene_selection._warnings([values[0], *values, "unknown"])
+    assert result == [*values[:7], "additional_warnings_omitted"]
+
+
+def test_dimension_mismatch_is_rejected_before_pixel_decoding(artifacts):
+    _, previews, objects, _, _ = artifacts
+    metadata = json.loads(previews.read_text())["scenes"][0]["candidates"][0][
+        "preview"
+    ]
+    image = MagicMock()
+    image.format = "JPEG"
+    image.n_frames = 1
+    image.size = (scene_selection.scene_preview_cache.MAX_NORMALIZED_EDGE + 1, 12)
+    image.mode = "RGB"
+    opened = MagicMock()
+    opened.__enter__.return_value = image
+    with (
+        patch.object(
+            scene_selection.utils, "storage_dir", return_value=str(objects.parent)
+        ),
+        patch.object(scene_selection.Image, "open", return_value=opened),
+    ):
+        assert scene_selection._validate_preview_object(metadata) == "object_invalid"
+    image.load.assert_not_called()
+
+
+def test_missing_preview_object_does_not_create_cache_directory(tmp_path):
+    cache_root = tmp_path / "storage" / "cache_candidate_previews"
+    metadata = {
+        "image_sha256": "0" * 64,
+        "byte_size": 1,
+        "width": 1,
+        "height": 1,
+    }
+    with patch.object(
+        scene_selection.utils, "storage_dir", return_value=str(cache_root)
+    ):
+        assert scene_selection._validate_preview_object(metadata) == "object_missing"
+    assert not cache_root.exists()
 
 
 def test_atomic_publication_failure_leaves_no_partial_artifact(artifacts):
     candidates, previews, objects, _, _ = artifacts
     with (
-        patch.object(scene_selection.scene_preview_cache, "object_dir", return_value=objects),
+        patch.object(
+            scene_selection.utils, "storage_dir", return_value=str(objects.parent)
+        ),
         patch.object(scene_selection.os, "replace", side_effect=OSError("disk failure")),
         pytest.raises(OSError),
     ):

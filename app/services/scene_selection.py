@@ -8,6 +8,7 @@ import math
 import os
 import re
 import tempfile
+import warnings
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
@@ -15,6 +16,7 @@ from pathlib import Path
 from PIL import Image, UnidentifiedImageError
 
 from app.services import scene_preview_cache
+from app.utils import utils
 
 MANIFEST_VERSION = 1
 SELECTION_POLICY_VERSION = "provider-rank-v1"
@@ -462,26 +464,45 @@ def _validate_preview_metadata(preview: dict, normalization: str) -> None:
 def _validate_preview_object(metadata: dict) -> str:
     digest = metadata["image_sha256"]
     try:
-        path = scene_preview_cache.object_dir() / scene_preview_cache.object_name(
-            digest
-        )
+        object_directory = Path(
+            utils.storage_dir("cache_candidate_previews", create=False)
+        ) / "objects"
+        if object_directory.is_symlink() or not object_directory.is_dir():
+            return "object_missing"
+        path = object_directory / scene_preview_cache.object_name(digest)
         stat = path.lstat()
         if path.is_symlink() or not path.is_file():
             return "object_invalid"
-        if stat.st_size != metadata["byte_size"] or stat.st_size > MAX_NORMALIZED_PREVIEW_OBJECT_BYTES:
+        if (
+            stat.st_size != metadata["byte_size"]
+            or stat.st_size > MAX_NORMALIZED_PREVIEW_OBJECT_BYTES
+        ):
             return "object_invalid"
         with path.open("rb") as stream:
             data = stream.read(MAX_NORMALIZED_PREVIEW_OBJECT_BYTES + 1)
-        if len(data) != metadata["byte_size"] or hashlib.sha256(data).hexdigest() != digest:
+        if (
+            len(data) != metadata["byte_size"]
+            or hashlib.sha256(data).hexdigest() != digest
+        ):
             return "object_invalid"
-        with Image.open(BytesIO(data)) as image:
-            if image.format != "JPEG" or getattr(image, "n_frames", 1) != 1:
-                return "object_invalid"
-            image.load()
-            if image.mode != "RGB" or image.size != (metadata["width"], metadata["height"]):
-                return "object_invalid"
-            if image.width * image.height > scene_preview_cache.MAX_DECODED_PIXELS or max(image.size) > scene_preview_cache.MAX_NORMALIZED_EDGE:
-                return "object_invalid"
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(data)) as image:
+                width, height = image.size
+                if image.format != "JPEG" or getattr(image, "n_frames", 1) != 1:
+                    return "object_invalid"
+                if width <= 0 or height <= 0:
+                    return "object_invalid"
+                if (width, height) != (metadata["width"], metadata["height"]):
+                    return "object_invalid"
+                if (
+                    width * height > scene_preview_cache.MAX_DECODED_PIXELS
+                    or max(width, height) > scene_preview_cache.MAX_NORMALIZED_EDGE
+                ):
+                    return "object_invalid"
+                if image.mode != "RGB":
+                    return "object_invalid"
+                image.load()
         return "valid"
     except FileNotFoundError:
         return "object_missing"
@@ -491,6 +512,7 @@ def _validate_preview_object(metadata: dict) -> str:
         TypeError,
         UnidentifiedImageError,
         Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
     ):
         return "object_invalid"
 
@@ -498,13 +520,11 @@ def _validate_preview_object(metadata: dict) -> str:
 def _warnings(values: list[str]) -> list[str]:
     unique: list[str] = []
     for value in values:
-        if value not in WARNING_CODES or value in unique:
-            continue
-        if len(unique) == MAX_WARNINGS - 1:
-            unique.append("additional_warnings_omitted")
-            break
-        unique.append(value)
-    return unique
+        if value in WARNING_CODES and value not in unique:
+            unique.append(value)
+    if len(unique) <= MAX_WARNINGS:
+        return unique
+    return [*unique[: MAX_WARNINGS - 1], "additional_warnings_omitted"]
 
 
 def _atomic_write(path: Path, payload: dict) -> None:

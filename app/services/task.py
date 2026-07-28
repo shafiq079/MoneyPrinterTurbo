@@ -1215,12 +1215,17 @@ def _run_pipeline(
                             scene_previews_path
                         ):
                             try:
-                                scene_selections_path = (
+                                published_selection_path = (
                                     scene_selection.create_scene_selections(
-                                        scene_candidates_path,
-                                        scene_previews_path,
+                                        scene_candidates_path, scene_previews_path
                                     )
                                 )
+                                if (
+                                    published_selection_path
+                                    and not os.path.islink(published_selection_path)
+                                    and os.path.isfile(published_selection_path)
+                                ):
+                                    scene_selections_path = published_selection_path
                             except Exception as exc:
                                 logger.warning(
                                     "scene selection preparation failed; continuing "
