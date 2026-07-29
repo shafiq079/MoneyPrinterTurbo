@@ -234,7 +234,11 @@ def _validate_selections(
 def _usable_url(value) -> str | None:
     if not isinstance(value, str) or not value or value != value.strip():
         return None
-    if len(value) > 4096 or _CONTROL.search(value):
+    if (
+        len(value) > 4096
+        or _CONTROL.search(value)
+        or any(char.isspace() for char in value)
+    ):
         return None
     try:
         parsed = urlsplit(value)

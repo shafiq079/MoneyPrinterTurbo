@@ -118,6 +118,44 @@ class TestSceneRenderPlan(unittest.TestCase):
         self.assertEqual(last["end_time"], timeline[2]["end_time"])
         self.assertEqual(last["duration"], timeline[2]["duration"])
 
+    def test_all_selected_statuses_and_valid_url_forms(self):
+        cases = (
+            (
+                "provider_rank_selected",
+                "https://cdn.example/video.mp4?token=a%2Bb&expires=1",
+            ),
+            ("provider_rank_fallback", "https://cdn.example/a%20b/video.mp4"),
+            ("vlm_selected", "https://cdn.example/video.mp4"),
+        )
+        for status, url in cases:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                timeline = [self._timeline()[0]]
+                selected = self._selected(1, url=url)
+                selected["status"] = status
+                paths = self._write(tmp, timeline, self._selection([selected]))
+                target = scene_render_plan.create_scene_render_plan(
+                    *(str(path) for path in paths)
+                )
+                row = json.loads(Path(target).read_text(encoding="utf-8"))["scenes"][0]
+                self.assertEqual(row["binding"], "selected")
+                self.assertEqual(row["video_url"], url)
+                self.assertIsNone(row["fallback_reason"])
+
+    def test_unicode_narration_is_written_as_unescaped_utf8(self):
+        timeline = [self._timeline()[0]]
+        timeline[0]["text"] = "咖啡与音乐 — مرحبًا 🎬"
+        selection = self._selection([self._selected(1)])
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._write(tmp, timeline, selection)
+            target = scene_render_plan.create_scene_render_plan(
+                *(str(path) for path in paths)
+            )
+            raw = Path(target).read_bytes()
+            payload = json.loads(raw.decode("utf-8"))
+        self.assertEqual(payload["scenes"][0]["text"], timeline[0]["text"])
+        self.assertIn(timeline[0]["text"].encode("utf-8"), raw)
+        self.assertNotIn(b"\\u", raw)
+
     def test_initial_hold_reuses_next_selected_visual(self):
         timeline = self._timeline()
         timeline[0]["text"] = ""
@@ -191,6 +229,11 @@ class TestSceneRenderPlan(unittest.TestCase):
             "relative.mp4",
             "ftp://cdn.example/video.mp4",
             "https:///x",
+            "https://example.com/a b",
+            "https://exa mple.com/video.mp4",
+            "https://user:password@example.com/video.mp4",
+            "https://example.com/video.mp4#fragment",
+            "https://example.com:70000/video.mp4",
         ]
         for invalid_url in invalid_urls:
             with self.subTest(url=invalid_url), tempfile.TemporaryDirectory() as tmp:

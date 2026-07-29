@@ -295,12 +295,38 @@ class TestTaskService(unittest.TestCase):
             self.assertEqual(result, {"materials": materials})
             get_materials.assert_called_once()
 
+            result, _, _, _, _, get_materials, _, materials = (
+                self._run_preview_pipeline(tmp, source="local")
+            )
+            self.last_render_plan.assert_not_called()
+            self.assertNotIn("scene_render_plan_path", result)
+            self.assertEqual(result["materials"], materials)
+            self.assertEqual(
+                result["scene_timeline_path"], str(Path(tmp) / "scenes.json")
+            )
+            get_materials.assert_called_once()
+
             preview_path = Path(tmp) / "scene_previews.json"
             preview_path.write_text("{}", encoding="utf-8")
             selection_path = Path(tmp) / "scene_selections.json"
             selection_path.write_text("{}", encoding="utf-8")
             render_plan_path = Path(tmp) / "scene_render_plan.json"
             render_plan_path.write_text("{}", encoding="utf-8")
+            result, _, _, _, _, get_materials, _, materials = (
+                self._run_preview_pipeline(
+                    tmp,
+                    preview_result=str(preview_path),
+                    selection_result=str(selection_path),
+                    render_plan_result=str(render_plan_path),
+                )
+            )
+            self.last_render_plan.assert_called_once_with(
+                str(Path(tmp) / "scenes.json"), str(selection_path)
+            )
+            self.assertEqual(result["scene_render_plan_path"], str(render_plan_path))
+            self.assertEqual(result["materials"], materials)
+            get_materials.assert_called_once()
+
             result, state, _, _, _, get_materials, render, materials = (
                 self._run_preview_pipeline(
                     tmp,
@@ -321,6 +347,37 @@ class TestTaskService(unittest.TestCase):
             get_materials.assert_called_once()
             render.assert_called_once()
             self.assertIs(render.call_args.args[2], materials)
+
+            missing_plan = Path(tmp) / "missing-scene-render-plan.json"
+            result, _, _, _, _, get_materials, _, materials = (
+                self._run_preview_pipeline(
+                    tmp,
+                    preview_result=str(preview_path),
+                    selection_result=str(selection_path),
+                    render_plan_result=str(missing_plan),
+                )
+            )
+            self.last_render_plan.assert_called_once()
+            self.assertNotIn("scene_render_plan_path", result)
+            self.assertEqual(result["materials"], materials)
+            get_materials.assert_called_once()
+
+            real_plan = Path(tmp) / "real-scene-render-plan.json"
+            real_plan.write_text("{}", encoding="utf-8")
+            symlink_plan = Path(tmp) / "symlink-scene-render-plan.json"
+            symlink_plan.symlink_to(real_plan)
+            result, _, _, _, _, get_materials, _, materials = (
+                self._run_preview_pipeline(
+                    tmp,
+                    preview_result=str(preview_path),
+                    selection_result=str(selection_path),
+                    render_plan_result=str(symlink_plan),
+                )
+            )
+            self.last_render_plan.assert_called_once()
+            self.assertNotIn("scene_render_plan_path", result)
+            self.assertEqual(result["materials"], materials)
+            get_materials.assert_called_once()
 
             result, _, _, _, _, get_materials, render, materials = (
                 self._run_preview_pipeline(
