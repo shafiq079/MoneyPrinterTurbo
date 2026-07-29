@@ -22,6 +22,7 @@ from app.services import (
     material,
     scene_candidate,
     scene_preview,
+    scene_render_plan,
     scene_selection,
     scene_timeline,
     sonilo,
@@ -1182,6 +1183,7 @@ def _run_pipeline(
     scene_candidates_path = ""
     scene_previews_path = ""
     scene_selections_path = ""
+    scene_render_plan_path = ""
     if params.match_materials_to_script:
         scene_timeline_path = scene_timeline.create_scene_timeline(
             task_dir=utils.task_dir(task_id),
@@ -1226,6 +1228,31 @@ def _run_pipeline(
                                     and os.path.isfile(published_selection_path)
                                 ):
                                     scene_selections_path = published_selection_path
+                                    try:
+                                        published_render_plan_path = (
+                                            scene_render_plan.create_scene_render_plan(
+                                                scene_timeline_path,
+                                                scene_selections_path,
+                                            )
+                                        )
+                                        if (
+                                            published_render_plan_path
+                                            and not os.path.islink(
+                                                published_render_plan_path
+                                            )
+                                            and os.path.isfile(
+                                                published_render_plan_path
+                                            )
+                                        ):
+                                            scene_render_plan_path = (
+                                                published_render_plan_path
+                                            )
+                                    except Exception as exc:
+                                        logger.warning(
+                                            "scene render-plan preparation failed; "
+                                            "continuing with the existing material "
+                                            f"path: {type(exc).__name__}"
+                                        )
                             except Exception as exc:
                                 logger.warning(
                                     "scene selection preparation failed; continuing "
@@ -1264,6 +1291,8 @@ def _run_pipeline(
             material_result["scene_previews_path"] = scene_previews_path
         if scene_selections_path:
             material_result["scene_selections_path"] = scene_selections_path
+        if scene_render_plan_path:
+            material_result["scene_render_plan_path"] = scene_render_plan_path
         sm.state.update_task(
             task_id, state=const.TASK_STATE_COMPLETE, progress=100, **material_result
         )
@@ -1338,6 +1367,8 @@ def _run_pipeline(
         kwargs["scene_previews_path"] = scene_previews_path
     if scene_selections_path:
         kwargs["scene_selections_path"] = scene_selections_path
+    if scene_render_plan_path:
+        kwargs["scene_render_plan_path"] = scene_render_plan_path
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )

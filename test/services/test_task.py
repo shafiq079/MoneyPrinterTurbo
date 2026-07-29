@@ -46,6 +46,8 @@ class TestTaskService(unittest.TestCase):
         preview_error=None,
         selection_result="scene_selections.json",
         selection_error=None,
+        render_plan_result="scene_render_plan.json",
+        render_plan_error=None,
         stop_at="materials",
     ):
         timeline_path = Path(tmp_path) / "scenes.json"
@@ -103,6 +105,14 @@ class TestTaskService(unittest.TestCase):
                     side_effect=selection_error,
                 )
             )
+            render_plan = stack.enter_context(
+                patch.object(
+                    tm.scene_render_plan,
+                    "create_scene_render_plan",
+                    return_value=render_plan_result,
+                    side_effect=render_plan_error,
+                )
+            )
             get_materials = stack.enter_context(
                 patch.object(tm, "get_video_materials", return_value=materials)
             )
@@ -122,6 +132,7 @@ class TestTaskService(unittest.TestCase):
             )
             stack.enter_context(patch.object(tm.sm, "state", state))
             result = tm.start("preview-pipeline", params, stop_at=stop_at)
+        self.last_render_plan = render_plan
         return (
             result,
             state,
@@ -273,6 +284,115 @@ class TestTaskService(unittest.TestCase):
             render.assert_called_once()
             self.assertIs(render.call_args.args[2], materials)
             self.assertNotIn("scene_selections_path", result)
+
+    def test_scene_render_plan_is_gated_additive_and_nonfatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _, _, _, get_materials, _, materials = (
+                self._run_preview_pipeline(tmp, matching=False)
+            )
+            self.last_render_plan.assert_not_called()
+            self.assertNotIn("scene_render_plan_path", result)
+            self.assertEqual(result, {"materials": materials})
+            get_materials.assert_called_once()
+
+            result, _, _, _, _, get_materials, _, materials = (
+                self._run_preview_pipeline(tmp, source="local")
+            )
+            self.last_render_plan.assert_not_called()
+            self.assertNotIn("scene_render_plan_path", result)
+            self.assertEqual(result["materials"], materials)
+            self.assertEqual(
+                result["scene_timeline_path"], str(Path(tmp) / "scenes.json")
+            )
+            get_materials.assert_called_once()
+
+            preview_path = Path(tmp) / "scene_previews.json"
+            preview_path.write_text("{}", encoding="utf-8")
+            selection_path = Path(tmp) / "scene_selections.json"
+            selection_path.write_text("{}", encoding="utf-8")
+            render_plan_path = Path(tmp) / "scene_render_plan.json"
+            render_plan_path.write_text("{}", encoding="utf-8")
+            result, _, _, _, _, get_materials, _, materials = (
+                self._run_preview_pipeline(
+                    tmp,
+                    preview_result=str(preview_path),
+                    selection_result=str(selection_path),
+                    render_plan_result=str(render_plan_path),
+                )
+            )
+            self.last_render_plan.assert_called_once_with(
+                str(Path(tmp) / "scenes.json"), str(selection_path)
+            )
+            self.assertEqual(result["scene_render_plan_path"], str(render_plan_path))
+            self.assertEqual(result["materials"], materials)
+            get_materials.assert_called_once()
+
+            result, state, _, _, _, get_materials, render, materials = (
+                self._run_preview_pipeline(
+                    tmp,
+                    preview_result=str(preview_path),
+                    selection_result=str(selection_path),
+                    render_plan_result=str(render_plan_path),
+                    stop_at="video",
+                )
+            )
+            self.last_render_plan.assert_called_once_with(
+                str(Path(tmp) / "scenes.json"), str(selection_path)
+            )
+            self.assertEqual(result["scene_render_plan_path"], str(render_plan_path))
+            self.assertEqual(
+                state.get_task("preview-pipeline")["scene_render_plan_path"],
+                str(render_plan_path),
+            )
+            get_materials.assert_called_once()
+            render.assert_called_once()
+            self.assertIs(render.call_args.args[2], materials)
+
+            missing_plan = Path(tmp) / "missing-scene-render-plan.json"
+            result, _, _, _, _, get_materials, _, materials = (
+                self._run_preview_pipeline(
+                    tmp,
+                    preview_result=str(preview_path),
+                    selection_result=str(selection_path),
+                    render_plan_result=str(missing_plan),
+                )
+            )
+            self.last_render_plan.assert_called_once()
+            self.assertNotIn("scene_render_plan_path", result)
+            self.assertEqual(result["materials"], materials)
+            get_materials.assert_called_once()
+
+            real_plan = Path(tmp) / "real-scene-render-plan.json"
+            real_plan.write_text("{}", encoding="utf-8")
+            symlink_plan = Path(tmp) / "symlink-scene-render-plan.json"
+            symlink_plan.symlink_to(real_plan)
+            result, _, _, _, _, get_materials, _, materials = (
+                self._run_preview_pipeline(
+                    tmp,
+                    preview_result=str(preview_path),
+                    selection_result=str(selection_path),
+                    render_plan_result=str(symlink_plan),
+                )
+            )
+            self.last_render_plan.assert_called_once()
+            self.assertNotIn("scene_render_plan_path", result)
+            self.assertEqual(result["materials"], materials)
+            get_materials.assert_called_once()
+
+            result, _, _, _, _, get_materials, render, materials = (
+                self._run_preview_pipeline(
+                    tmp,
+                    preview_result=str(preview_path),
+                    selection_result=str(selection_path),
+                    render_plan_error=RuntimeError("secret must not escape"),
+                    stop_at="video",
+                )
+            )
+            self.last_render_plan.assert_called_once()
+            self.assertNotIn("scene_render_plan_path", result)
+            get_materials.assert_called_once()
+            render.assert_called_once()
+            self.assertIs(render.call_args.args[2], materials)
 
     def test_is_task_busy_covers_generation_and_cross_posting(self):
         """删除入口必须同时识别视频生成和跨平台发布的活跃状态。"""
