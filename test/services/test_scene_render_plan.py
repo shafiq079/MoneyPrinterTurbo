@@ -350,5 +350,24 @@ class TestSceneRenderPlan(unittest.TestCase):
             self.assertEqual(list(Path(tmp).glob("*.tmp")), [])
 
 
+    def test_strict_loader_verifies_source_bytes_and_existing_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._write(
+                tmp, [self._timeline()[0]], self._selection([self._selected(1)])
+            )
+            target = scene_render_plan.create_scene_render_plan(
+                *(str(path) for path in paths)
+            )
+            loaded = scene_render_plan.load_scene_render_plan(
+                target, *(str(path) for path in paths)
+            )
+            self.assertEqual(loaded["source_scene_manifest"].keys(), {"sha256"})
+            paths[0].write_text("[]", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                scene_render_plan.load_scene_render_plan(
+                    target, *(str(path) for path in paths)
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
