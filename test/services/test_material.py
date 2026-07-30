@@ -621,6 +621,23 @@ def test_pexels_candidate_normalization_and_legacy_projection():
     assert legacy[0] == candidate.to_material_info()
 
 
+def test_material_directory_resolver_preserves_legacy_destinations():
+    original = dict(config.app)
+    try:
+        with tempfile.TemporaryDirectory() as custom:
+            config.app["material_directory"] = custom
+            assert material.resolve_material_directory("task-id") == custom
+        config.app["material_directory"] = "task"
+        with patch.object(material.utils, "task_dir", return_value="/tasks/task-id"):
+            assert material.resolve_material_directory("task-id") == "/tasks/task-id"
+        config.app["material_directory"] = "/missing/custom-material-root"
+        with patch.object(material.utils, "storage_dir", return_value="/cache/videos"):
+            assert material.resolve_material_directory("task-id") == "/cache/videos"
+    finally:
+        config.app.clear()
+        config.app.update(original)
+
+
 def test_pixabay_candidate_normalization_and_legacy_projection():
     from app.models.schema import VideoAspect
 

@@ -578,11 +578,7 @@ def download_videos(
             video_aspect=video_aspect,
         )
 
-    material_directory = config.app.get("material_directory", "").strip()
-    if material_directory == "task":
-        material_directory = utils.task_dir(task_id)
-    elif material_directory and not os.path.isdir(material_directory):
-        material_directory = ""
+    material_directory = resolve_material_directory(task_id)
 
     if match_script_order:
         return _download_videos_by_script_order(
@@ -642,6 +638,16 @@ def download_videos(
             logger.error(f"failed to download video: {utils.to_json(item)} => {str(e)}")
     logger.success(f"downloaded {len(video_paths)} videos")
     return video_paths
+
+
+def resolve_material_directory(task_id: str) -> str:
+    """Return the directory used by the legacy downloader without changing it."""
+    material_directory = config.app.get("material_directory", "").strip()
+    if material_directory == "task":
+        return utils.task_dir(task_id)
+    if material_directory and os.path.isdir(material_directory):
+        return material_directory
+    return utils.storage_dir("cache_videos")
 
 
 def _download_videos_by_script_order(

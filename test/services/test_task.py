@@ -1945,5 +1945,55 @@ class TestTaskService(unittest.TestCase):
         print(result)
     
 
+    def test_scene_material_finalization_does_not_change_renderer_materials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            preview = root / "scene_previews.json"
+            selection = root / "scene_selections.json"
+            plan = root / "scene_render_plan.json"
+            artifact = root / "scene_render_materials.json"
+            for item in (preview, selection, plan, artifact):
+                item.write_text("{}", encoding="utf-8")
+            with (
+                patch.object(
+                    tm.scene_render_materials,
+                    "create_scene_render_materials",
+                    return_value=str(artifact),
+                ) as finalize,
+                patch.object(
+                    tm.scene_render_materials,
+                    "load_scene_render_materials",
+                    return_value={},
+                ),
+                patch.object(
+                    tm.material, "resolve_material_directory", return_value=str(root)
+                ),
+                patch.object(tm.utils, "task_dir", return_value=str(root)),
+            ):
+                result, _, _, _, _, get_materials, render, materials = (
+                    self._run_preview_pipeline(
+                        tmp,
+                        preview_result=str(preview),
+                        selection_result=str(selection),
+                        render_plan_result=str(plan),
+                        stop_at="video",
+                    )
+                )
+            get_materials.assert_called_once_with(
+                "preview-pipeline", unittest.mock.ANY, ["term"], 5
+            )
+            self.assertIs(finalize.call_args.kwargs["legacy_material_paths"], materials)
+            self.assertIs(render.call_args.args[2], materials)
+            self.assertEqual(result["scene_render_materials_path"], str(artifact))
+
+    def test_disabled_and_local_paths_never_finalize_scene_materials(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            tm.scene_render_materials, "create_scene_render_materials"
+        ) as finalize:
+            self._run_preview_pipeline(tmp, matching=False)
+            self._run_preview_pipeline(tmp, source="local")
+        finalize.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

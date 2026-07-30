@@ -406,3 +406,41 @@ def create_scene_render_plan(
     target = parent / "scene_render_plan.json"
     _atomic_write(target, payload)
     return str(target)
+
+
+def load_scene_render_plan(
+    render_plan_path: str,
+    scene_manifest_path: str,
+    selection_manifest_path: str,
+) -> dict:
+    """Strictly reload a render plan and verify it against its source bytes."""
+    plan_path, plan_bytes = _read_manifest(render_plan_path, "render plan")
+    scene_path, scene_bytes = _read_manifest(scene_manifest_path, "scene manifest")
+    selection_path, selection_bytes = _read_manifest(
+        selection_manifest_path, "selection manifest"
+    )
+    parents = {plan_path.parent, scene_path.parent, selection_path.parent}
+    if len(parents) != 1:
+        _fail("render plan and source manifests must share a task directory")
+    parent = plan_path.parent
+    if parent.is_symlink() or not parent.is_dir():
+        _fail("task directory is invalid")
+
+    timeline = _validate_timeline(_parse_json(scene_bytes, "scene manifest"))
+    selections = _validate_selections(
+        _parse_json(selection_bytes, "selection manifest"),
+        {scene["scene_index"] for scene in timeline},
+    )
+    expected = {
+        "version": MANIFEST_VERSION,
+        "source_scene_manifest": {"sha256": hashlib.sha256(scene_bytes).hexdigest()},
+        "source_selection_manifest": {
+            "version": 1,
+            "sha256": hashlib.sha256(selection_bytes).hexdigest(),
+        },
+        "scenes": _build_rows(timeline, selections),
+    }
+    payload = _parse_json(plan_bytes, "render plan")
+    if payload != expected:
+        _fail("render plan does not match its validated sources")
+    return payload

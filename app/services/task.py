@@ -8,6 +8,7 @@ import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from functools import partial
 from os import path
+from pathlib import Path
 from uuid import uuid4
 
 from loguru import logger
@@ -22,6 +23,7 @@ from app.services import (
     material,
     scene_candidate,
     scene_preview,
+    scene_render_materials,
     scene_render_plan,
     scene_selection,
     scene_timeline,
@@ -1184,6 +1186,7 @@ def _run_pipeline(
     scene_previews_path = ""
     scene_selections_path = ""
     scene_render_plan_path = ""
+    scene_render_materials_path = ""
     if params.match_materials_to_script:
         scene_timeline_path = scene_timeline.create_scene_timeline(
             task_dir=utils.task_dir(task_id),
@@ -1281,6 +1284,43 @@ def _run_pipeline(
             "failed to prepare video materials",
         )
 
+    if (
+        params.match_materials_to_script
+        and params.video_source != "local"
+        and scene_render_plan_path
+    ):
+        try:
+            legacy_material_root = material.resolve_material_directory(task_id)
+            published_materials_path = (
+                scene_render_materials.create_scene_render_materials(
+                    render_plan_path=scene_render_plan_path,
+                    scene_manifest_path=scene_timeline_path,
+                    selection_manifest_path=scene_selections_path,
+                    legacy_material_paths=downloaded_videos,
+                    legacy_material_root=legacy_material_root,
+                    task_dir=utils.task_dir(task_id),
+                )
+            )
+            task_root = Path(utils.task_dir(task_id)).resolve(strict=True)
+            published_path = Path(published_materials_path).absolute()
+            published_path.relative_to(task_root)
+            if published_path.is_symlink() or not published_path.is_file():
+                raise ValueError("scene material artifact is not a regular file")
+            scene_render_materials.load_scene_render_materials(
+                str(published_path),
+                scene_render_plan_path,
+                scene_timeline_path,
+                scene_selections_path,
+                legacy_material_root,
+                utils.task_dir(task_id),
+            )
+            scene_render_materials_path = str(published_path)
+        except Exception as exc:
+            logger.warning(
+                "scene material finalization failed; continuing with the existing "
+                f"legacy renderer: {type(exc).__name__}"
+            )
+
     if stop_at == "materials":
         material_result = {"materials": downloaded_videos}
         if scene_timeline_path:
@@ -1293,6 +1333,10 @@ def _run_pipeline(
             material_result["scene_selections_path"] = scene_selections_path
         if scene_render_plan_path:
             material_result["scene_render_plan_path"] = scene_render_plan_path
+        if scene_render_materials_path:
+            material_result["scene_render_materials_path"] = (
+                scene_render_materials_path
+            )
         sm.state.update_task(
             task_id, state=const.TASK_STATE_COMPLETE, progress=100, **material_result
         )
@@ -1369,6 +1413,8 @@ def _run_pipeline(
         kwargs["scene_selections_path"] = scene_selections_path
     if scene_render_plan_path:
         kwargs["scene_render_plan_path"] = scene_render_plan_path
+    if scene_render_materials_path:
+        kwargs["scene_render_materials_path"] = scene_render_materials_path
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )
