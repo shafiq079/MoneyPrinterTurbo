@@ -74,6 +74,9 @@ class TestTaskService(unittest.TestCase):
                 patch.object(tm, "generate_audio", return_value=("audio.mp3", 5, object()))
             )
             stack.enter_context(
+                patch.object(tm.voice, "get_audio_duration", return_value=5.0)
+            )
+            stack.enter_context(
                 patch.object(tm, "generate_subtitle", return_value="subtitle.srt")
             )
             stack.enter_context(
@@ -2131,6 +2134,69 @@ class TestTaskService(unittest.TestCase):
             self._run_preview_pipeline(tmp, source="local")
         finalize.assert_not_called()
 
+
+
+class TestSceneRendererTaskIntegration(unittest.TestCase):
+    def _context(self, materials):
+        return tm.SceneRenderContext(
+            "materials.json", "plan.json", "scenes.json", "selections.json",
+            materials, "legacy", "task"
+        )
+
+    def test_valid_context_selects_scene_renderer_and_revalidates(self):
+        materials = ["legacy.mp4"]
+        context = self._context(materials)
+        params = VideoParams(video_subject="test", bgm_type="")
+        payload = {"materials": [], "scenes": []}
+        with (
+            patch.object(tm, "_load_scene_render_payload", return_value=payload) as load,
+            patch.object(tm.video, "combine_scene_videos") as scene_render,
+            patch.object(tm.video, "combine_videos") as legacy_render,
+            patch.object(tm.video, "generate_video"),
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            tm.generate_final_videos("task", params, materials, "audio", "", 5, context)
+        load.assert_called_once_with(context)
+        self.assertIs(scene_render.call_args.kwargs["scene_render_payload"], payload)
+        legacy_render.assert_not_called()
+
+    def test_scene_failure_falls_back_with_original_list_identity(self):
+        materials = ["legacy.mp4"]
+        params = VideoParams(video_subject="test", bgm_type="")
+        with (
+            patch.object(tm, "_load_scene_render_payload", return_value={}),
+            patch.object(tm.video, "combine_scene_videos", side_effect=RuntimeError),
+            patch.object(tm.video, "combine_videos") as legacy_render,
+            patch.object(tm.video, "delete_files") as cleanup,
+            patch.object(tm.video, "generate_video"),
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            tm.generate_final_videos(
+                "task", params, materials, "audio", "", 5, self._context(materials)
+            )
+        self.assertIs(legacy_render.call_args.kwargs["video_paths"], materials)
+        self.assertTrue(cleanup.call_args.args[0].endswith("combined-1.mp4"))
+
+    def test_output_two_fallback_does_not_clean_output_one(self):
+        materials = ["legacy.mp4"]
+        params = VideoParams(video_subject="test", bgm_type="", video_count=2)
+        with (
+            patch.object(tm, "_load_scene_render_payload", return_value={}),
+            patch.object(
+                tm.video, "combine_scene_videos",
+                side_effect=[None, RuntimeError("second failed")],
+            ),
+            patch.object(tm.video, "combine_videos") as legacy_render,
+            patch.object(tm.video, "delete_files") as cleanup,
+            patch.object(tm.video, "generate_video"),
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            finals, combined, _ = tm.generate_final_videos(
+                "task", params, materials, "audio", "", 5, self._context(materials)
+            )
+        self.assertEqual((len(finals), len(combined)), (2, 2))
+        self.assertEqual(legacy_render.call_count, 1)
+        self.assertTrue(cleanup.call_args.args[0].endswith("combined-2.mp4"))
 
 if __name__ == "__main__":
     unittest.main()

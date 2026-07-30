@@ -6,6 +6,7 @@ import socket
 import threading
 import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import partial
 from os import path
 from pathlib import Path
@@ -81,6 +82,29 @@ _VIDEO_MUSIC_PROVIDERS = {
         "display_name": "ElevenLabs",
     },
 }
+
+
+@dataclass(frozen=True, slots=True)
+class SceneRenderContext:
+    scene_render_materials_path: str
+    render_plan_path: str
+    scene_manifest_path: str
+    selection_manifest_path: str
+    legacy_material_paths: list[str]
+    legacy_material_root: str
+    task_dir: str
+
+
+def _load_scene_render_payload(context: SceneRenderContext) -> dict:
+    return scene_render_materials.load_scene_render_materials(
+        context.scene_render_materials_path,
+        context.render_plan_path,
+        context.scene_manifest_path,
+        context.selection_manifest_path,
+        context.legacy_material_paths,
+        context.legacy_material_root,
+        context.task_dir,
+    )
 
 
 def _get_video_music_prompt(params: VideoParams) -> str:
@@ -616,7 +640,8 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
 
 
 def generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
+    task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration,
+    scene_render_context: SceneRenderContext | None = None,
 ):
     final_video_paths = []
     combined_video_paths = []
@@ -643,17 +668,46 @@ def generate_final_videos(
             utils.task_dir(task_id), f"combined-{index}.mp4"
         )
         logger.info(f"\n\n## combining video: {index} => {combined_video_path}")
-        video.combine_videos(
-            combined_video_path=combined_video_path,
-            video_paths=downloaded_videos,
-            audio_file=audio_file,
-            video_aspect=params.video_aspect,
-            video_concat_mode=video_concat_mode,
-            video_transition_mode=video_transition_mode,
-            max_clip_duration=params.video_clip_duration,
-            threads=params.n_threads,
-            clip_speed=params.video_clip_speed,
-        )
+        scene_payload = None
+        if scene_render_context is not None:
+            try:
+                scene_payload = _load_scene_render_payload(scene_render_context)
+            except Exception as exc:
+                logger.warning(
+                    "scene material revalidation failed; using legacy renderer for "
+                    f"output {index}: {type(exc).__name__}"
+                )
+        if scene_payload is not None:
+            try:
+                video.combine_scene_videos(
+                    combined_video_path=combined_video_path,
+                    scene_render_payload=scene_payload,
+                    audio_file=audio_file,
+                    video_aspect=params.video_aspect,
+                    video_transition_mode=video_transition_mode,
+                    threads=params.n_threads,
+                    clip_speed=params.video_clip_speed,
+                    output_index=index,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "scene rendering failed; retrying this output with the legacy "
+                    f"renderer: output={index}, error={type(exc).__name__}"
+                )
+                video.delete_files(combined_video_path)
+                scene_payload = None
+        if scene_payload is None:
+            video.combine_videos(
+                combined_video_path=combined_video_path,
+                video_paths=downloaded_videos,
+                audio_file=audio_file,
+                video_aspect=params.video_aspect,
+                video_concat_mode=video_concat_mode,
+                video_transition_mode=video_transition_mode,
+                max_clip_duration=params.video_clip_duration,
+                threads=params.n_threads,
+                clip_speed=params.video_clip_speed,
+            )
 
         _progress += 50 / params.video_count / 2
         sm.state.update_task(task_id, progress=_progress)
@@ -1187,15 +1241,38 @@ def _run_pipeline(
     scene_selections_path = ""
     scene_render_plan_path = ""
     scene_render_materials_path = ""
+    scene_render_context = None
+    scene_pipeline_supported = params.video_source in scene_candidate.SUPPORTED_SOURCES
+    scene_renderer_eligible = scene_pipeline_supported
+    scene_timeline_duration = audio_duration
+    if params.match_materials_to_script and scene_pipeline_supported:
+        try:
+            scene_timeline_duration = voice.get_audio_duration(audio_file)
+            if scene_timeline_duration <= 0:
+                raise ValueError("narration duration probe returned zero")
+        except Exception as exc:
+            scene_renderer_eligible = False
+            scene_timeline_duration = audio_duration
+            logger.warning(
+                "scene narration probe failed; continuing with the existing "
+                f"material path: {type(exc).__name__}"
+            )
     if params.match_materials_to_script:
-        scene_timeline_path = scene_timeline.create_scene_timeline(
-            task_dir=utils.task_dir(task_id),
-            narration=video_script,
-            audio_duration=audio_duration,
-            subtitle_path=subtitle_path,
-            max_clip_duration=params.video_clip_duration,
-        )
-        if params.video_source in scene_candidate.SUPPORTED_SOURCES:
+        try:
+            scene_timeline_path = scene_timeline.create_scene_timeline(
+                task_dir=utils.task_dir(task_id),
+                narration=video_script,
+                audio_duration=scene_timeline_duration,
+                subtitle_path=subtitle_path,
+                max_clip_duration=params.video_clip_duration,
+            )
+        except Exception as exc:
+            scene_pipeline_supported = False
+            logger.warning(
+                "scene timeline preparation failed; continuing with the existing "
+                f"material path: {type(exc).__name__}"
+            )
+        if scene_pipeline_supported and scene_timeline_path:
             try:
                 with open(scene_timeline_path, encoding="utf-8") as timeline_file:
                     timeline_data = json.load(timeline_file)
@@ -1316,6 +1393,16 @@ def _run_pipeline(
                 utils.task_dir(task_id),
             )
             scene_render_materials_path = str(published_path)
+            if scene_renderer_eligible:
+                scene_render_context = SceneRenderContext(
+                    scene_render_materials_path=scene_render_materials_path,
+                    render_plan_path=scene_render_plan_path,
+                    scene_manifest_path=scene_timeline_path,
+                    selection_manifest_path=scene_selections_path,
+                    legacy_material_paths=downloaded_videos,
+                    legacy_material_root=legacy_material_root,
+                    task_dir=utils.task_dir(task_id),
+                )
         except Exception as exc:
             logger.warning(
                 "scene material finalization failed; continuing with the existing "
@@ -1358,6 +1445,7 @@ def _run_pipeline(
         audio_file,
         subtitle_path,
         audio_duration,
+        scene_render_context,
     )
 
     if not final_video_paths:

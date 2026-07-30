@@ -10,6 +10,7 @@ import unicodedata
 from contextlib import ExitStack, redirect_stdout
 from functools import lru_cache
 from typing import List
+from uuid import uuid4
 from loguru import logger
 import numpy as np
 from moviepy import (
@@ -21,6 +22,7 @@ from moviepy import (
     TextClip,
     VideoFileClip,
     afx,
+    vfx,
 )
 from moviepy.video.tools.subtitles import SubtitlesClip
 from PIL import Image, ImageDraw, ImageFont
@@ -37,6 +39,7 @@ from app.models.schema import (
 from app.services import bgm as bgm_service
 from app.services.utils import video_effects
 from app.utils import file_security, utils
+
 
 class SubClippedVideoClip:
     def __init__(
@@ -276,7 +279,9 @@ def _get_temp_audio_dir(output_dir: str) -> str:
     return output_dir
 
 
-def _fallback_write_videofile(clip, output_file: str, failed_codec: str, reason: str, **kwargs):
+def _fallback_write_videofile(
+    clip, output_file: str, failed_codec: str, reason: str, **kwargs
+):
     """
     硬件编码失败后用 libx264 重试，只有重试成功才禁用该硬件编码器。
 
@@ -336,8 +341,16 @@ def concat_video_clips_with_ffmpeg(
     output_dir: str,
     max_duration: float | None = None,
 ):
-    concat_list_file = os.path.join(output_dir, "ffmpeg-concat-list.txt")
-    with open(concat_list_file, "w", encoding="utf-8") as fp:
+    concat_handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=output_dir,
+        prefix="ffmpeg-concat-",
+        suffix=".txt",
+        delete=False,
+    )
+    concat_list_file = concat_handle.name
+    with concat_handle as fp:
         for clip_file in clip_files:
             fp.write(f"file '{_format_ffmpeg_concat_path(clip_file)}'\n")
 
@@ -456,29 +469,29 @@ def close_clip(clip):
         
     try:
         # close main resources
-        if hasattr(clip, 'reader') and clip.reader is not None:
+        if hasattr(clip, "reader") and clip.reader is not None:
             clip.reader.close()
             
         # close audio resources
-        if hasattr(clip, 'audio') and clip.audio is not None:
-            if hasattr(clip.audio, 'reader') and clip.audio.reader is not None:
+        if hasattr(clip, "audio") and clip.audio is not None:
+            if hasattr(clip.audio, "reader") and clip.audio.reader is not None:
                 clip.audio.reader.close()
             del clip.audio
             
         # close mask resources
-        if hasattr(clip, 'mask') and clip.mask is not None:
-            if hasattr(clip.mask, 'reader') and clip.mask.reader is not None:
+        if hasattr(clip, "mask") and clip.mask is not None:
+            if hasattr(clip.mask, "reader") and clip.mask.reader is not None:
                 clip.mask.reader.close()
             del clip.mask
             
         # handle child clips in composite clips
-        if hasattr(clip, 'clips') and clip.clips:
+        if hasattr(clip, "clips") and clip.clips:
             for child_clip in clip.clips:
                 if child_clip is not clip:  # avoid possible circular references
                     close_clip(child_clip)
             
         # clear clip list
-        if hasattr(clip, 'clips'):
+        if hasattr(clip, "clips"):
             clip.clips = []
             
     except Exception as e:
@@ -486,6 +499,7 @@ def close_clip(clip):
     
     del clip
     gc.collect()
+
 
 def delete_files(files: List[str] | str):
     if isinstance(files, str):
@@ -508,6 +522,69 @@ def delete_files(files: List[str] | str):
             logger.warning(f"failed to delete temporary file {file}: {str(e)}")
 
 
+def _fit_clip_to_aspect(clip, video_aspect: VideoAspect):
+    """Fit the complete clip into the requested frame using legacy letterboxing."""
+    aspect = VideoAspect(video_aspect)
+    video_width, video_height = aspect.to_resolution()
+    clip_w, clip_h = clip.size
+    if clip_w == video_width and clip_h == video_height:
+        return clip
+
+    clip_ratio = clip.w / clip.h
+    video_ratio = video_width / video_height
+    logger.debug(
+        "resizing clip, "
+        f"source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, "
+        f"target: {video_width}x{video_height}, ratio: {video_ratio:.2f}"
+    )
+    if clip_ratio == video_ratio:
+        return clip.resized(new_size=(video_width, video_height))
+
+    scale_factor = (
+        video_width / clip_w if clip_ratio > video_ratio else video_height / clip_h
+    )
+    new_width = int(clip_w * scale_factor)
+    new_height = int(clip_h * scale_factor)
+    background = ColorClip(
+        size=(video_width, video_height), color=(0, 0, 0)
+    ).with_duration(clip.duration)
+    clip_resized = clip.resized(new_size=(new_width, new_height)).with_position(
+        "center"
+    )
+    return CompositeVideoClip([background, clip_resized])
+
+
+def _apply_video_transition(clip, video_transition_mode, *, duration: float = 1.0):
+    """Apply an existing transition without changing clip ordering."""
+    transition_value = getattr(video_transition_mode, "value", video_transition_mode)
+    shuffle_side = random.choice(["left", "right", "top", "bottom"])
+    if transition_value in (None, VideoTransitionMode.none.value):
+        return clip
+    if transition_value == VideoTransitionMode.fade_in.value:
+        return video_effects.fadein_transition(clip, duration)
+    if transition_value == VideoTransitionMode.fade_out.value:
+        return video_effects.fadeout_transition(clip, duration)
+    if transition_value == VideoTransitionMode.slide_in.value:
+        return video_effects.slidein_transition(clip, duration, shuffle_side)
+    if transition_value == VideoTransitionMode.slide_out.value:
+        return video_effects.slideout_transition(clip, duration, shuffle_side)
+    if transition_value == VideoTransitionMode.zoom_in.value:
+        return video_effects.zoomin_transition(clip, duration)
+    if transition_value == VideoTransitionMode.zoom_out.value:
+        return video_effects.zoomout_transition(clip, duration)
+    if transition_value == VideoTransitionMode.shuffle.value:
+        transition_funcs = [
+            lambda c: video_effects.fadein_transition(c, duration),
+            lambda c: video_effects.fadeout_transition(c, duration),
+            lambda c: video_effects.slidein_transition(c, duration, shuffle_side),
+            lambda c: video_effects.slideout_transition(c, duration, shuffle_side),
+            lambda c: video_effects.zoomin_transition(c, duration),
+            lambda c: video_effects.zoomout_transition(c, duration),
+        ]
+        return random.choice(transition_funcs)(clip)
+    return clip
+
+
 def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
     if not bgm_type:
         return ""
@@ -518,9 +595,7 @@ def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
         except ValueError as exc:
             # API 请求里的 bgm_file 来自用户输入，只允许解析到用户 BGM 或内置
             # 歌曲目录，阻止 MoviePy 读取配置、密钥等任意服务器文件。
-            logger.warning(
-                f"reject unsafe bgm file: {bgm_file}, error: {str(exc)}"
-            )
+            logger.warning(f"reject unsafe bgm file: {bgm_file}, error: {str(exc)}")
             return ""
         return resolved_bgm_file
 
@@ -575,9 +650,6 @@ def combine_videos(
     # 1.5 秒画面。该计算同时保证不同速度下的源时间线连续且无重叠。
     source_clip_duration = max_clip_duration * normalized_clip_speed
     output_dir = os.path.dirname(combined_video_path)
-
-    aspect = VideoAspect(video_aspect)
-    video_width, video_height = aspect.to_resolution()
 
     processed_clips = []
     subclipped_items = []
@@ -641,54 +713,9 @@ def combine_videos(
             if normalized_clip_speed != 1.0:
                 clip = clip.with_speed_scaled(normalized_clip_speed)
             clip_duration = clip.duration
-            # Not all videos are same size, so we need to resize them
             clip_w, clip_h = clip.size
-            if clip_w != video_width or clip_h != video_height:
-                clip_ratio = clip.w / clip.h
-                video_ratio = video_width / video_height
-                logger.debug(f"resizing clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, target: {video_width}x{video_height}, ratio: {video_ratio:.2f}")
-                
-                if clip_ratio == video_ratio:
-                    clip = clip.resized(new_size=(video_width, video_height))
-                else:
-                    if clip_ratio > video_ratio:
-                        scale_factor = video_width / clip_w
-                    else:
-                        scale_factor = video_height / clip_h
-
-                    new_width = int(clip_w * scale_factor)
-                    new_height = int(clip_h * scale_factor)
-
-                    background = ColorClip(size=(video_width, video_height), color=(0, 0, 0)).with_duration(clip_duration)
-                    clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
-                    clip = CompositeVideoClip([background, clip_resized])
-                    
-            shuffle_side = random.choice(["left", "right", "top", "bottom"])
-            if transition_value in (None, VideoTransitionMode.none.value):
-                clip = clip
-            elif transition_value == VideoTransitionMode.fade_in.value:
-                clip = video_effects.fadein_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.fade_out.value:
-                clip = video_effects.fadeout_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.slide_in.value:
-                clip = video_effects.slidein_transition(clip, 1, shuffle_side)
-            elif transition_value == VideoTransitionMode.slide_out.value:
-                clip = video_effects.slideout_transition(clip, 1, shuffle_side)
-            elif transition_value == VideoTransitionMode.zoom_in.value:
-                clip = video_effects.zoomin_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.zoom_out.value:
-                clip = video_effects.zoomout_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.shuffle.value:
-                transition_funcs = [
-                    lambda c: video_effects.fadein_transition(c, 1),
-                    lambda c: video_effects.fadeout_transition(c, 1),
-                    lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
-                    lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
-                    lambda c: video_effects.zoomin_transition(c, 1),
-                    lambda c: video_effects.zoomout_transition(c, 1),
-                ]
-                shuffle_transition = random.choice(transition_funcs)
-                clip = shuffle_transition(clip)
+            clip = _fit_clip_to_aspect(clip, video_aspect)
+            clip = _apply_video_transition(clip, transition_value)
 
             if clip.duration > max_clip_duration:
                 clip = clip.subclipped(0, max_clip_duration)
@@ -757,9 +784,172 @@ def combine_videos(
     
     # clean temp files
     delete_files(clip_files)
-            
     logger.info("video combining completed")
     return combined_video_path
+
+
+_SCENE_TIMELINE_TOLERANCE = 0.001
+_SCENE_AUDIO_CODEC_TOLERANCE = 0.020
+
+
+def _close_owned_clips(clips):
+    """Close distinct MoviePy objects in reverse construction order."""
+    seen = set()
+    for clip in reversed(clips):
+        if clip is None or id(clip) in seen:
+            continue
+        seen.add(id(clip))
+        close_clip(clip)
+
+
+def _validate_scene_render_timeline(scene_render_payload: dict, audio_duration: float):
+    """Validate supplied scene order and timing without sorting or repairing it."""
+    if not isinstance(scene_render_payload, dict):
+        raise ValueError("scene render payload is invalid")
+    scenes = scene_render_payload.get("scenes")
+    materials = scene_render_payload.get("materials")
+    if not isinstance(scenes, list) or not scenes:
+        raise ValueError("scene render payload has no scenes")
+    if not isinstance(materials, list) or not materials:
+        raise ValueError("scene render payload has no materials")
+
+    materials_by_id = {}
+    for material_row in materials:
+        if not isinstance(material_row, dict):
+            raise ValueError("scene material row is invalid")
+        material_id = material_row.get("material_id")
+        local_path = material_row.get("local_path")
+        if (
+            not isinstance(material_id, str)
+            or not material_id
+            or material_id in materials_by_id
+            or not isinstance(local_path, str)
+            or not local_path
+        ):
+            raise ValueError("scene material binding is invalid")
+        materials_by_id[material_id] = material_row
+
+    previous_end = None
+    total_duration = 0.0
+    for expected_index, scene in enumerate(scenes):
+        if not isinstance(scene, dict) or scene.get("scene_index") != expected_index:
+            raise ValueError("scene indexes must be zero-based and supplied in order")
+        try:
+            start_time = float(scene["start_time"])
+            end_time = float(scene["end_time"])
+            declared_duration = float(scene["duration"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("scene timing is invalid") from exc
+        required_duration = end_time - start_time
+        if (
+            not all(
+                np.isfinite(value)
+                for value in (start_time, end_time, declared_duration)
+            )
+            or start_time < 0
+            or required_duration <= 0
+            or abs(declared_duration - required_duration) > _SCENE_TIMELINE_TOLERANCE
+        ):
+            raise ValueError("scene timing is invalid")
+        if previous_end is None:
+            if abs(start_time) > _SCENE_TIMELINE_TOLERANCE:
+                raise ValueError("scene coverage must begin at zero")
+        elif abs(start_time - previous_end) > _SCENE_TIMELINE_TOLERANCE:
+            raise ValueError("scene coverage has a gap or overlap")
+        if scene.get("material_id") not in materials_by_id:
+            raise ValueError("scene references a missing material")
+        total_duration += required_duration
+        previous_end = end_time
+
+    if abs(total_duration - previous_end) > _SCENE_TIMELINE_TOLERANCE:
+        raise ValueError("scene duration sum does not match the timeline endpoint")
+    audio_tolerance = (1 / fps) + _SCENE_AUDIO_CODEC_TOLERANCE
+    if abs(previous_end - audio_duration) > audio_tolerance:
+        raise ValueError("scene timeline does not match narration duration")
+    return scenes, materials_by_id
+
+
+def combine_scene_videos(
+    combined_video_path: str,
+    scene_render_payload: dict,
+    audio_file: str,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    video_transition_mode: VideoTransitionMode = None,
+    threads: int = 2,
+    clip_speed: float = 1.0,
+    output_index: int = 1,
+) -> str:
+    """Render strictly validated local scene bindings on their narration timeline."""
+    audio_clip = AudioFileClip(audio_file)
+    try:
+        audio_duration = float(audio_clip.duration)
+    finally:
+        close_clip(audio_clip)
+
+    scenes, materials_by_id = _validate_scene_render_timeline(
+        scene_render_payload, audio_duration
+    )
+    normalized_clip_speed = utils.normalize_clip_speed(clip_speed)
+    output_dir = os.path.dirname(combined_video_path)
+    render_token = uuid4().hex
+    temporary_files = []
+    succeeded = False
+    try:
+        for scene in scenes:
+            scene_index = scene["scene_index"]
+            required_duration = float(scene["end_time"]) - float(scene["start_time"])
+            material = materials_by_id[scene["material_id"]]
+            local_path = material["local_path"]
+            clip_file = os.path.join(
+                output_dir,
+                f"scene-{output_index}-{scene_index}-{render_token}.mp4",
+            )
+            temporary_files.append(clip_file)
+            owned_clips = []
+            try:
+                clip = _open_video_clip_quietly(local_path)
+                owned_clips.append(clip)
+                if normalized_clip_speed != 1.0:
+                    clip = clip.with_speed_scaled(normalized_clip_speed)
+                    owned_clips.append(clip)
+                if clip.duration < required_duration:
+                    clip = clip.with_effects([vfx.Loop(duration=required_duration)])
+                    owned_clips.append(clip)
+                clip = clip.subclipped(0, required_duration)
+                owned_clips.append(clip)
+                clip = _fit_clip_to_aspect(clip, video_aspect)
+                owned_clips.append(clip)
+                clip = _apply_video_transition(
+                    clip,
+                    video_transition_mode,
+                    duration=min(1.0, required_duration),
+                )
+                owned_clips.append(clip)
+                clip = clip.subclipped(0, required_duration)
+                owned_clips.append(clip)
+                _write_videofile_with_codec_fallback(
+                    clip,
+                    clip_file,
+                    codec=_get_configured_video_codec(),
+                    logger=None,
+                    fps=fps,
+                )
+            finally:
+                _close_owned_clips(owned_clips)
+
+        concat_video_clips_with_ffmpeg(
+            clip_files=temporary_files,
+            output_file=combined_video_path,
+            threads=threads,
+            output_dir=output_dir,
+            max_duration=audio_duration,
+        )
+        succeeded = True
+        return combined_video_path
+    finally:
+        delete_files(temporary_files)
+        if not succeeded:
+            delete_files(combined_video_path)
 
 
 def wrap_text(text, max_width, font="Arial", fontsize=60):
@@ -1200,9 +1390,7 @@ def generate_video(
             video_clip = CompositeVideoClip([video_clip, *text_clips])
             clip_stack.callback(video_clip.close)
 
-        bgm_enabled = bgm_service.should_use_bgm(
-            params.bgm_type, params.bgm_volume
-        )
+        bgm_enabled = bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
         if not bgm_enabled and params.bgm_type:
             # 所有 BGM 来源共用这一条短路规则。音量不大于 0 时不能解析随机或
             # 自定义文件，也不能加载提供商返回的文件，避免无意义的 IO 和混音。
