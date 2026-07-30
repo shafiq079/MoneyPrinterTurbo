@@ -49,6 +49,7 @@ class TestTaskService(unittest.TestCase):
         render_plan_result="scene_render_plan.json",
         render_plan_error=None,
         stop_at="materials",
+        events=None,
     ):
         timeline_path = Path(tmp_path) / "scenes.json"
         timeline_path.write_text("[]", encoding="utf-8")
@@ -123,6 +124,17 @@ class TestTaskService(unittest.TestCase):
                     return_value=(["final.mp4"], ["combined.mp4"], []),
                 )
             )
+            if events is not None:
+                render_plan.side_effect = lambda *_args: (
+                    events.append("render_plan") or render_plan_result
+                )
+                get_materials.side_effect = lambda *_args: (
+                    events.append("get_video_materials") or materials
+                )
+                render.side_effect = lambda *_args: (
+                    events.append("rendering")
+                    or (["final.mp4"], ["combined.mp4"], [])
+                )
             stack.enter_context(
                 patch.object(
                     tm.upload_post.upload_post_service,
@@ -1954,11 +1966,17 @@ class TestTaskService(unittest.TestCase):
             artifact = root / "scene_render_materials.json"
             for item in (preview, selection, plan, artifact):
                 item.write_text("{}", encoding="utf-8")
+            events = []
+
+            def finalize_result(**_kwargs):
+                events.append("scene_material_finalization")
+                return str(artifact)
+
             with (
                 patch.object(
                     tm.scene_render_materials,
                     "create_scene_render_materials",
-                    return_value=str(artifact),
+                    side_effect=finalize_result,
                 ) as finalize,
                 patch.object(
                     tm.scene_render_materials,
@@ -1977,6 +1995,7 @@ class TestTaskService(unittest.TestCase):
                         selection_result=str(selection),
                         render_plan_result=str(plan),
                         stop_at="video",
+                        events=events,
                     )
                 )
             get_materials.assert_called_once_with(
@@ -1985,6 +2004,124 @@ class TestTaskService(unittest.TestCase):
             self.assertIs(finalize.call_args.kwargs["legacy_material_paths"], materials)
             self.assertIs(render.call_args.args[2], materials)
             self.assertEqual(result["scene_render_materials_path"], str(artifact))
+            self.assertEqual(
+                events,
+                [
+                    "render_plan",
+                    "get_video_materials",
+                    "scene_material_finalization",
+                    "rendering",
+                ],
+            )
+
+    def test_scene_material_artifact_is_exposed_at_material_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            preview = root / "scene_previews.json"
+            selection = root / "scene_selections.json"
+            plan = root / "scene_render_plan.json"
+            artifact = root / "scene_render_materials.json"
+            for item in (preview, selection, plan, artifact):
+                item.write_text("{}", encoding="utf-8")
+            with (
+                patch.object(
+                    tm.scene_render_materials,
+                    "create_scene_render_materials",
+                    return_value=str(artifact),
+                ),
+                patch.object(
+                    tm.scene_render_materials,
+                    "load_scene_render_materials",
+                    return_value={},
+                ),
+                patch.object(
+                    tm.material, "resolve_material_directory", return_value=str(root)
+                ),
+                patch.object(tm.utils, "task_dir", return_value=str(root)),
+            ):
+                result, state, *_rest = self._run_preview_pipeline(
+                    tmp,
+                    preview_result=str(preview),
+                    selection_result=str(selection),
+                    render_plan_result=str(plan),
+                    stop_at="materials",
+                )
+            self.assertEqual(result["scene_render_materials_path"], str(artifact))
+            self.assertEqual(
+                state.get_task("preview-pipeline")["scene_render_materials_path"],
+                str(artifact),
+            )
+
+    def test_invalid_scene_material_artifacts_and_failures_are_nonfatal(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as other:
+            root = Path(tmp)
+            preview = root / "scene_previews.json"
+            selection = root / "scene_selections.json"
+            plan = root / "scene_render_plan.json"
+            for item in (preview, selection, plan):
+                item.write_text("{}", encoding="utf-8")
+            missing = root / "missing.json"
+            directory = root / "directory"
+            directory.mkdir()
+            regular = root / "regular.json"
+            regular.write_text("{}", encoding="utf-8")
+            symlink = root / "symlink.json"
+            symlink.symlink_to(regular)
+            outside = Path(other) / "outside.json"
+            outside.write_text("{}", encoding="utf-8")
+            cases = ("", str(missing), str(directory), str(symlink), str(outside))
+            for returned in cases:
+                with (
+                    self.subTest(returned=returned),
+                    patch.object(
+                        tm.scene_render_materials,
+                        "create_scene_render_materials",
+                        return_value=returned,
+                    ),
+                    patch.object(
+                        tm.material,
+                        "resolve_material_directory",
+                        return_value=str(root),
+                    ),
+                    patch.object(tm.utils, "task_dir", return_value=str(root)),
+                ):
+                    result, _, _, _, _, _, render, materials = (
+                        self._run_preview_pipeline(
+                            tmp,
+                            preview_result=str(preview),
+                            selection_result=str(selection),
+                            render_plan_result=str(plan),
+                            stop_at="video",
+                        )
+                    )
+                self.assertNotIn("scene_render_materials_path", result)
+                self.assertIs(render.call_args.args[2], materials)
+
+            with (
+                patch.object(
+                    tm.scene_render_materials,
+                    "create_scene_render_materials",
+                    return_value=str(regular),
+                ),
+                patch.object(
+                    tm.scene_render_materials,
+                    "load_scene_render_materials",
+                    side_effect=ValueError("malformed"),
+                ),
+                patch.object(
+                    tm.material, "resolve_material_directory", return_value=str(root)
+                ),
+                patch.object(tm.utils, "task_dir", return_value=str(root)),
+            ):
+                result, _, _, _, _, _, render, materials = self._run_preview_pipeline(
+                    tmp,
+                    preview_result=str(preview),
+                    selection_result=str(selection),
+                    render_plan_result=str(plan),
+                    stop_at="video",
+                )
+            self.assertNotIn("scene_render_materials_path", result)
+            self.assertIs(render.call_args.args[2], materials)
 
     def test_disabled_and_local_paths_never_finalize_scene_materials(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(

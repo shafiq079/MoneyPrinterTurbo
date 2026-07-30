@@ -1311,6 +1311,7 @@ def _run_pipeline(
                 scene_render_plan_path,
                 scene_timeline_path,
                 scene_selections_path,
+                downloaded_videos,
                 legacy_material_root,
                 utils.task_dir(task_id),
             )

@@ -163,7 +163,10 @@ def _probe(path: Path, root: Path, *, selected: bool) -> dict:
 def _validate_url(url: str) -> tuple[str, int]:
     if not isinstance(url, str) or not url or len(url) > 4096:
         raise AcquisitionError("unsafe_destination")
-    if any(character.isspace() or ord(character) < 32 for character in url):
+    if any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127
+        for character in url
+    ):
         raise AcquisitionError("unsafe_destination")
     try:
         parsed = urlsplit(url)
@@ -251,22 +254,28 @@ def _download(url: str, destination: Path, root: Path) -> dict:
         content_length = response.headers.get("Content-Length")
         if content_length:
             try:
-                if int(content_length) > MAX_SELECTED_VIDEO_BYTES:
-                    raise AcquisitionLimitError("selected video exceeds size limit")
+                declared_size = int(content_length)
             except ValueError as exc:
                 raise AcquisitionError("download_failed") from exc
+            if declared_size > MAX_SELECTED_VIDEO_BYTES:
+                raise AcquisitionLimitError("selected video exceeds size limit")
         with tempfile.NamedTemporaryFile(
             mode="wb", dir=root, suffix=".part", delete=False
         ) as output:
             temporary = Path(output.name)
             total = 0
-            for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_BYTES):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > MAX_SELECTED_VIDEO_BYTES:
-                    raise AcquisitionLimitError("selected video exceeds size limit")
-                output.write(chunk)
+            try:
+                for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_BYTES):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_SELECTED_VIDEO_BYTES:
+                        raise AcquisitionLimitError(
+                            "selected video exceeds size limit"
+                        )
+                    output.write(chunk)
+            except requests.RequestException as exc:
+                raise AcquisitionError("download_failed") from exc
             output.flush()
             os.fsync(output.fileno())
         if total <= 0:
@@ -285,7 +294,7 @@ def _material_row(metadata: dict, **identity) -> dict:
     return {**identity, **metadata}
 
 
-def _atomic_write(path: Path, payload: dict) -> None:
+def _atomic_write(path: Path, payload: dict, validate_temporary) -> None:
     if path.exists() or path.is_symlink():
         if path.is_symlink() or not path.is_file():
             raise ValueError("material manifest target is unsafe")
@@ -298,6 +307,7 @@ def _atomic_write(path: Path, payload: dict) -> None:
             json.dump(payload, output, ensure_ascii=False, indent=2)
             output.flush()
             os.fsync(output.fileno())
+        validate_temporary(str(temporary))
         os.replace(temporary, path)
         temporary = None
     finally:
@@ -326,11 +336,15 @@ def create_scene_render_materials(
     legacy_root = _real_root(legacy_material_root, "legacy material root")
 
     selected_requests = {}
+    selected_identities = {}
     for scene in plan["scenes"]:
         if scene["binding"] != "selected":
             continue
         url = scene["video_url"]
         url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        identity = (scene["provider"], scene["provider_video_id"])
+        if selected_identities.setdefault(url_hash, identity) != identity:
+            raise ValueError("one selected URL has inconsistent provider identities")
         selected_requests.setdefault(url_hash, scene)
     if len(selected_requests) > MAX_UNIQUE_SELECTED_DOWNLOADS:
         raise AcquisitionLimitError("too many unique selected videos")
@@ -477,16 +491,23 @@ def create_scene_render_materials(
         "scenes": scene_rows,
     }
     target = task_root / "scene_render_materials.json"
-    _atomic_write(target, payload)
+    validate_args = (
+        render_plan_path,
+        scene_manifest_path,
+        selection_manifest_path,
+        legacy_material_paths,
+        legacy_material_root,
+        task_dir,
+    )
+    _atomic_write(
+        target,
+        payload,
+        lambda temporary_path: load_scene_render_materials(
+            temporary_path, *validate_args
+        ),
+    )
     try:
-        load_scene_render_materials(
-            str(target),
-            render_plan_path,
-            scene_manifest_path,
-            selection_manifest_path,
-            legacy_material_root,
-            task_dir,
-        )
+        load_scene_render_materials(str(target), *validate_args)
     except Exception:
         target.unlink(missing_ok=True)
         raise
@@ -498,10 +519,11 @@ def load_scene_render_materials(
     render_plan_path: str,
     scene_manifest_path: str,
     selection_manifest_path: str,
+    legacy_material_paths: list[str],
     legacy_material_root: str,
     task_dir: str,
 ) -> dict:
-    """Strictly validate a published material artifact and every local file."""
+    """Strictly validate a material artifact, its sources, and its exact bindings."""
     task_root = _real_root(task_dir, "task directory")
     manifest = _contained_file(manifest_path, task_root, "material manifest")
     data = _regular_bytes(manifest, MAX_MANIFEST_BYTES, "material manifest")
@@ -521,14 +543,11 @@ def load_scene_render_materials(
         MAX_MANIFEST_BYTES,
         "render plan",
     )
-    if not isinstance(payload, dict) or set(payload) != {
-        "version",
-        "source_render_plan",
-        "source_scene_manifest",
-        "source_selection_manifest",
-        "materials",
-        "scenes",
-    }:
+    expected_fields = {
+        "version", "source_render_plan", "source_scene_manifest",
+        "source_selection_manifest", "materials", "scenes",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise ValueError("material manifest fields are invalid")
     if payload["version"] != MANIFEST_VERSION or payload["source_render_plan"] != {
         "version": plan["version"],
@@ -544,26 +563,36 @@ def load_scene_render_materials(
         payload["scenes"], list
     ):
         raise ValueError("material manifest arrays are invalid")
+
     selected_root = _real_root(
         str(task_root / "scene_materials"), "selected material directory"
     )
     legacy_root = _real_root(legacy_material_root, "legacy material root")
+    validated_legacy = []
+    seen_legacy_paths = set()
+    seen_legacy_ids = set()
+    for legacy_path in legacy_material_paths:
+        try:
+            candidate = _contained_file(legacy_path, legacy_root, "legacy material")
+            if candidate in seen_legacy_paths:
+                continue
+            seen_legacy_paths.add(candidate)
+            metadata = _probe(candidate, legacy_root, selected=False)
+            material_id = f"legacy:{metadata['content_sha256']}"
+            if material_id in seen_legacy_ids:
+                continue
+            seen_legacy_ids.add(material_id)
+            validated_legacy.append({**metadata, "material_id": material_id})
+        except Exception:
+            continue
+
     materials = {}
     selected_count = 0
     selected_total = 0
     material_fields = {
-        "material_id",
-        "origin",
-        "source_url_sha256",
-        "provider",
-        "provider_video_id",
-        "local_path",
-        "content_sha256",
-        "size_bytes",
-        "duration",
-        "fps",
-        "width",
-        "height",
+        "material_id", "origin", "source_url_sha256", "provider",
+        "provider_video_id", "local_path", "content_sha256", "size_bytes",
+        "duration", "fps", "width", "height",
     }
     for row in payload["materials"]:
         if (
@@ -577,21 +606,17 @@ def load_scene_render_materials(
             Path(row["local_path"]), root, selected=row["origin"] == "selected_url"
         )
         for key in (
-            "local_path",
-            "content_sha256",
-            "size_bytes",
-            "duration",
-            "fps",
-            "width",
-            "height",
+            "local_path", "content_sha256", "size_bytes", "duration", "fps",
+            "width", "height",
         ):
             if metadata[key] != row[key]:
                 raise ValueError("material file does not match its manifest")
         if row["origin"] == "selected_url":
+            digest = row["source_url_sha256"]
             if (
-                not isinstance(row["source_url_sha256"], str)
-                or not _SHA256.fullmatch(row["source_url_sha256"])
-                or row["material_id"] != f"selected:{row['source_url_sha256']}"
+                not isinstance(digest, str)
+                or not _SHA256.fullmatch(digest)
+                or row["material_id"] != f"selected:{digest}"
                 or not isinstance(row["provider"], str)
                 or not row["provider"]
                 or not isinstance(row["provider_video_id"], str)
@@ -600,13 +625,20 @@ def load_scene_render_materials(
                 raise ValueError("selected material identity is invalid")
             selected_count += 1
             selected_total += row["size_bytes"]
-        elif (
-            row["source_url_sha256"] is not None
-            or row["provider"] is not None
-            or row["provider_video_id"] is not None
-            or row["material_id"] != f"legacy:{row['content_sha256']}"
-        ):
-            raise ValueError("legacy material identity is invalid")
+        else:
+            if (
+                row["source_url_sha256"] is not None
+                or row["provider"] is not None
+                or row["provider_video_id"] is not None
+                or row["material_id"] != f"legacy:{row['content_sha256']}"
+            ):
+                raise ValueError("legacy material identity is invalid")
+            if not any(
+                item["material_id"] == row["material_id"]
+                and item["local_path"] == row["local_path"]
+                for item in validated_legacy
+            ):
+                raise ValueError("legacy material was not supplied by the task")
         if row["material_id"] in materials:
             raise ValueError("material IDs must be unique")
         materials[row["material_id"]] = row
@@ -615,21 +647,56 @@ def load_scene_render_materials(
         or selected_total > MAX_TOTAL_SELECTED_VIDEO_BYTES
     ):
         raise ValueError("selected material limits are exceeded")
+
+    plan_by_index = {row["scene_index"]: row for row in plan["scenes"]}
+    available_selected = {}
+    selected_identity_by_hash = {}
+    for requested in plan["scenes"]:
+        if requested["binding"] != "selected":
+            continue
+        digest = hashlib.sha256(requested["video_url"].encode("utf-8")).hexdigest()
+        identity = (requested["provider"], requested["provider_video_id"])
+        if selected_identity_by_hash.setdefault(digest, identity) != identity:
+            raise ValueError("one selected URL has inconsistent provider identities")
+        material_id = f"selected:{digest}"
+        candidate = materials.get(material_id)
+        if candidate is None:
+            continue
+        if (
+            candidate["source_url_sha256"] != digest
+            or candidate["provider"] != requested["provider"]
+            or candidate["provider_video_id"] != requested["provider_video_id"]
+        ):
+            raise ValueError("selected material does not match its render-plan source")
+        available_selected[requested["scene_index"]] = candidate
+
+    first_legacy = validated_legacy[0] if validated_legacy else None
+
+    def expected_fallback(index):
+        prior = [source for source in available_selected if source < index]
+        if prior:
+            source = max(prior)
+            return "fallback_previous_selected", source, available_selected[source]
+        later = [source for source in available_selected if source > index]
+        if later:
+            source = min(later)
+            return "fallback_next_selected", source, available_selected[source]
+        if first_legacy is not None:
+            legacy_row = materials.get(first_legacy["material_id"])
+            if legacy_row is None:
+                raise ValueError("first supplied legacy fallback material is missing")
+            return "fallback_legacy", None, legacy_row
+        raise ValueError("scene has no validated fallback material")
+
     scene_fields = {
-        "scene_index",
-        "start_time",
-        "end_time",
-        "duration",
-        "requested_binding",
-        "resolution",
-        "requested_visual_source_scene_index",
-        "resolved_visual_source_scene_index",
-        "material_id",
-        "fallback_reason",
+        "scene_index", "start_time", "end_time", "duration",
+        "requested_binding", "resolution", "requested_visual_source_scene_index",
+        "resolved_visual_source_scene_index", "material_id", "fallback_reason",
         "acquisition_error",
     }
     if len(payload["scenes"]) != len(plan["scenes"]):
         raise ValueError("material scene coverage is incomplete")
+    used_material_ids = set()
     for actual, requested in zip(payload["scenes"], plan["scenes"]):
         if not isinstance(actual, dict) or set(actual) != scene_fields:
             raise ValueError("material scene row is invalid")
@@ -645,49 +712,45 @@ def load_scene_render_materials(
             or actual["fallback_reason"] != requested["fallback_reason"]
         ):
             raise ValueError("material scene request is invalid")
-        if (
-            actual["resolution"] not in RESOLUTIONS
-            or actual["material_id"] not in materials
-        ):
-            raise ValueError("material scene resolution is invalid")
-        chosen = materials[actual["material_id"]]
-        resolution = actual["resolution"]
-        resolved_source = actual["resolved_visual_source_scene_index"]
-        if resolution == "selected" and not (
-            actual["requested_binding"] == "selected"
-            and resolved_source == actual["scene_index"]
-            and chosen["origin"] == "selected_url"
-            and actual["acquisition_error"] is None
-        ):
-            raise ValueError("selected scene resolution is inconsistent")
-        if resolution == "reused" and not (
-            actual["requested_binding"] == "reused"
-            and resolved_source == actual["requested_visual_source_scene_index"]
-            and chosen["origin"] == "selected_url"
-            and actual["acquisition_error"] is None
-        ):
-            raise ValueError("reused scene resolution is inconsistent")
-        if resolution in {"fallback_previous_selected", "fallback_next_selected"}:
-            if (
-                not isinstance(resolved_source, int)
-                or chosen["origin"] != "selected_url"
-            ):
-                raise ValueError("selected fallback resolution is inconsistent")
-            if (
-                resolution == "fallback_previous_selected"
-                and resolved_source >= actual["scene_index"]
-            ):
-                raise ValueError("previous fallback source is invalid")
-            if (
-                resolution == "fallback_next_selected"
-                and resolved_source <= actual["scene_index"]
-            ):
-                raise ValueError("next fallback source is invalid")
-        if resolution == "fallback_legacy" and not (
-            resolved_source is None and chosen["origin"] == "legacy_fallback"
-        ):
-            raise ValueError("legacy fallback resolution is inconsistent")
+        if actual["material_id"] not in materials:
+            raise ValueError("material scene references a missing material")
         error = actual["acquisition_error"]
         if error is not None and error not in ACQUISITION_ERRORS:
             raise ValueError("material acquisition error is invalid")
+
+        binding = requested["binding"]
+        index = requested["scene_index"]
+        if binding == "selected" and index in available_selected:
+            expected = ("selected", index, available_selected[index])
+            expected_error = None
+        elif binding == "reused":
+            source_index = requested["visual_source_scene_index"]
+            source = plan_by_index.get(source_index)
+            if source is None or source["binding"] != "selected":
+                raise ValueError("reused scene source is not selected")
+            if source_index in available_selected:
+                expected = ("reused", source_index, available_selected[source_index])
+                expected_error = None
+            else:
+                expected = expected_fallback(index)
+                expected_error = "source_download_failed"
+        else:
+            expected = expected_fallback(index)
+            expected_error = None if binding == "fallback_required" else "failure"
+
+        expected_resolution, expected_source, expected_material = expected
+        if (
+            actual["resolution"] != expected_resolution
+            or actual["resolved_visual_source_scene_index"] != expected_source
+            or actual["material_id"] != expected_material["material_id"]
+        ):
+            raise ValueError("material scene does not use its deterministic resolution")
+        if expected_error == "failure":
+            if error is None or error == "source_download_failed":
+                raise ValueError("selected fallback acquisition error is invalid")
+        elif error != expected_error:
+            raise ValueError("material acquisition error semantics are invalid")
+        used_material_ids.add(actual["material_id"])
+    if used_material_ids != set(materials):
+        raise ValueError("material manifest contains unused material rows")
     return payload
