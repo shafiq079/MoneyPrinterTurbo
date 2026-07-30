@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unicodedata
 from contextlib import ExitStack, redirect_stdout
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import List
 from uuid import uuid4
@@ -343,6 +344,7 @@ def concat_video_clips_with_ffmpeg(
     output_dir: str,
     max_duration: float | None = None,
     exact_timestamps: bool = False,
+    target_frames: int | None = None,
 ):
     concat_handle = tempfile.NamedTemporaryFile(
         mode="w",
@@ -377,12 +379,14 @@ def concat_video_clips_with_ffmpeg(
                     ]
                 )
             else:
-                command.extend(
-                    ["-f", "concat", "-safe", "0", "-i", concat_list_file]
-                )
+                command.extend(["-f", "concat", "-safe", "0", "-i", concat_list_file])
             command.extend(
                 [
-                    "-c:v", codec, "-threads", str(threads or 2), "-pix_fmt",
+                    "-c:v",
+                    codec,
+                    "-threads",
+                    str(threads or 2),
+                    "-pix_fmt",
                     "yuv420p",
                 ]
             )
@@ -390,13 +394,18 @@ def concat_video_clips_with_ffmpeg(
                 command.extend(["-r", str(fps)])
             if max_duration is not None and max_duration > 0:
                 command.extend(["-t", f"{max_duration:.3f}"])
+            if target_frames is not None:
+                command.extend(["-frames:v", str(target_frames)])
             command.append(output_file)
             return command
 
         def run_concat(codec: str):
             command = build_command(codec)
             result = subprocess.run(
-                command, capture_output=True, text=True, check=False,
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
             )
             if result.returncode != 0:
                 error_message = (result.stderr or result.stdout or "").strip()
@@ -477,37 +486,37 @@ def _open_video_clip_quietly(video_path: str, audio: bool = False) -> VideoFileC
 def close_clip(clip):
     if clip is None:
         return
-        
+
     try:
         # close main resources
         if hasattr(clip, "reader") and clip.reader is not None:
             clip.reader.close()
-            
+
         # close audio resources
         if hasattr(clip, "audio") and clip.audio is not None:
             if hasattr(clip.audio, "reader") and clip.audio.reader is not None:
                 clip.audio.reader.close()
             del clip.audio
-            
+
         # close mask resources
         if hasattr(clip, "mask") and clip.mask is not None:
             if hasattr(clip.mask, "reader") and clip.mask.reader is not None:
                 clip.mask.reader.close()
             del clip.mask
-            
+
         # handle child clips in composite clips
         if hasattr(clip, "clips") and clip.clips:
             for child_clip in clip.clips:
                 if child_clip is not clip:  # avoid possible circular references
                     close_clip(child_clip)
-            
+
         # clear clip list
         if hasattr(clip, "clips"):
             clip.clips = []
-            
+
     except Exception as e:
         logger.error(f"failed to close clip: {str(e)}")
-    
+
     del clip
     gc.collect()
 
@@ -670,7 +679,7 @@ def combine_videos(
         clip_duration = clip.duration
         clip_w, clip_h = clip.size
         close_clip(clip)
-        
+
         start_time = 0
 
         while start_time < clip_duration:
@@ -699,21 +708,21 @@ def combine_videos(
         subclipped_items=subclipped_items,
         concat_mode=video_concat_mode,
     )
-        
+
     logger.debug(f"total subclipped items: {len(subclipped_items)}")
-    
+
     # Add downloaded clips over and over until the duration of the audio (max_duration) has been reached
     for i, subclipped_item in enumerate(subclipped_items):
         if video_duration >= required_video_duration:
             break
-        
+
         logger.debug(
-            f"processing clip {i+1}: {subclipped_item.width}x{subclipped_item.height}, "
+            f"processing clip {i + 1}: {subclipped_item.width}x{subclipped_item.height}, "
             f"source: {os.path.basename(subclipped_item.source_file_path)}, "
             f"current duration: {video_duration:.2f}s, "
             f"remaining: {required_video_duration - video_duration:.2f}s"
         )
-        
+
         try:
             clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
                 subclipped_item.start_time, subclipped_item.end_time
@@ -730,9 +739,9 @@ def combine_videos(
 
             if clip.duration > max_clip_duration:
                 clip = clip.subclipped(0, max_clip_duration)
-                
+
             # wirte clip to temp file
-            clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
+            clip_file = f"{output_dir}/temp-clip-{i + 1}.mp4"
             _write_videofile_with_codec_fallback(
                 clip,
                 clip_file,
@@ -755,10 +764,10 @@ def combine_videos(
                 )
             )
             video_duration += clip_duration_saved
-            
+
         except Exception as e:
             logger.error(f"failed to process clip: {str(e)}")
-    
+
     # loop processed clips until the video duration covers the audio duration and the small safety margin.
     if video_duration < required_video_duration:
         logger.warning(
@@ -774,15 +783,15 @@ def combine_videos(
         logger.info(
             f"video duration: {video_duration:.2f}s, audio duration: {audio_duration:.2f}s, "
             f"required duration: {required_video_duration:.2f}s, "
-            f"looped {len(processed_clips)-len(base_clips)} clips"
+            f"looped {len(processed_clips) - len(base_clips)} clips"
         )
-     
+
     # merge video clips progressively, avoid loading all videos at once to avoid memory overflow
     logger.info("starting clip merging process")
     if not processed_clips:
         logger.warning("no clips available for merging")
         return combined_video_path
-    
+
     clip_files = [clip.file_path for clip in processed_clips]
     logger.info(f"concatenating {len(clip_files)} clips with ffmpeg")
     concat_video_clips_with_ffmpeg(
@@ -792,7 +801,7 @@ def combine_videos(
         output_dir=output_dir,
         max_duration=audio_duration,
     )
-    
+
     # clean temp files
     delete_files(clip_files)
     logger.info("video combining completed")
@@ -801,6 +810,27 @@ def combine_videos(
 
 _SCENE_TIMELINE_TOLERANCE = 0.001
 _SCENE_AUDIO_CODEC_TOLERANCE = 0.020
+
+
+@dataclass(frozen=True, slots=True)
+class SceneVisualRun:
+    material_id: str
+    local_path: str
+    first_scene_index: int
+    last_scene_index: int
+    start_time: float
+    end_time: float
+    required_duration: float
+    start_frame: int = 0
+    end_frame: int = 0
+
+    @property
+    def frame_count(self) -> int:
+        return self.end_frame - self.start_frame
+
+    @property
+    def encode_duration(self) -> float:
+        return self.frame_count / fps
 
 
 def _close_owned_clips(clips):
@@ -880,6 +910,76 @@ def _validate_scene_render_timeline(scene_render_payload: dict, audio_duration: 
     return scenes, materials_by_id
 
 
+def _build_scene_visual_runs(scenes: list[dict], materials_by_id: dict):
+    """Coalesce only consecutive logical scenes with the same material binding."""
+    runs: list[SceneVisualRun] = []
+    for scene in scenes:
+        material_id = scene["material_id"]
+        material = materials_by_id[material_id]
+        start_time = float(scene["start_time"])
+        end_time = float(scene["end_time"])
+        if runs and runs[-1].material_id == material_id:
+            previous = runs[-1]
+            runs[-1] = SceneVisualRun(
+                material_id=material_id,
+                local_path=previous.local_path,
+                first_scene_index=previous.first_scene_index,
+                last_scene_index=scene["scene_index"],
+                start_time=previous.start_time,
+                end_time=end_time,
+                required_duration=end_time - previous.start_time,
+            )
+            continue
+        runs.append(
+            SceneVisualRun(
+                material_id=material_id,
+                local_path=material["local_path"],
+                first_scene_index=scene["scene_index"],
+                last_scene_index=scene["scene_index"],
+                start_time=start_time,
+                end_time=end_time,
+                required_duration=end_time - start_time,
+            )
+        )
+    return runs
+
+
+def _allocate_scene_visual_run_frames(
+    runs: list[SceneVisualRun], audio_duration: float
+) -> tuple[list[SceneVisualRun], int]:
+    """Assign an integral 30 FPS interval to every run from cumulative endpoints."""
+    total_target_frames = math.ceil(audio_duration * fps)
+    if total_target_frames < len(runs):
+        raise ValueError("visual runs cannot each receive a positive frame")
+    allocated: list[SceneVisualRun] = []
+    previous_end = 0
+    for position, run in enumerate(runs):
+        remaining_runs = len(runs) - position - 1
+        if not remaining_runs:
+            end_frame = total_target_frames
+        else:
+            desired_end = math.ceil(run.end_time * fps)
+            latest_end = total_target_frames - remaining_runs
+            end_frame = max(previous_end + 1, min(desired_end, latest_end))
+        if end_frame <= previous_end:
+            raise ValueError("visual run frame allocation is empty")
+        allocated.append(
+            SceneVisualRun(
+                material_id=run.material_id,
+                local_path=run.local_path,
+                first_scene_index=run.first_scene_index,
+                last_scene_index=run.last_scene_index,
+                start_time=run.start_time,
+                end_time=run.end_time,
+                required_duration=run.required_duration,
+                start_frame=previous_end,
+                end_frame=end_frame,
+            )
+        )
+        previous_end = end_frame
+    return allocated, total_target_frames
+
+
 def combine_scene_videos(
     combined_video_path: str,
     scene_render_payload: dict,
@@ -900,9 +1000,8 @@ def combine_scene_videos(
     try:
         audio_clip = AudioFileClip(audio_file)
         audio_duration_value = audio_clip.duration
-        if (
-            isinstance(audio_duration_value, bool)
-            or not isinstance(audio_duration_value, numbers.Real)
+        if isinstance(audio_duration_value, bool) or not isinstance(
+            audio_duration_value, numbers.Real
         ):
             raise ValueError("narration duration must be numeric")
         audio_duration = float(audio_duration_value)
@@ -914,20 +1013,27 @@ def combine_scene_videos(
         scenes, materials_by_id = _validate_scene_render_timeline(
             scene_render_payload, audio_duration
         )
+        visual_runs = _build_scene_visual_runs(scenes, materials_by_id)
+        visual_runs, total_target_frames = _allocate_scene_visual_run_frames(
+            visual_runs, audio_duration
+        )
+        logger.info(
+            "scene renderer selected: "
+            f"logical_scenes={len(scenes)}, visual_runs={len(visual_runs)}"
+        )
         normalized_clip_speed = utils.normalize_clip_speed(clip_speed)
-        for scene in scenes:
-            scene_index = scene["scene_index"]
-            required_duration = float(scene["end_time"]) - float(scene["start_time"])
-            material = materials_by_id[scene["material_id"]]
-            local_path = material["local_path"]
+        for run in visual_runs:
+            required_duration = run.encode_duration
             clip_file = os.path.join(
                 output_dir,
-                f"scene-{output_index}-{scene_index}-{render_token}.mp4",
+                "scene-"
+                f"{output_index}-{run.first_scene_index}-{run.last_scene_index}-"
+                f"{render_token}.mp4",
             )
             temporary_files.append(clip_file)
             owned_clips = []
             try:
-                clip = _open_video_clip_quietly(local_path)
+                clip = _open_video_clip_quietly(run.local_path)
                 owned_clips.append(clip)
                 if normalized_clip_speed != 1.0:
                     clip = clip.with_speed_scaled(normalized_clip_speed)
@@ -939,12 +1045,13 @@ def combine_scene_videos(
                 owned_clips.append(clip)
                 clip = _fit_clip_to_aspect(clip, video_aspect)
                 owned_clips.append(clip)
-                clip = _apply_video_transition(
-                    clip,
-                    video_transition_mode,
-                    duration=min(1.0, required_duration),
-                )
-                owned_clips.append(clip)
+                if required_duration >= 2.0:
+                    clip = _apply_video_transition(
+                        clip,
+                        video_transition_mode,
+                        duration=min(1.0, required_duration * 0.25),
+                    )
+                    owned_clips.append(clip)
                 clip = clip.subclipped(0, required_duration)
                 owned_clips.append(clip)
                 _write_videofile_with_codec_fallback(
@@ -967,8 +1074,8 @@ def combine_scene_videos(
             output_file=combined_video_path,
             threads=threads,
             output_dir=output_dir,
-            max_duration=audio_duration,
             exact_timestamps=True,
+            target_frames=total_target_frames,
         )
         succeeded = True
         return combined_video_path

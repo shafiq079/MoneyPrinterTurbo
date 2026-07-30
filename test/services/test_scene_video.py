@@ -39,7 +39,8 @@ class _Clip:
 
 def _payload(durations=(0.4, 0.6), paths=("a.mp4", "b.mp4")):
     materials = [
-        {"material_id": f"m{i}", "local_path": item} for i, item in enumerate(paths, start=1)
+        {"material_id": f"m{i}", "local_path": item}
+        for i, item in enumerate(paths, start=1)
     ]
     scenes = []
     cursor = 0.0
@@ -128,13 +129,13 @@ class TestSceneVideoRenderer(unittest.TestCase):
             self.assertEqual([duration for _, duration in written], [0.4, 0.6])
             self.assertTrue(any(event[0] == "speed" for event in events))
             self.assertTrue(any(event[0] == "loop" for event in events))
-            self.assertEqual(concat.call_args.kwargs["max_duration"], 1.0)
+            self.assertEqual(concat.call_args.kwargs["target_frames"], 30)
             self.assertEqual(
                 concat.call_args.kwargs["clip_files"], [path for path, _ in written]
             )
             self.assertFalse(any(Path(path).exists() for path, _ in written))
 
-    def test_all_transitions_cap_effect_to_subsecond_scene(self):
+    def test_all_transitions_are_skipped_for_sub_two_second_runs(self):
         for mode in VideoTransitionMode:
             with self.subTest(mode=mode):
                 durations = []
@@ -164,7 +165,183 @@ class TestSceneVideoRenderer(unittest.TestCase):
                         "audio.wav",
                         video_transition_mode=mode,
                     )
-                self.assertEqual(durations, [(mode, 0.4)])
+                self.assertEqual(durations, [])
+
+    def test_long_run_receives_one_adaptive_transition(self):
+        for run_duration, expected_transition in ((2.4, 0.6), (8.0, 1.0)):
+            with self.subTest(run_duration=run_duration):
+                transitions = []
+
+                def transition(clip, transition_mode, *, duration):
+                    transitions.append((transition_mode, duration))
+                    return clip
+
+                with (
+                    tempfile.TemporaryDirectory() as tmp,
+                    patch.object(
+                        video, "AudioFileClip", return_value=_Audio(run_duration)
+                    ),
+                    patch.object(
+                        video,
+                        "_open_video_clip_quietly",
+                        return_value=_Clip(run_duration, []),
+                    ),
+                    patch.object(
+                        video, "_fit_clip_to_aspect", side_effect=lambda c, _a: c
+                    ),
+                    patch.object(
+                        video, "_apply_video_transition", side_effect=transition
+                    ),
+                    patch.object(video, "_write_videofile_with_codec_fallback"),
+                    patch.object(video, "concat_video_clips_with_ffmpeg"),
+                ):
+                    video.combine_scene_videos(
+                        os.path.join(tmp, "combined.mp4"),
+                        _payload((run_duration,), ("a.mp4",)),
+                        "audio.wav",
+                        video_transition_mode=VideoTransitionMode.fade_in,
+                    )
+                self.assertEqual(
+                    transitions,
+                    [(VideoTransitionMode.fade_in, expected_transition)],
+                )
+
+    def test_consecutive_material_bindings_coalesce_but_later_reuse_does_not(self):
+        payload = {
+            "materials": [
+                {"material_id": "a", "local_path": "a.mp4"},
+                {"material_id": "b", "local_path": "b.mp4"},
+            ],
+            "scenes": [
+                {
+                    "scene_index": 1,
+                    "start_time": 0,
+                    "end_time": 0.5,
+                    "duration": 0.5,
+                    "material_id": "a",
+                },
+                {
+                    "scene_index": 2,
+                    "start_time": 0.5,
+                    "end_time": 1.0,
+                    "duration": 0.5,
+                    "material_id": "a",
+                },
+                {
+                    "scene_index": 3,
+                    "start_time": 1.0,
+                    "end_time": 1.5,
+                    "duration": 0.5,
+                    "material_id": "b",
+                },
+                {
+                    "scene_index": 4,
+                    "start_time": 1.5,
+                    "end_time": 2.0,
+                    "duration": 0.5,
+                    "material_id": "a",
+                },
+            ],
+        }
+        scenes, materials = video._validate_scene_render_timeline(payload, 2.0)
+        runs = video._build_scene_visual_runs(scenes, materials)
+        self.assertEqual(
+            [
+                (run.material_id, run.first_scene_index, run.last_scene_index)
+                for run in runs
+            ],
+            [("a", 1, 2), ("b", 3, 3), ("a", 4, 4)],
+        )
+
+    def test_leading_internal_and_trailing_holds_coalesce_by_material(self):
+        payload = {
+            "materials": [
+                {"material_id": "a", "local_path": "a.mp4"},
+                {"material_id": "b", "local_path": "b.mp4"},
+            ],
+            "scenes": [
+                {
+                    "scene_index": 1,
+                    "start_time": 0,
+                    "end_time": 0.2,
+                    "duration": 0.2,
+                    "material_id": "a",
+                },
+                {
+                    "scene_index": 2,
+                    "start_time": 0.2,
+                    "end_time": 0.8,
+                    "duration": 0.6,
+                    "material_id": "a",
+                },
+                {
+                    "scene_index": 3,
+                    "start_time": 0.8,
+                    "end_time": 1.0,
+                    "duration": 0.2,
+                    "material_id": "a",
+                },
+                {
+                    "scene_index": 4,
+                    "start_time": 1.0,
+                    "end_time": 1.8,
+                    "duration": 0.8,
+                    "material_id": "b",
+                },
+                {
+                    "scene_index": 5,
+                    "start_time": 1.8,
+                    "end_time": 2.0,
+                    "duration": 0.2,
+                    "material_id": "b",
+                },
+            ],
+        }
+        scenes, materials = video._validate_scene_render_timeline(payload, 2.0)
+        runs = video._build_scene_visual_runs(scenes, materials)
+        self.assertEqual(len(runs), 2)
+        self.assertEqual((runs[0].first_scene_index, runs[0].last_scene_index), (1, 3))
+        self.assertEqual((runs[1].first_scene_index, runs[1].last_scene_index), (4, 5))
+
+    def test_adjacent_scenes_open_once_and_loop_for_complete_run(self):
+        payload = {
+            "materials": [{"material_id": "a", "local_path": "a.mp4"}],
+            "scenes": [
+                {
+                    "scene_index": 1,
+                    "start_time": 0,
+                    "end_time": 0.6,
+                    "duration": 0.6,
+                    "material_id": "a",
+                },
+                {
+                    "scene_index": 2,
+                    "start_time": 0.6,
+                    "end_time": 1.2,
+                    "duration": 0.6,
+                    "material_id": "a",
+                },
+            ],
+        }
+        events = []
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(video, "AudioFileClip", return_value=_Audio(1.2)),
+            patch.object(
+                video, "_open_video_clip_quietly", return_value=_Clip(0.5, events)
+            ) as opened,
+            patch.object(video, "_fit_clip_to_aspect", side_effect=lambda c, _a: c),
+            patch.object(video, "_apply_video_transition") as transition,
+            patch.object(video, "_write_videofile_with_codec_fallback"),
+            patch.object(video, "concat_video_clips_with_ffmpeg"),
+        ):
+            video.combine_scene_videos(
+                os.path.join(tmp, "combined.mp4"), payload, "audio.wav"
+            )
+        opened.assert_called_once_with("a.mp4")
+        transition.assert_not_called()
+        loop_events = [event for event in events if event[0] == "loop"]
+        self.assertEqual(loop_events, [("loop", "source", 1.2)])
 
     def test_aspect_helper_preserves_fit_and_black_background(self):
         clip = MagicMock(size=(1920, 1080), w=1920, h=1080, duration=1.0)
@@ -405,5 +582,80 @@ class TestSceneVideoRealMedia(unittest.TestCase):
                 self.assertLessEqual(abs(rendered.duration - 0.4), 1 / 30)
             finally:
                 video.close_clip(rendered)
+            self.assertEqual(list(root.glob("scene-*.mp4")), [])
+            self.assertEqual(list(root.glob("ffmpeg-concat-*.txt")), [])
+
+    def test_many_fractional_scenes_keep_frames_and_continue_through_hold(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "moving.mp4"
+            audio = root / "audio.wav"
+            output = root / "combined.mp4"
+            self._write_video(
+                source,
+                10.0,
+                lambda t: np.full(
+                    (24, 24, 3),
+                    (220, 20, 20) if t < 5.0 else (20, 220, 20),
+                    np.uint8,
+                ),
+            )
+            self._write_audio(audio, 31.8)
+            endpoints = [0.0, 0.1, 2.175, 4.25, 5.275, 8.588]
+            while endpoints[-1] < 30.75:
+                endpoints.append(min(30.75, endpoints[-1] + 1.037))
+            endpoints.append(31.8)
+            scenes = [
+                {
+                    "scene_index": index,
+                    "start_time": start,
+                    "end_time": end,
+                    "duration": end - start,
+                    "material_id": "moving",
+                }
+                for index, (start, end) in enumerate(
+                    zip(endpoints, endpoints[1:]), start=1
+                )
+            ]
+            payload = {
+                "materials": [{"material_id": "moving", "local_path": str(source)}],
+                "scenes": scenes,
+            }
+            opened = []
+            real_open = video._open_video_clip_quietly
+
+            def tracked_open(path):
+                opened.append(path)
+                return real_open(path)
+
+            with (
+                patch.object(
+                    video, "_open_video_clip_quietly", side_effect=tracked_open
+                ),
+                patch.object(VideoAspect, "to_resolution", return_value=(24, 24)),
+            ):
+                video.combine_scene_videos(
+                    str(output),
+                    payload,
+                    str(audio),
+                    video_transition_mode=VideoTransitionMode.fade_in,
+                )
+
+            rendered = real_open(str(output))
+            try:
+                self.assertEqual(math.ceil(31.8 * 30), 954)
+                self.assertGreaterEqual(rendered.duration, 31.8)
+                self.assertLessEqual(rendered.duration - 31.8, 1 / 30)
+                before_hold_end = rendered.get_frame(5.24)[12, 12]
+                after_hold_end = rendered.get_frame(5.31)[12, 12]
+            finally:
+                video.close_clip(rendered)
+            self.assertGreater(before_hold_end[1], before_hold_end[0])
+            self.assertGreater(after_hold_end[1], after_hold_end[0])
+            self.assertGreater(int(before_hold_end.sum()), 100)
+            self.assertGreater(int(after_hold_end.sum()), 100)
+            self.assertEqual(opened.count(str(source)), 1)
             self.assertEqual(list(root.glob("scene-*.mp4")), [])
             self.assertEqual(list(root.glob("ffmpeg-concat-*.txt")), [])
