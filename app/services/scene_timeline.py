@@ -31,6 +31,7 @@ _SRT_TIME_RANGE = re.compile(
     r"^\s*(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*"
     r"(\d+):(\d+):(\d+)[,.](\d+)\s*$"
 )
+TIMING_TOLERANCE = 0.001
 
 
 def _timestamp_seconds(parts: tuple[str, ...]) -> float:
@@ -91,13 +92,13 @@ def _append_segment(
 ) -> None:
     text = " ".join(text.split())
     duration = end - start
-    if not text or not math.isfinite(duration) or duration <= 0:
+    if not math.isfinite(duration) or duration <= 0:
         return
 
     split_count = 1
     if math.isfinite(max_clip_duration) and max_clip_duration > 0:
         split_count = max(1, math.ceil(duration / max_clip_duration))
-    chunks = _split_text(text, split_count)
+    chunks = _split_text(text, split_count) if text else [""] * split_count
     # Time is divided evenly rather than by chunk text length.  Natural word
     # boundaries can make text chunks quite uneven; weighting time by those
     # lengths could therefore exceed max_clip_duration even though split_count
@@ -179,8 +180,26 @@ def build_scenes(
             cursor = end
 
     scenes: list[NarrationScene] = []
+    cursor = 0.0
     for text, start, end in segments:
+        gap = start - cursor
+        if gap > TIMING_TOLERANCE:
+            _append_segment(scenes, "", cursor, start, max_clip_duration)
+        elif abs(gap) <= TIMING_TOLERANCE:
+            start = cursor
         _append_segment(scenes, text, start, end, max_clip_duration)
+        cursor = end
+    trailing_gap = audio_duration - cursor
+    if trailing_gap > TIMING_TOLERANCE:
+        _append_segment(scenes, "", cursor, audio_duration, max_clip_duration)
+    elif scenes and abs(trailing_gap) <= TIMING_TOLERANCE:
+        final = scenes[-1]
+        scenes[-1] = final.model_copy(
+            update={
+                "end_time": audio_duration,
+                "duration": audio_duration - final.start_time,
+            }
+        )
     return scenes
 
 

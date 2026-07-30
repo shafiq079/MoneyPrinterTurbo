@@ -842,9 +842,9 @@ def _validate_scene_render_timeline(scene_render_payload: dict, audio_duration: 
 
     previous_end = None
     total_duration = 0.0
-    for expected_index, scene in enumerate(scenes):
+    for expected_index, scene in enumerate(scenes, start=1):
         if not isinstance(scene, dict) or scene.get("scene_index") != expected_index:
-            raise ValueError("scene indexes must be zero-based and supplied in order")
+            raise ValueError("scene indexes must be one-based and supplied in order")
         try:
             start_time = float(scene["start_time"])
             end_time = float(scene["end_time"])

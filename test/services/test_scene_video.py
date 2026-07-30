@@ -39,11 +39,11 @@ class _Clip:
 
 def _payload(durations=(0.4, 0.6), paths=("a.mp4", "b.mp4")):
     materials = [
-        {"material_id": f"m{i}", "local_path": item} for i, item in enumerate(paths)
+        {"material_id": f"m{i}", "local_path": item} for i, item in enumerate(paths, start=1)
     ]
     scenes = []
     cursor = 0.0
-    for index, duration in enumerate(durations):
+    for index, duration in enumerate(durations, start=1):
         scenes.append(
             {
                 "scene_index": index,
@@ -78,7 +78,7 @@ class TestSceneVideoRenderer(unittest.TestCase):
         with (
             patch.object(video, "AudioFileClip", return_value=_Audio(1.0)),
             patch.object(video, "_open_video_clip_quietly") as opened,
-            self.assertRaisesRegex(ValueError, "zero-based"),
+            self.assertRaisesRegex(ValueError, "one-based"),
         ):
             video.combine_scene_videos("combined.mp4", payload, "audio.wav")
         opened.assert_not_called()
@@ -313,21 +313,21 @@ class TestSceneVideoRealMedia(unittest.TestCase):
                 ],
                 "scenes": [
                     {
-                        "scene_index": 0,
+                        "scene_index": 1,
                         "start_time": 0.0,
                         "end_time": 0.4,
                         "duration": 0.4,
                         "material_id": "short",
                     },
                     {
-                        "scene_index": 1,
+                        "scene_index": 2,
                         "start_time": 0.4,
                         "end_time": 0.7,
                         "duration": 0.3,
                         "material_id": "long",
                     },
                     {
-                        "scene_index": 2,
+                        "scene_index": 3,
                         "start_time": 0.7,
                         "end_time": 1.0,
                         "duration": 0.3,
@@ -385,7 +385,7 @@ class TestSceneVideoRealMedia(unittest.TestCase):
                 "materials": [{"material_id": "source", "local_path": str(source)}],
                 "scenes": [
                     {
-                        "scene_index": 0,
+                        "scene_index": 1,
                         "start_time": 0.0,
                         "end_time": 0.4,
                         "duration": 0.4,
