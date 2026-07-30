@@ -1,5 +1,7 @@
 import itertools
 import io
+import math
+import numbers
 import os
 import random
 import gc
@@ -340,6 +342,7 @@ def concat_video_clips_with_ffmpeg(
     threads: int,
     output_dir: str,
     max_duration: float | None = None,
+    exact_timestamps: bool = False,
 ):
     concat_handle = tempfile.NamedTemporaryFile(
         mode="w",
@@ -350,48 +353,56 @@ def concat_video_clips_with_ffmpeg(
         delete=False,
     )
     concat_list_file = concat_handle.name
-    with concat_handle as fp:
-        for clip_file in clip_files:
-            fp.write(f"file '{_format_ffmpeg_concat_path(clip_file)}'\n")
-
-    def build_command(codec: str) -> list[str]:
-        command = [
-            utils.get_ffmpeg_binary(),
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            concat_list_file,
-            "-c:v",
-            codec,
-            "-threads",
-            str(threads or 2),
-            "-pix_fmt",
-            "yuv420p",
-        ]
-        if max_duration is not None and max_duration > 0:
-            command.extend(["-t", f"{max_duration:.3f}"])
-        command.append(output_file)
-        return command
-
-    def run_concat(codec: str):
-        command = build_command(codec)
-        # 使用 ffmpeg 只做一次串联与编码，避免 MoviePy 逐段合并时反复重编码，
-        # 从而降低画质劣化与颜色偏移风险。
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            error_message = (result.stderr or result.stdout or "").strip()
-            raise RuntimeError(error_message or "ffmpeg concat failed")
-        return codec
-
     try:
+        with concat_handle as fp:
+            for clip_file in clip_files:
+                fp.write(f"file '{_format_ffmpeg_concat_path(clip_file)}'\n")
+
+        def build_command(codec: str) -> list[str]:
+            command = [utils.get_ffmpeg_binary(), "-y"]
+            if exact_timestamps:
+                for clip_file in clip_files:
+                    command.extend(["-i", clip_file])
+                inputs = "".join(
+                    f"[{index}:v]setpts=PTS-STARTPTS[v{index}];"
+                    for index in range(len(clip_files))
+                )
+                streams = "".join(f"[v{index}]" for index in range(len(clip_files)))
+                command.extend(
+                    [
+                        "-filter_complex",
+                        f"{inputs}{streams}concat=n={len(clip_files)}:v=1:a=0[outv]",
+                        "-map",
+                        "[outv]",
+                    ]
+                )
+            else:
+                command.extend(
+                    ["-f", "concat", "-safe", "0", "-i", concat_list_file]
+                )
+            command.extend(
+                [
+                    "-c:v", codec, "-threads", str(threads or 2), "-pix_fmt",
+                    "yuv420p",
+                ]
+            )
+            if exact_timestamps:
+                command.extend(["-r", str(fps)])
+            if max_duration is not None and max_duration > 0:
+                command.extend(["-t", f"{max_duration:.3f}"])
+            command.append(output_file)
+            return command
+
+        def run_concat(codec: str):
+            command = build_command(codec)
+            result = subprocess.run(
+                command, capture_output=True, text=True, check=False,
+            )
+            if result.returncode != 0:
+                error_message = (result.stderr or result.stdout or "").strip()
+                raise RuntimeError(error_message or "ffmpeg concat failed")
+            return codec
+
         effective_codec = _get_effective_video_codec()
         try:
             return run_concat(effective_codec)
@@ -880,21 +891,30 @@ def combine_scene_videos(
     output_index: int = 1,
 ) -> str:
     """Render strictly validated local scene bindings on their narration timeline."""
-    audio_clip = AudioFileClip(audio_file)
-    try:
-        audio_duration = float(audio_clip.duration)
-    finally:
-        close_clip(audio_clip)
-
-    scenes, materials_by_id = _validate_scene_render_timeline(
-        scene_render_payload, audio_duration
-    )
-    normalized_clip_speed = utils.normalize_clip_speed(clip_speed)
     output_dir = os.path.dirname(combined_video_path)
     render_token = uuid4().hex
     temporary_files = []
     succeeded = False
+    combined_output_owned = False
+    audio_clip = None
     try:
+        audio_clip = AudioFileClip(audio_file)
+        audio_duration_value = audio_clip.duration
+        if (
+            isinstance(audio_duration_value, bool)
+            or not isinstance(audio_duration_value, numbers.Real)
+        ):
+            raise ValueError("narration duration must be numeric")
+        audio_duration = float(audio_duration_value)
+        if not math.isfinite(audio_duration) or audio_duration <= 0:
+            raise ValueError("narration duration must be finite and greater than zero")
+        close_clip(audio_clip)
+        audio_clip = None
+
+        scenes, materials_by_id = _validate_scene_render_timeline(
+            scene_render_payload, audio_duration
+        )
+        normalized_clip_speed = utils.normalize_clip_speed(clip_speed)
         for scene in scenes:
             scene_index = scene["scene_index"]
             required_duration = float(scene["end_time"]) - float(scene["start_time"])
@@ -937,18 +957,26 @@ def combine_scene_videos(
             finally:
                 _close_owned_clips(owned_clips)
 
+        # From this point onward this invocation owns the combined path. Removing
+        # an older same-index file first prevents a failed overwrite from being
+        # mistaken for a successful result, without touching any other output.
+        delete_files(combined_video_path)
+        combined_output_owned = True
         concat_video_clips_with_ffmpeg(
             clip_files=temporary_files,
             output_file=combined_video_path,
             threads=threads,
             output_dir=output_dir,
             max_duration=audio_duration,
+            exact_timestamps=True,
         )
         succeeded = True
         return combined_video_path
     finally:
+        if audio_clip is not None:
+            close_clip(audio_clip)
         delete_files(temporary_files)
-        if not succeeded:
+        if not succeeded and combined_output_owned:
             delete_files(combined_video_path)
 
 

@@ -888,6 +888,25 @@ class TestVideoService(unittest.TestCase):
         self.assertEqual(command[command.index("-t") + 1], "10.000")
         self.assertLess(command.index("-t"), command.index(output_file))
 
+    def test_concat_video_clips_cleans_list_when_entry_formatting_fails(self):
+        """A failure while writing the concat list must not leak its temp file."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(
+                    vd,
+                    "_format_ffmpeg_concat_path",
+                    side_effect=ValueError("bad entry"),
+                ),
+                self.assertRaises(ValueError),
+            ):
+                vd.concat_video_clips_with_ffmpeg(
+                    clip_files=["bad.mp4"],
+                    output_file=os.path.join(temp_dir, "combined.mp4"),
+                    threads=1,
+                    output_dir=temp_dir,
+                )
+            self.assertEqual(list(Path(temp_dir).glob("ffmpeg-concat-*.txt")), [])
+
     def test_prioritize_unique_source_clips_uses_each_source_before_reuse(self):
         """
         随机模式下，一个长素材会被拆成多个片段。调度层应先让每个源素材

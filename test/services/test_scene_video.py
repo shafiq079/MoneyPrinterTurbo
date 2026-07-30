@@ -1,3 +1,4 @@
+import math
 import os
 import tempfile
 import unittest
@@ -57,6 +58,20 @@ def _payload(durations=(0.4, 0.6), paths=("a.mp4", "b.mp4")):
 
 
 class TestSceneVideoRenderer(unittest.TestCase):
+    def test_rejects_invalid_narration_durations_and_cleans_audio(self):
+        invalid_values = (0, -1, math.nan, math.inf, -math.inf, "1.0", True)
+        for value in invalid_values:
+            with self.subTest(value=value):
+                audio = _Audio(value)
+                with (
+                    patch.object(video, "AudioFileClip", return_value=audio),
+                    patch.object(video, "_open_video_clip_quietly") as opened,
+                    self.assertRaises(ValueError),
+                ):
+                    video.combine_scene_videos("combined.mp4", _payload(), "audio.wav")
+                audio.reader.close.assert_called_once()
+                opened.assert_not_called()
+
     def test_rejects_out_of_order_without_opening_materials(self):
         payload = _payload()
         payload["scenes"].reverse()
@@ -171,7 +186,7 @@ class TestSceneVideoRenderer(unittest.TestCase):
         clip.resized.assert_called_once_with(new_size=(1080, 607))
         composite_type.assert_called_once_with([background, resized])
 
-    def test_failure_removes_only_attempt_files_and_partial_output(self):
+    def test_encoding_failure_removes_attempt_files_but_not_preexisting_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "combined-2.mp4"
             output.write_bytes(b"partial")
@@ -199,9 +214,196 @@ class TestSceneVideoRenderer(unittest.TestCase):
                 video.combine_scene_videos(
                     str(output), _payload(), "audio.wav", output_index=2
                 )
+            self.assertEqual(output.read_bytes(), b"partial")
+            self.assertEqual(list(Path(tmp).glob("scene-*.mp4")), [])
+
+    def test_concat_failure_removes_invocation_output_and_scene_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "combined.mp4"
+
+            def fail_concat(**kwargs):
+                Path(kwargs["output_file"]).write_bytes(b"partial")
+                raise RuntimeError("concat failed")
+
+            with (
+                patch.object(video, "AudioFileClip", return_value=_Audio(1.0)),
+                patch.object(
+                    video, "_open_video_clip_quietly", return_value=_Clip(2.0, [])
+                ),
+                patch.object(video, "_fit_clip_to_aspect", side_effect=lambda c, _a: c),
+                patch.object(
+                    video, "_apply_video_transition", side_effect=lambda c, *_a, **_k: c
+                ),
+                patch.object(
+                    video,
+                    "_write_videofile_with_codec_fallback",
+                    side_effect=lambda _clip, path, **_kwargs: Path(path).write_bytes(
+                        b"scene"
+                    ),
+                ),
+                patch.object(
+                    video, "concat_video_clips_with_ffmpeg", side_effect=fail_concat
+                ),
+                self.assertRaises(RuntimeError),
+            ):
+                video.combine_scene_videos(str(output), _payload(), "audio.wav")
             self.assertFalse(output.exists())
             self.assertEqual(list(Path(tmp).glob("scene-*.mp4")), [])
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSceneVideoRealMedia(unittest.TestCase):
+    @staticmethod
+    def _write_video(path, duration, frame_function):
+        from moviepy import VideoClip
+
+        clip = VideoClip(frame_function=frame_function, duration=duration)
+        try:
+            clip.write_videofile(
+                str(path), codec="libx264", fps=30, audio=False, logger=None
+            )
+        finally:
+            clip.close()
+
+    @staticmethod
+    def _write_audio(path, duration):
+        import numpy as np
+        from moviepy import AudioArrayClip
+
+        sample_rate = 8000
+        times = np.arange(int(duration * sample_rate)) / sample_rate
+        samples = (0.05 * np.sin(2 * np.pi * 220 * times)).astype(np.float32)
+        audio = AudioArrayClip(np.column_stack([samples, samples]), fps=sample_rate)
+        try:
+            audio.write_audiofile(str(path), fps=sample_rate, logger=None)
+        finally:
+            audio.close()
+
+    def test_real_timeline_loop_trim_reuse_order_and_cleanup(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            short = root / "short.mp4"
+            long = root / "long.mp4"
+            audio = root / "audio.wav"
+            output = root / "combined.mp4"
+            self._write_video(
+                short,
+                0.2,
+                lambda t: np.full(
+                    (48, 48, 3), (240, 0, 0) if t < 0.1 else (0, 240, 0), np.uint8
+                ),
+            )
+            self._write_video(
+                long,
+                1.0,
+                lambda t: np.full(
+                    (48, 48, 3), (240, 240, 0) if t < 0.4 else (0, 240, 240), np.uint8
+                ),
+            )
+            self._write_audio(audio, 1.0)
+            payload = {
+                "materials": [
+                    {"material_id": "short", "local_path": str(short)},
+                    {"material_id": "long", "local_path": str(long)},
+                ],
+                "scenes": [
+                    {
+                        "scene_index": 0,
+                        "start_time": 0.0,
+                        "end_time": 0.4,
+                        "duration": 0.4,
+                        "material_id": "short",
+                    },
+                    {
+                        "scene_index": 1,
+                        "start_time": 0.4,
+                        "end_time": 0.7,
+                        "duration": 0.3,
+                        "material_id": "long",
+                    },
+                    {
+                        "scene_index": 2,
+                        "start_time": 0.7,
+                        "end_time": 1.0,
+                        "duration": 0.3,
+                        "material_id": "short",
+                    },
+                ],
+            }
+            opened = []
+            real_open = video._open_video_clip_quietly
+
+            def tracked_open(path):
+                opened.append(path)
+                return real_open(path)
+
+            with (
+                patch.object(
+                    video, "_open_video_clip_quietly", side_effect=tracked_open
+                ),
+                patch.object(VideoAspect, "to_resolution", return_value=(48, 48)),
+            ):
+                video.combine_scene_videos(str(output), payload, str(audio))
+
+            rendered = real_open(str(output))
+            try:
+                self.assertLessEqual(abs(rendered.duration - 1.0), 1 / 30)
+                samples = {
+                    "short_start": rendered.get_frame(0.05)[24, 24],
+                    "short_loop": rendered.get_frame(0.25)[24, 24],
+                    "long_start": rendered.get_frame(0.5)[24, 24],
+                    "reuse_start": rendered.get_frame(0.75)[24, 24],
+                }
+            finally:
+                video.close_clip(rendered)
+            self.assertGreater(samples["short_start"][0], samples["short_start"][1])
+            self.assertGreater(samples["short_loop"][0], samples["short_loop"][1])
+            self.assertGreater(samples["long_start"][0], samples["long_start"][2])
+            self.assertGreater(samples["reuse_start"][0], samples["reuse_start"][1])
+            self.assertEqual(opened.count(str(short)), 2)
+            self.assertEqual(list(root.glob("scene-*.mp4")), [])
+            self.assertEqual(list(root.glob("ffmpeg-concat-*.txt")), [])
+
+    def test_real_subsecond_fade_preserves_duration(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.mp4"
+            audio = root / "audio.wav"
+            output = root / "combined.mp4"
+            self._write_video(
+                source, 0.5, lambda _t: np.full((32, 32, 3), (220, 20, 20), np.uint8)
+            )
+            self._write_audio(audio, 0.4)
+            payload = {
+                "materials": [{"material_id": "source", "local_path": str(source)}],
+                "scenes": [
+                    {
+                        "scene_index": 0,
+                        "start_time": 0.0,
+                        "end_time": 0.4,
+                        "duration": 0.4,
+                        "material_id": "source",
+                    }
+                ],
+            }
+            with patch.object(VideoAspect, "to_resolution", return_value=(32, 32)):
+                video.combine_scene_videos(
+                    str(output),
+                    payload,
+                    str(audio),
+                    video_transition_mode=VideoTransitionMode.fade_in,
+                )
+            rendered = video._open_video_clip_quietly(str(output))
+            try:
+                self.assertLessEqual(abs(rendered.duration - 0.4), 1 / 30)
+            finally:
+                video.close_clip(rendered)
+            self.assertEqual(list(root.glob("scene-*.mp4")), [])
+            self.assertEqual(list(root.glob("ffmpeg-concat-*.txt")), [])

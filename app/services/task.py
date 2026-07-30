@@ -694,7 +694,6 @@ def generate_final_videos(
                     "scene rendering failed; retrying this output with the legacy "
                     f"renderer: output={index}, error={type(exc).__name__}"
                 )
-                video.delete_files(combined_video_path)
                 scene_payload = None
         if scene_payload is None:
             video.combine_videos(
@@ -1248,8 +1247,13 @@ def _run_pipeline(
     if params.match_materials_to_script and scene_pipeline_supported:
         try:
             scene_timeline_duration = voice.get_audio_duration(audio_file)
-            if scene_timeline_duration <= 0:
-                raise ValueError("narration duration probe returned zero")
+            if (
+                isinstance(scene_timeline_duration, bool)
+                or not isinstance(scene_timeline_duration, (int, float))
+                or not math.isfinite(scene_timeline_duration)
+                or scene_timeline_duration <= 0
+            ):
+                raise ValueError("narration duration probe is invalid")
         except Exception as exc:
             scene_renderer_eligible = False
             scene_timeline_duration = audio_duration
