@@ -50,6 +50,8 @@ class TestTaskService(unittest.TestCase):
         render_plan_error=None,
         stop_at="materials",
         events=None,
+        probe_result=5.0,
+        probe_error=None,
     ):
         timeline_path = Path(tmp_path) / "scenes.json"
         timeline_path.write_text("[]", encoding="utf-8")
@@ -72,6 +74,14 @@ class TestTaskService(unittest.TestCase):
             stack.enter_context(patch.object(tm, "save_script_data"))
             stack.enter_context(
                 patch.object(tm, "generate_audio", return_value=("audio.mp3", 5, object()))
+            )
+            audio_duration_probe = stack.enter_context(
+                patch.object(
+                    tm.voice,
+                    "get_audio_duration",
+                    return_value=probe_result,
+                    side_effect=probe_error,
+                )
             )
             stack.enter_context(
                 patch.object(tm, "generate_subtitle", return_value="subtitle.srt")
@@ -145,6 +155,7 @@ class TestTaskService(unittest.TestCase):
             stack.enter_context(patch.object(tm.sm, "state", state))
             result = tm.start("preview-pipeline", params, stop_at=stop_at)
         self.last_render_plan = render_plan
+        self.last_audio_duration_probe = audio_duration_probe
         return (
             result,
             state,
@@ -2131,6 +2142,177 @@ class TestTaskService(unittest.TestCase):
             self._run_preview_pipeline(tmp, source="local")
         finalize.assert_not_called()
 
+    def test_exact_audio_probe_is_limited_to_supported_remote_matching(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run_preview_pipeline(tmp, matching=False)
+            self.last_audio_duration_probe.assert_not_called()
+            self._run_preview_pipeline(tmp, source="local")
+            self.last_audio_duration_probe.assert_not_called()
+            self._run_preview_pipeline(tmp)
+            self.last_audio_duration_probe.assert_called_once_with("audio.mp3")
+
+    def test_invalid_exact_audio_probe_disables_scene_renderer_context(self):
+        invalid_probes = (
+            RuntimeError("probe failed"),
+            0,
+            float("nan"),
+            float("inf"),
+        )
+        for invalid in invalid_probes:
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                preview = root / "scene_previews.json"
+                selection = root / "scene_selections.json"
+                plan = root / "scene_render_plan.json"
+                artifact = root / "scene_render_materials.json"
+                for item in (preview, selection, plan, artifact):
+                    item.write_text("{}", encoding="utf-8")
+                with (
+                    patch.object(
+                        tm.scene_render_materials,
+                        "create_scene_render_materials",
+                        return_value=str(artifact),
+                    ),
+                    patch.object(
+                        tm.scene_render_materials,
+                        "load_scene_render_materials",
+                        return_value={},
+                    ),
+                    patch.object(
+                        tm.material,
+                        "resolve_material_directory",
+                        return_value=str(root),
+                    ),
+                    patch.object(tm.utils, "task_dir", return_value=str(root)),
+                ):
+                    result = self._run_preview_pipeline(
+                        tmp,
+                        preview_result=str(preview),
+                        selection_result=str(selection),
+                        render_plan_result=str(plan),
+                        stop_at="video",
+                        probe_result=invalid if not isinstance(invalid, Exception) else 5,
+                        probe_error=invalid if isinstance(invalid, Exception) else None,
+                    )
+                render = result[6]
+                self.assertIsNone(render.call_args.args[-1])
+
+
+
+class TestSceneRendererTaskIntegration(unittest.TestCase):
+    def _context(self, materials):
+        return tm.SceneRenderContext(
+            "materials.json", "plan.json", "scenes.json", "selections.json",
+            materials, "legacy", "task"
+        )
+
+    def test_valid_context_selects_scene_renderer_and_revalidates(self):
+        materials = ["legacy.mp4"]
+        context = self._context(materials)
+        params = VideoParams(video_subject="test", bgm_type="")
+        payload = {"materials": [], "scenes": []}
+        with (
+            patch.object(tm, "_load_scene_render_payload", return_value=payload) as load,
+            patch.object(tm.video, "combine_scene_videos") as scene_render,
+            patch.object(tm.video, "combine_videos") as legacy_render,
+            patch.object(tm.video, "generate_video"),
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            tm.generate_final_videos("task", params, materials, "audio", "", 5, context)
+        load.assert_called_once_with(context)
+        self.assertIs(scene_render.call_args.kwargs["scene_render_payload"], payload)
+        legacy_render.assert_not_called()
+
+    def test_scene_failure_falls_back_with_original_list_identity(self):
+        materials = ["legacy.mp4"]
+        params = VideoParams(video_subject="test", bgm_type="")
+        with (
+            patch.object(tm, "_load_scene_render_payload", return_value={}),
+            patch.object(tm.video, "combine_scene_videos", side_effect=RuntimeError),
+            patch.object(tm.video, "combine_videos") as legacy_render,
+            patch.object(tm.video, "generate_video"),
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            tm.generate_final_videos(
+                "task", params, materials, "audio", "", 5, self._context(materials)
+            )
+        self.assertIs(legacy_render.call_args.kwargs["video_paths"], materials)
+
+    def test_output_two_fallback_does_not_clean_output_one(self):
+        materials = ["legacy.mp4"]
+        params = VideoParams(video_subject="test", bgm_type="", video_count=2)
+        with (
+            patch.object(tm, "_load_scene_render_payload", return_value={}),
+            patch.object(
+                tm.video, "combine_scene_videos",
+                side_effect=[None, RuntimeError("second failed")],
+            ),
+            patch.object(tm.video, "combine_videos") as legacy_render,
+            patch.object(tm.video, "generate_video"),
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            finals, combined, _ = tm.generate_final_videos(
+                "task", params, materials, "audio", "", 5, self._context(materials)
+            )
+        self.assertEqual((len(finals), len(combined)), (2, 2))
+        self.assertEqual(legacy_render.call_count, 1)
+
+    def test_strict_load_failure_falls_back_independently(self):
+        materials = ["legacy.mp4"]
+        params = VideoParams(video_subject="test", bgm_type="", video_count=2)
+        with (
+            patch.object(
+                tm,
+                "_load_scene_render_payload",
+                side_effect=[ValueError("stale"), {"validated": True}],
+            ),
+            patch.object(tm.video, "combine_scene_videos") as scene_render,
+            patch.object(tm.video, "combine_videos") as legacy_render,
+            patch.object(tm.video, "generate_video"),
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            tm.generate_final_videos(
+                "task", params, materials, "audio", "", 5, self._context(materials)
+            )
+        self.assertEqual(legacy_render.call_count, 1)
+        self.assertIs(legacy_render.call_args.kwargs["video_paths"], materials)
+        self.assertEqual(scene_render.call_count, 1)
+        self.assertEqual(scene_render.call_args.kwargs["output_index"], 2)
+
+    def test_final_mux_failure_does_not_trigger_legacy_fallback(self):
+        materials = ["legacy.mp4"]
+        params = VideoParams(video_subject="test", bgm_type="")
+        with (
+            patch.object(tm, "_load_scene_render_payload", return_value={}),
+            patch.object(tm.video, "combine_scene_videos"),
+            patch.object(tm.video, "combine_videos") as legacy_render,
+            patch.object(tm.video, "generate_video", side_effect=RuntimeError("mux")),
+            patch.object(tm.sm.state, "update_task"),
+            self.assertRaisesRegex(RuntimeError, "mux"),
+        ):
+            tm.generate_final_videos(
+                "task", params, materials, "audio", "", 5, self._context(materials)
+            )
+        legacy_render.assert_not_called()
+
+    def test_bgm_failure_is_outside_fallback_and_keeps_rounded_duration(self):
+        materials = ["legacy.mp4"]
+        params = VideoParams(video_subject="test", bgm_type="sonilo")
+        with (
+            patch.object(tm, "_load_scene_render_payload", return_value={}),
+            patch.object(tm.video, "combine_scene_videos"),
+            patch.object(tm.video, "combine_videos") as legacy_render,
+            patch.object(
+                tm.sonilo, "generate_bgm", side_effect=RuntimeError("unexpected bgm")
+            ) as bgm,
+            patch.object(tm.sm.state, "update_task"),
+            self.assertRaisesRegex(RuntimeError, "unexpected bgm"),
+        ):
+            tm.generate_final_videos(
+                "task", params, materials, "audio", "", 5, self._context(materials)
+            )
+        self.assertEqual(bgm.call_args.kwargs["video_duration"], 5)
+        legacy_render.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

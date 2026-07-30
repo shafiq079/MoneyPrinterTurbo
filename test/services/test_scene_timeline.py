@@ -15,6 +15,8 @@ def write_srt(tmp_path: Path, content: str) -> str:
 
 def assert_valid_timeline(scenes, duration):
     assert [scene.index for scene in scenes] == list(range(1, len(scenes) + 1))
+    assert scenes[0].start_time == pytest.approx(0)
+    assert scenes[-1].end_time == pytest.approx(duration)
     for previous, scene in zip([None, *scenes], scenes):
         assert 0 <= scene.start_time < scene.end_time <= duration
         assert scene.duration == pytest.approx(scene.end_time - scene.start_time)
@@ -23,7 +25,7 @@ def assert_valid_timeline(scenes, duration):
             for value in (scene.start_time, scene.end_time, scene.duration)
         )
         if previous is not None:
-            assert previous.end_time <= scene.start_time
+            assert previous.end_time == pytest.approx(scene.start_time)
 
 
 def test_valid_srt_timestamps_and_multiline_text(tmp_path):
@@ -36,8 +38,11 @@ def test_valid_srt_timestamps_and_multiline_text(tmp_path):
     scenes = build_scenes("First line second line. Last scene.", 5, subtitle, 10)
 
     assert [(scene.start_time, scene.end_time, scene.text) for scene in scenes] == [
+        (0.0, 0.25, ""),
         (0.25, 2.0, "First line second line"),
+        (2.0, 2.5, ""),
         (2.5, 4.0, "Last scene"),
+        (4.0, 5.0, ""),
     ]
     assert_valid_timeline(scenes, 5)
 
@@ -47,8 +52,9 @@ def test_srt_without_trailing_blank_line_is_included(tmp_path):
         tmp_path, "1\n00:00:00,000 --> 00:00:01,000\nNo trailing blank"
     )
     scenes = build_scenes("No trailing blank", 2, subtitle)
-    assert len(scenes) == 1
+    assert len(scenes) == 2
     assert scenes[0].text == "No trailing blank"
+    assert scenes[1].text == ""
 
 
 def test_malformed_zero_reversed_negative_and_overlapping_entries_are_safe(tmp_path):
@@ -63,6 +69,7 @@ def test_malformed_zero_reversed_negative_and_overlapping_entries_are_safe(tmp_p
     )
     scenes = build_scenes("Good. Overlap trimmed.", 4, subtitle, 10)
     assert [(scene.text, scene.start_time, scene.end_time) for scene in scenes] == [
+        ("", 0.0, 1.0),
         ("Good", 1.0, 3.0),
         ("Overlap trimmed", 3.0, 4.0),
     ]
@@ -169,6 +176,135 @@ def test_create_scene_timeline_writes_utf8_json(tmp_path):
     data = json.loads(Path(target).read_text(encoding="utf-8"))
     assert data[0]["text"] == "你好世界"
     assert set(data[0]) == {"index", "start_time", "end_time", "duration", "text"}
+
+
+def test_azure_timeline_adds_leading_internal_and_trailing_holds(tmp_path):
+    first = "Coffee begins on green farms where coffee plants grow under the warm sun"
+    second = "Workers carefully pick the ripe red coffee cherries by hand"
+    later = "The beans are washed dried roasted ground brewed and finally served"
+    subtitle = write_srt(
+        tmp_path,
+        "1\n00:00:00,100 --> 00:00:04,250\n"
+        f"{first}\n\n"
+        "2\n00:00:05,275 --> 00:00:08,588\n"
+        f"{second}\n\n"
+        "3\n00:00:10,000 --> 00:00:30,750\n"
+        f"{later}\n",
+    )
+    scenes = build_scenes(
+        f"{first}. {second}. {later}.", 31.8, subtitle, max_clip_duration=3
+    )
+
+    assert_valid_timeline(scenes, 31.8)
+    holds = [scene for scene in scenes if not scene.text]
+    assert any(
+        scene.start_time == pytest.approx(0)
+        and scene.end_time == pytest.approx(0.1)
+        for scene in holds
+    )
+    assert any(
+        scene.start_time == pytest.approx(4.25)
+        and scene.end_time == pytest.approx(5.275)
+        for scene in holds
+    )
+    assert any(
+        scene.start_time == pytest.approx(30.75)
+        and scene.end_time == pytest.approx(31.8)
+        for scene in holds
+    )
+    assert all(scene.duration <= 3 for scene in scenes)
+    assert " ".join(scene.text for scene in scenes if scene.text) == (
+        f"{first} {second} {later}"
+    )
+
+
+def test_long_silent_interval_is_split_and_tiny_gap_is_snapped(tmp_path):
+    subtitle = write_srt(
+        tmp_path,
+        "1\n00:00:00,000 --> 00:00:01,000\nFirst\n\n"
+        "2\n00:00:07,500 --> 00:00:08,000\nSecond\n",
+    )
+    scenes = build_scenes("First. Second.", 8, subtitle, max_clip_duration=2)
+    holds = [scene for scene in scenes if not scene.text]
+    assert len(holds) == 4
+    assert all(scene.duration <= 2 for scene in holds)
+    assert_valid_timeline(scenes, 8)
+
+    tiny_subtitle = write_srt(
+        tmp_path,
+        "1\n00:00:00,000 --> 00:00:01,000\nFirst\n\n"
+        "2\n00:00:01,0005 --> 00:00:02,000\nSecond\n",
+    )
+    tiny = build_scenes("First. Second.", 2, tiny_subtitle, max_clip_duration=3)
+    assert [scene.text for scene in tiny] == ["First", "Second"]
+    assert tiny[1].start_time == tiny[0].end_time
+    assert_valid_timeline(tiny, 2)
+
+
+def test_hold_timeline_passes_strict_render_plan_validation(tmp_path):
+    from app.services import scene_render_plan
+
+    subtitle = write_srt(
+        tmp_path,
+        "1\n00:00:00,100 --> 00:00:01,000\nFirst\n\n"
+        "2\n00:00:02,000 --> 00:00:03,000\nSecond\n",
+    )
+    timeline_path = create_scene_timeline(
+        str(tmp_path), "First. Second.", 4, subtitle, max_clip_duration=3
+    )
+    timeline = json.loads(Path(timeline_path).read_text(encoding="utf-8"))
+    selections = []
+    meaningful = [item["index"] for item in timeline if item["text"]]
+    for item in timeline:
+        index = item["index"]
+        if not item["text"]:
+            nearest = min(meaningful, key=lambda value: (abs(value - index), value))
+            selections.append(
+                {
+                    "scene_index": index,
+                    "status": "hold_no_search",
+                    "reuse_scene_index": nearest,
+                }
+            )
+            continue
+        candidate_id = f"pexels:{index}"
+        selections.append(
+            {
+                "scene_index": index,
+                "status": "provider_rank_selected",
+                "reuse_scene_index": None,
+                "selected_candidate_id": candidate_id,
+                "selected_candidate": {
+                    "candidate_id": candidate_id,
+                    "provider": "pexels",
+                    "provider_video_id": str(index),
+                    "video_url": f"https://cdn.example/{index}.mp4",
+                },
+                "candidates": [{"candidate_id": candidate_id}],
+            }
+        )
+    selection_path = tmp_path / "scene_selections.json"
+    selection_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "source_candidate_manifest": {"version": 1, "sha256": "a" * 64},
+                "source_preview_manifest": {"version": 1, "sha256": "b" * 64},
+                "scenes": selections,
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan_path = scene_render_plan.create_scene_render_plan(
+        timeline_path, str(selection_path)
+    )
+    plan = scene_render_plan.load_scene_render_plan(
+        plan_path, timeline_path, str(selection_path)
+    )
+    assert len(plan["scenes"]) == len(timeline)
+    assert [item["scene_index"] for item in plan["scenes"]] == list(
+        range(1, len(timeline) + 1)
+    )
 
 
 def _run_material_pipeline(
