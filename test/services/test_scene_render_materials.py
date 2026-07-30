@@ -666,6 +666,91 @@ class TestSceneRenderMaterials(unittest.TestCase):
                         str(root),
                     )
 
+    def test_selected_url_identity_is_bound_to_its_deterministic_cache_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scene_path, selection_path, plan_path = self._sources(root)
+            legacy_root = root / "legacy"
+            legacy_root.mkdir()
+            legacy = legacy_root / "legacy.mp4"
+            legacy.write_bytes(b"legacy")
+
+            def download(_url, destination, selected_root):
+                destination.write_bytes(destination.name.encode())
+                return service._probe(destination, selected_root, selected=True)
+
+            fake_clip = MagicMock(duration=5.0, fps=30.0, size=(1920, 1080))
+            with (
+                patch.object(service, "VideoFileClip", return_value=fake_clip),
+                patch.object(service, "_download", side_effect=download),
+            ):
+                target = Path(
+                    service.create_scene_render_materials(
+                        str(plan_path),
+                        str(scene_path),
+                        str(selection_path),
+                        [str(legacy)],
+                        str(legacy_root),
+                        str(root),
+                    )
+                )
+                original = json.loads(target.read_text(encoding="utf-8"))
+                service.load_scene_render_materials(
+                    str(target),
+                    str(plan_path),
+                    str(scene_path),
+                    str(selection_path),
+                    [str(legacy)],
+                    str(legacy_root),
+                    str(root),
+                )
+
+                file_fields = (
+                    "local_path",
+                    "content_sha256",
+                    "size_bytes",
+                    "duration",
+                    "fps",
+                    "width",
+                    "height",
+                )
+                swapped = json.loads(json.dumps(original))
+                for field in file_fields:
+                    swapped["materials"][0][field] = swapped["materials"][1][field]
+                target.write_text(json.dumps(swapped), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    service.load_scene_render_materials(
+                        str(target),
+                        str(plan_path),
+                        str(scene_path),
+                        str(selection_path),
+                        [str(legacy)],
+                        str(legacy_root),
+                        str(root),
+                    )
+
+                selected_root = root / "scene_materials"
+                for filename in ("unrelated.mp4", "unrelated.part"):
+                    with self.subTest(filename=filename):
+                        unrelated = selected_root / filename
+                        unrelated.write_bytes(filename.encode())
+                        metadata = service._probe(
+                            unrelated, selected_root, selected=True
+                        )
+                        tampered = json.loads(json.dumps(original))
+                        tampered["materials"][0].update(metadata)
+                        target.write_text(json.dumps(tampered), encoding="utf-8")
+                        with self.assertRaises(ValueError):
+                            service.load_scene_render_materials(
+                                str(target),
+                                str(plan_path),
+                                str(scene_path),
+                                str(selection_path),
+                                [str(legacy)],
+                                str(legacy_root),
+                                str(root),
+                            )
+
     def test_loader_rejects_changed_plan_symlink_and_outside_material(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

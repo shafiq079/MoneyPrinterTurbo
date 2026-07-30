@@ -294,6 +294,11 @@ def _material_row(metadata: dict, **identity) -> dict:
     return {**identity, **metadata}
 
 
+def _selected_destination(selected_root: Path, source_url_sha256: str) -> Path:
+    """Return the sole cache path authorized for an exact selected URL hash."""
+    return selected_root / f"selected-{source_url_sha256}.mp4"
+
+
 def _atomic_write(path: Path, payload: dict, validate_temporary) -> None:
     if path.exists() or path.is_symlink():
         if path.is_symlink() or not path.is_file():
@@ -356,7 +361,7 @@ def create_scene_render_materials(
         try:
             metadata = _download(
                 scene["video_url"],
-                selected_root / f"selected-{url_hash}.mp4",
+                _selected_destination(selected_root, url_hash),
                 selected_root,
             )
             aggregate += metadata["size_bytes"]
@@ -623,6 +628,14 @@ def load_scene_render_materials(
                 or not row["provider_video_id"]
             ):
                 raise ValueError("selected material identity is invalid")
+            try:
+                expected_path = _selected_destination(selected_root, digest).resolve(
+                    strict=True
+                )
+            except OSError as exc:
+                raise ValueError("selected material cache path is unavailable") from exc
+            if metadata["local_path"] != str(expected_path):
+                raise ValueError("selected material path does not match its URL hash")
             selected_count += 1
             selected_total += row["size_bytes"]
         else:
