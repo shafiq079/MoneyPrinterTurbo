@@ -36,23 +36,36 @@ _SRT_TIME_RANGE = re.compile(
 TIMING_TOLERANCE = 0.001
 
 
-def _is_unspaced_text(text: str) -> bool:
-    alphanumeric = [character for character in text if character.isalnum()]
-    if not alphanumeric:
-        return False
-    return all(
-        "CJK" in unicodedata.name(character, "")
-        or "HIRAGANA" in unicodedata.name(character, "")
-        or "KATAKANA" in unicodedata.name(character, "")
-        or "HANGUL" in unicodedata.name(character, "")
-        for character in alphanumeric
-    )
+def _uses_unspaced_boundary(character: str) -> bool:
+    name = unicodedata.name(character, "")
+    return "CJK" in name or "HIRAGANA" in name or "KATAKANA" in name
+
+
+def _significant_boundary(text: str, *, reverse: bool = False) -> str:
+    characters = reversed(text) if reverse else iter(text)
+    return next((character for character in characters if character.isalnum()), "")
 
 
 def _join_narration_text(left: str, right: str) -> str:
     """Join cue text without rewriting punctuation, case, or unspaced scripts."""
-    separator = "" if _is_unspaced_text(left) and _is_unspaced_text(right) else " "
+    left_boundary = _significant_boundary(left, reverse=True)
+    right_boundary = _significant_boundary(right)
+    separator = (
+        ""
+        if left_boundary
+        and right_boundary
+        and _uses_unspaced_boundary(left_boundary)
+        and _uses_unspaced_boundary(right_boundary)
+        else " "
+    )
     return f"{left}{separator}{right}"
+
+
+def _narration_signature(texts: list[str]) -> str:
+    """Preserve all narration content except intentionally normalized whitespace."""
+    return "".join(
+        character for text in texts for character in text if not character.isspace()
+    )
 
 
 def _validate_duration_bounds(
@@ -309,7 +322,11 @@ def build_scenes(
             segments.append((text, cursor, end))
             cursor = end
 
+    narration_signature = None
     if min_scene_duration is not None:
+        narration_signature = _narration_signature(
+            [" ".join(text.split()) for text, _, _ in segments if text.strip()]
+        )
         timeline_segments: list[tuple[str, float, float]] = []
         cursor = 0.0
         for text, start, end in segments:
@@ -371,6 +388,12 @@ def build_scenes(
                 )
             ):
                 raise ValueError("scene timeline timing is invalid")
+    if (
+        narration_signature is not None
+        and _narration_signature([scene.text for scene in scenes if scene.text])
+        != narration_signature
+    ):
+        raise ValueError("scene merging changed narration content")
     return scenes
 
 

@@ -210,6 +210,31 @@ def test_minimum_preserves_unspaced_script_without_inserting_spaces(tmp_path):
     assert_valid_timeline(scenes, 2.4)
 
 
+@pytest.mark.parametrize(
+    ("narration", "first", "second", "expected"),
+    [
+        ("東京です。次へ。", "東京です。", "次へ。", "東京です。次へ。"),
+        ("안녕하세요 세계", "안녕하세요", "세계", "안녕하세요 세계"),
+        ("Tokyo 東京", "Tokyo", "東京", "Tokyo 東京"),
+        ("東京 Tokyo", "東京", "Tokyo", "東京 Tokyo"),
+        ("Hello, world!", "Hello,", "world!", "Hello, world!"),
+        ("你好，世界！", "你好，", "世界！", "你好，世界！"),
+    ],
+)
+def test_minimum_uses_boundary_based_language_spacing(
+    tmp_path, narration, first, second, expected
+):
+    subtitle = write_srt(
+        tmp_path,
+        f"1\n00:00:00,000 --> 00:00:00,700\n{first}\n\n"
+        f"2\n00:00:00,700 --> 00:00:01,400\n{second}\n",
+    )
+
+    scenes = build_scenes(narration, 1.4, subtitle, 3, min_scene_duration=2)
+
+    assert [scene.text for scene in scenes] == [expected]
+
+
 def test_minimum_absorbs_only_approved_internal_hold(tmp_path):
     narration = "First. Second. Third."
     subtitle = write_srt(
@@ -273,9 +298,13 @@ def test_none_minimum_keeps_existing_maximum_split_output():
 @pytest.mark.parametrize(
     ("minimum", "maximum", "message"),
     [
+        (True, 3, "finite positive"),
+        (-1, 3, "finite positive"),
         (0, 3, "finite positive"),
+        (math.nan, 3, "finite positive"),
         (math.inf, 3, "finite positive"),
         (2, None, "max_clip_duration"),
+        (2, 0, "max_clip_duration"),
         (2, math.nan, "max_clip_duration"),
         (4, 3, "less than or equal"),
     ],
@@ -297,6 +326,30 @@ def test_atomic_publication_failure_preserves_existing_manifest(tmp_path, monkey
     monkeypatch.setattr("app.services.scene_timeline.os.replace", fail_replace)
     with pytest.raises(OSError, match="replace failed"):
         create_scene_timeline(str(tmp_path), "New narration.", 2)
+
+    assert target.read_text(encoding="utf-8") == '{"existing": true}'
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_content_corruption_is_rejected_before_atomic_publication(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "scenes.json"
+    target.write_text('{"existing": true}', encoding="utf-8")
+
+    def corrupt(segments, *_args):
+        text, start, end = next(row for row in segments if row[0])
+        return [(f"{text}!", start, end)]
+
+    monkeypatch.setattr("app.services.scene_timeline._merge_short_segments", corrupt)
+    with pytest.raises(ValueError, match="changed narration content"):
+        create_scene_timeline(
+            str(tmp_path),
+            "Keep this exact.",
+            2,
+            max_clip_duration=3,
+            min_scene_duration=2,
+        )
 
     assert target.read_text(encoding="utf-8") == '{"existing": true}'
     assert list(tmp_path.glob("*.tmp")) == []
@@ -545,7 +598,12 @@ def test_pipeline_does_not_create_or_expose_timeline_when_matching_disabled():
 
     create_timeline = Mock(return_value="must-not-be-used.json")
     retrieve_candidates = Mock(return_value="must-not-be-used-candidates.json")
-    result = _run_material_pipeline(False, create_timeline, retrieve_candidates)
+    result = _run_material_pipeline(
+        False,
+        create_timeline,
+        retrieve_candidates,
+        min_scene_duration=99,
+    )
 
     assert result == {"materials": ["clip.mp4"]}
     create_timeline.assert_not_called()
