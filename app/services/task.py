@@ -1526,7 +1526,7 @@ def _run_pipeline(
         if lazy_scene_path:
             try:
                 try:
-                    scene_render_context, validated_payload = (
+                    scene_render_context, _validated_payload = (
                         _create_scene_render_context(
                             task_id,
                             scene_render_plan_path,
@@ -1541,7 +1541,7 @@ def _run_pipeline(
                         "selected materials do not provide complete scene coverage"
                     )
                     legacy_material_root = material.resolve_material_directory(task_id)
-                    scene_render_context, validated_payload = (
+                    scene_render_context, _validated_payload = (
                         _create_scene_render_context(
                             task_id,
                             scene_render_plan_path,
@@ -1553,11 +1553,6 @@ def _run_pipeline(
                     )
                 scene_render_materials_path = (
                     scene_render_context.scene_render_materials_path
-                )
-                scene_material_paths = list(
-                    dict.fromkeys(
-                        row["local_path"] for row in validated_payload["materials"]
-                    )
                 )
             except LazyLegacyMaterialAcquisitionError as exc:
                 return _mark_task_failed(task_id, "materials", str(exc))
@@ -1631,6 +1626,25 @@ def _run_pipeline(
     acquired_legacy = legacy_loader.acquired_materials
     if acquired_legacy is not None:
         downloaded_videos = acquired_legacy
+
+    # Rendering may span multiple outputs, so the initially validated payload is
+    # not authoritative for task results. Revalidate once more after rendering
+    # and publish only paths from that final strict payload. Failure here is
+    # diagnostic only: completed outputs and any legacy fallback remain valid.
+    if scene_render_context is not None:
+        try:
+            final_scene_payload = _load_scene_render_payload(scene_render_context)
+        except Exception as exc:
+            logger.warning(
+                "final scene material revalidation failed; omitting scene_materials "
+                f"from task results: {type(exc).__name__}"
+            )
+        else:
+            scene_material_paths = list(
+                dict.fromkeys(
+                    row["local_path"] for row in final_scene_payload["materials"]
+                )
+            )
 
     if not final_video_paths:
         return _mark_task_failed(

@@ -53,6 +53,8 @@ class TestTaskService(unittest.TestCase):
         events=None,
         probe_result=5.0,
         probe_error=None,
+        render_side_effect=None,
+        materials=None,
     ):
         timeline_path = Path(tmp_path) / "scenes.json"
         timeline_path.write_text("[]", encoding="utf-8")
@@ -68,7 +70,8 @@ class TestTaskService(unittest.TestCase):
             video_source=source,
             bgm_type="",
         )
-        materials = ["ordered-1.mp4", "ordered-2.mp4"]
+        if materials is None:
+            materials = ["ordered-1.mp4", "ordered-2.mp4"]
         with ExitStack() as stack:
             stack.enter_context(patch.object(tm, "generate_script", return_value="script"))
             stack.enter_context(patch.object(tm, "generate_terms", return_value=["term"]))
@@ -135,6 +138,8 @@ class TestTaskService(unittest.TestCase):
                     return_value=(["final.mp4"], ["combined.mp4"], []),
                 )
             )
+            if render_side_effect is not None:
+                render.side_effect = render_side_effect
             if events is not None:
                 render_plan.side_effect = lambda *_args: (
                     events.append("render_plan") or render_plan_result
@@ -2056,6 +2061,7 @@ class TestTaskService(unittest.TestCase):
                     stop_at="materials",
                 )
             self.assertEqual(result["scene_render_materials_path"], str(artifact))
+            self.assertNotIn("scene_materials", result)
             self.assertEqual(
                 state.get_task("preview-pipeline")["scene_render_materials_path"],
                 str(artifact),
@@ -2338,8 +2344,11 @@ class TestLazyLegacyMaterials(unittest.TestCase):
                 ],
                 "scenes": [],
             }
-            with patch.object(
-                tm, "_create_scene_render_context", return_value=(context, payload)
+            with (
+                patch.object(
+                    tm, "_create_scene_render_context", return_value=(context, payload)
+                ),
+                patch.object(tm, "_load_scene_render_payload", return_value=payload),
             ):
                 result, state, *_ = TestTaskService()._run_preview_pipeline(
                     tmp, stop_at="video", preview_result=str(preview),
@@ -2353,6 +2362,58 @@ class TestLazyLegacyMaterials(unittest.TestCase):
                 state.get_task("preview-pipeline")["scene_materials"],
                 ["selected.mp4", "legacy.mp4"],
             )
+
+    def test_final_revalidation_failure_omits_scene_materials_without_repair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            preview = root / "previews.json"
+            selection = root / "selections.json"
+            plan = root / "plan.json"
+            artifact = root / "materials.json"
+            for item in (preview, selection, plan, artifact):
+                item.write_text("{}", encoding="utf-8")
+            context = tm.SceneRenderContext(
+                str(artifact), str(plan), str(root / "scenes.json"),
+                str(selection), [], "", str(root),
+            )
+            initially_valid = {
+                "materials": [
+                    {"origin": "selected_url", "local_path": "selected.mp4"}
+                ],
+                "scenes": [],
+            }
+            legacy = ["ordered-1.mp4", "ordered-2.mp4"]
+
+            def render_with_fallback(*args):
+                loader = args[-1]
+                self.assertIs(loader.acquire("output strict validation failed"), legacy)
+                return ["final.mp4"], ["combined.mp4"], []
+
+            with (
+                patch.object(
+                    tm, "_create_scene_render_context",
+                    return_value=(context, initially_valid),
+                ) as create,
+                patch.object(
+                    tm, "_load_scene_render_payload",
+                    side_effect=ValueError("artifact changed"),
+                ),
+            ):
+                result, state, *_ = TestTaskService()._run_preview_pipeline(
+                    tmp,
+                    stop_at="video",
+                    preview_result=str(preview),
+                    selection_result=str(selection),
+                    render_plan_result=str(plan),
+                    render_side_effect=render_with_fallback,
+                    materials=legacy,
+                )
+            create.assert_called_once()
+            self.assertIs(result["materials"], legacy)
+            self.assertNotIn("scene_materials", result)
+            self.assertEqual(result["scene_render_materials_path"], str(artifact))
+            self.assertEqual(state.get_task("preview-pipeline")["materials"], legacy)
+            self.assertNotIn("scene_materials", state.get_task("preview-pipeline"))
 
     def test_lazy_failure_has_one_materials_state_transition_and_no_render(self):
         class CountingState(MemoryState):
