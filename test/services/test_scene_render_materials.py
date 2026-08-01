@@ -189,6 +189,68 @@ class TestSceneRenderMaterials(unittest.TestCase):
             self.assertEqual(row["acquisition_error"], "download_failed")
             self.assertIsNone(row["fallback_reason"])
 
+    def test_empty_legacy_root_is_not_required_or_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scene_path, selection_path, plan_path = self._sources(root)
+            missing_legacy_root = root / "never-created-legacy"
+
+            def download(_url, destination, _root):
+                destination.write_bytes(b"selected")
+                return self._metadata(destination)
+
+            with (
+                patch.object(service, "_download", side_effect=download),
+                patch.object(
+                    service,
+                    "_probe",
+                    side_effect=lambda path, _root, selected: self._metadata(Path(path)),
+                ),
+            ):
+                target = service.create_scene_render_materials(
+                    str(plan_path), str(scene_path), str(selection_path), [],
+                    str(missing_legacy_root), str(root),
+                )
+                payload = service.load_scene_render_materials(
+                    target, str(plan_path), str(scene_path), str(selection_path), [],
+                    str(missing_legacy_root), str(root),
+                )
+            self.assertFalse(missing_legacy_root.exists())
+            self.assertTrue(payload["materials"])
+            self.assertTrue(
+                all(row["origin"] == "selected_url" for row in payload["materials"])
+            )
+
+            manifest = Path(target)
+            tampered = json.loads(manifest.read_text(encoding="utf-8"))
+            tampered["materials"][0]["origin"] = "legacy_fallback"
+            manifest.write_text(json.dumps(tampered), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "legacy material was not supplied"):
+                service.load_scene_render_materials(
+                    target, str(plan_path), str(scene_path), str(selection_path), [],
+                    str(missing_legacy_root), str(root),
+                )
+            self.assertFalse(missing_legacy_root.exists())
+
+    def test_no_selected_coverage_has_narrow_exception(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scene_path, selection_path, plan_path = self._sources(root)
+            missing_legacy_root = root / "missing-legacy"
+            with (
+                patch.object(
+                    service, "_download",
+                    side_effect=service.AcquisitionError("download_failed"),
+                ),
+                self.assertRaises(service.NoSelectedSceneCoverageError),
+            ):
+                service.create_scene_render_materials(
+                    str(plan_path), str(scene_path), str(selection_path), [],
+                    str(missing_legacy_root), str(root),
+                )
+            self.assertFalse(missing_legacy_root.exists())
+            self.assertFalse((root / "scene_render_materials.json").exists())
+
     def test_limits_abort_without_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

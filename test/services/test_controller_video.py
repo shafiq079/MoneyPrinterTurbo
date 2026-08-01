@@ -229,6 +229,36 @@ class TestVideoControllerTasks(unittest.TestCase):
             sm.state.delete_task(task_id)
             shutil.rmtree(task_dir, ignore_errors=True)
 
+    def test_task_apis_preserve_material_result_fields_unchanged(self):
+        task = {
+            "task_id": "scene-task",
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+            "materials": [],
+            "scene_materials": ["selected.mp4", "legacy.mp4"],
+        }
+        with patch.object(video_controller.sm.state, "get_task", return_value=task):
+            query_response = video_controller.get_task(
+                self._request(), task_id="scene-task", query=MagicMock()
+            )
+        self.assertEqual(query_response["data"]["materials"], [])
+        self.assertEqual(
+            query_response["data"]["scene_materials"],
+            ["selected.mp4", "legacy.mp4"],
+        )
+
+        with patch.object(
+            video_controller.sm.state, "get_all_tasks", return_value=([task], 1)
+        ):
+            list_response = video_controller.get_all_tasks(
+                self._request(), page=1, page_size=10
+            )
+        listed = list_response["data"]["tasks"][0]
+        self.assertEqual(listed["materials"], [])
+        self.assertEqual(
+            listed["scene_materials"], ["selected.mp4", "legacy.mp4"]
+        )
+
     def test_task_query_preserves_structured_failure_details(self):
         """失败阶段和错误信息必须通过任务查询接口原样返回。"""
         failed_task = {

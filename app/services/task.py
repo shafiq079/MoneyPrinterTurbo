@@ -95,6 +95,77 @@ class SceneRenderContext:
     task_dir: str
 
 
+class LazyLegacyMaterialAcquisitionError(RuntimeError):
+    """The task's one permitted legacy-material acquisition did not succeed."""
+
+
+class LazyLegacyMaterials:
+    """Acquire and cache one task's legacy materials, including terminal failure."""
+
+    def __init__(self, task_id, params, video_terms, audio_duration):
+        self._task_id = task_id
+        self._params = params
+        self._video_terms = video_terms
+        self._audio_duration = audio_duration
+        self._condition = threading.Condition()
+        self._state = "not_started"
+        self._materials: list[str] | None = None
+        self._error: LazyLegacyMaterialAcquisitionError | None = None
+
+    @property
+    def acquired_materials(self) -> list[str] | None:
+        with self._condition:
+            return self._materials
+
+    def acquire(self, reason: str) -> list[str]:
+        with self._condition:
+            while self._state == "acquiring":
+                self._condition.wait()
+            if self._state == "succeeded":
+                return self._materials
+            if self._state == "failed":
+                raise self._error
+            self._state = "acquiring"
+
+        logger.info(
+            "acquiring lazy legacy materials: "
+            f"task_id={self._task_id}, reason={reason}"
+        )
+        try:
+            materials = get_video_materials(
+                self._task_id,
+                self._params,
+                self._video_terms,
+                self._audio_duration,
+                mark_failure=False,
+            )
+            if not materials:
+                raise LazyLegacyMaterialAcquisitionError(
+                    "failed to prepare fallback video materials"
+                )
+        except Exception as exc:
+            error = (
+                exc
+                if isinstance(exc, LazyLegacyMaterialAcquisitionError)
+                else LazyLegacyMaterialAcquisitionError(
+                    f"legacy material acquisition failed: {type(exc).__name__}"
+                )
+            )
+            if error is not exc:
+                error.__cause__ = exc
+            with self._condition:
+                self._error = error
+                self._state = "failed"
+                self._condition.notify_all()
+            raise error
+
+        with self._condition:
+            self._materials = materials
+            self._state = "succeeded"
+            self._condition.notify_all()
+            return self._materials
+
+
 def _load_scene_render_payload(context: SceneRenderContext) -> dict:
     return scene_render_materials.load_scene_render_materials(
         context.scene_render_materials_path,
@@ -105,6 +176,40 @@ def _load_scene_render_payload(context: SceneRenderContext) -> dict:
         context.legacy_material_root,
         context.task_dir,
     )
+
+
+def _create_scene_render_context(
+    task_id: str,
+    render_plan_path: str,
+    scene_manifest_path: str,
+    selection_manifest_path: str,
+    legacy_material_paths: list[str],
+    legacy_material_root: str,
+) -> tuple[SceneRenderContext, dict]:
+    task_directory = utils.task_dir(task_id)
+    published_materials_path = scene_render_materials.create_scene_render_materials(
+        render_plan_path=render_plan_path,
+        scene_manifest_path=scene_manifest_path,
+        selection_manifest_path=selection_manifest_path,
+        legacy_material_paths=legacy_material_paths,
+        legacy_material_root=legacy_material_root,
+        task_dir=task_directory,
+    )
+    task_root = Path(task_directory).resolve(strict=True)
+    published_path = Path(published_materials_path).absolute()
+    published_path.relative_to(task_root)
+    if published_path.is_symlink() or not published_path.is_file():
+        raise ValueError("scene material artifact is not a regular file")
+    context = SceneRenderContext(
+        scene_render_materials_path=str(published_path),
+        render_plan_path=render_plan_path,
+        scene_manifest_path=scene_manifest_path,
+        selection_manifest_path=selection_manifest_path,
+        legacy_material_paths=legacy_material_paths,
+        legacy_material_root=legacy_material_root,
+        task_dir=task_directory,
+    )
+    return context, _load_scene_render_payload(context)
 
 
 def _get_video_music_prompt(params: VideoParams) -> str:
@@ -597,18 +702,21 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     return subtitle_path
 
 
-def get_video_materials(task_id, params, video_terms, audio_duration):
+def get_video_materials(
+    task_id, params, video_terms, audio_duration, *, mark_failure=True
+):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
             materials=params.video_materials, clip_duration=params.video_clip_duration
         )
         if not materials:
-            _mark_task_failed(
-                task_id,
-                "materials",
-                "no valid local video materials were found",
-            )
+            if mark_failure:
+                _mark_task_failed(
+                    task_id,
+                    "materials",
+                    "no valid local video materials were found",
+                )
             return None
         return [material_info.url for material_info in materials]
     else:
@@ -630,11 +738,12 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             match_script_order=params.match_materials_to_script,
         )
         if not downloaded_videos:
-            _mark_task_failed(
-                task_id,
-                "materials",
-                f"failed to download video materials from {params.video_source}",
-            )
+            if mark_failure:
+                _mark_task_failed(
+                    task_id,
+                    "materials",
+                    f"failed to download video materials from {params.video_source}",
+                )
             return None
         return downloaded_videos
 
@@ -642,6 +751,7 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
 def generate_final_videos(
     task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration,
     scene_render_context: SceneRenderContext | None = None,
+    legacy_material_loader: LazyLegacyMaterials | None = None,
 ):
     final_video_paths = []
     combined_video_paths = []
@@ -696,6 +806,18 @@ def generate_final_videos(
                 )
                 scene_payload = None
         if scene_payload is None:
+            if not downloaded_videos:
+                if legacy_material_loader is None:
+                    raise LazyLegacyMaterialAcquisitionError(
+                        "legacy renderer has no material loader"
+                    )
+                downloaded_videos = legacy_material_loader.acquire(
+                    "scene renderer unavailable"
+                )
+            if not downloaded_videos:
+                raise LazyLegacyMaterialAcquisitionError(
+                    "legacy renderer received no materials"
+                )
             video.combine_videos(
                 combined_video_path=combined_video_path,
                 video_paths=downloaded_videos,
@@ -1355,64 +1477,106 @@ def _run_pipeline(
                     f"existing material path: {type(exc).__name__}: {exc}"
                 )
 
-    # 5. Get video materials
-    downloaded_videos = get_video_materials(
+    legacy_loader = LazyLegacyMaterials(
         task_id, params, video_terms, audio_duration
     )
-    if not downloaded_videos:
-        return _mark_task_failed(
-            task_id,
-            "materials",
-            "failed to prepare video materials",
-        )
+    downloaded_videos: list[str] = []
+    scene_material_paths: list[str] = []
 
-    if (
-        params.match_materials_to_script
-        and params.video_source != "local"
-        and scene_render_plan_path
-    ):
-        try:
-            legacy_material_root = material.resolve_material_directory(task_id)
-            published_materials_path = (
-                scene_render_materials.create_scene_render_materials(
-                    render_plan_path=scene_render_plan_path,
-                    scene_manifest_path=scene_timeline_path,
-                    selection_manifest_path=scene_selections_path,
-                    legacy_material_paths=downloaded_videos,
-                    legacy_material_root=legacy_material_root,
-                    task_dir=utils.task_dir(task_id),
+    # The materials endpoint retains its historical eager acquisition contract.
+    if stop_at == "materials":
+        downloaded_videos = get_video_materials(
+            task_id, params, video_terms, audio_duration
+        )
+        if not downloaded_videos:
+            return _mark_task_failed(
+                task_id,
+                "materials",
+                "failed to prepare video materials",
+            )
+        if (
+            params.match_materials_to_script
+            and params.video_source != "local"
+            and scene_render_plan_path
+        ):
+            try:
+                legacy_material_root = material.resolve_material_directory(task_id)
+                context, _payload = _create_scene_render_context(
+                    task_id,
+                    scene_render_plan_path,
+                    scene_timeline_path,
+                    scene_selections_path,
+                    downloaded_videos,
+                    legacy_material_root,
                 )
-            )
-            task_root = Path(utils.task_dir(task_id)).resolve(strict=True)
-            published_path = Path(published_materials_path).absolute()
-            published_path.relative_to(task_root)
-            if published_path.is_symlink() or not published_path.is_file():
-                raise ValueError("scene material artifact is not a regular file")
-            scene_render_materials.load_scene_render_materials(
-                str(published_path),
-                scene_render_plan_path,
-                scene_timeline_path,
-                scene_selections_path,
-                downloaded_videos,
-                legacy_material_root,
-                utils.task_dir(task_id),
-            )
-            scene_render_materials_path = str(published_path)
-            if scene_renderer_eligible:
-                scene_render_context = SceneRenderContext(
-                    scene_render_materials_path=scene_render_materials_path,
-                    render_plan_path=scene_render_plan_path,
-                    scene_manifest_path=scene_timeline_path,
-                    selection_manifest_path=scene_selections_path,
-                    legacy_material_paths=downloaded_videos,
-                    legacy_material_root=legacy_material_root,
-                    task_dir=utils.task_dir(task_id),
+                scene_render_materials_path = context.scene_render_materials_path
+            except Exception as exc:
+                logger.warning(
+                    "scene material finalization failed; continuing with the existing "
+                    f"legacy renderer: {type(exc).__name__}"
                 )
-        except Exception as exc:
-            logger.warning(
-                "scene material finalization failed; continuing with the existing "
-                f"legacy renderer: {type(exc).__name__}"
+    else:
+        lazy_scene_path = (
+            params.match_materials_to_script
+            and scene_pipeline_supported
+            and scene_renderer_eligible
+            and params.video_source != "local"
+            and bool(scene_render_plan_path)
+        )
+        if lazy_scene_path:
+            try:
+                try:
+                    scene_render_context, _validated_payload = (
+                        _create_scene_render_context(
+                            task_id,
+                            scene_render_plan_path,
+                            scene_timeline_path,
+                            scene_selections_path,
+                            [],
+                            "",
+                        )
+                    )
+                except scene_render_materials.NoSelectedSceneCoverageError:
+                    downloaded_videos = legacy_loader.acquire(
+                        "selected materials do not provide complete scene coverage"
+                    )
+                    legacy_material_root = material.resolve_material_directory(task_id)
+                    scene_render_context, _validated_payload = (
+                        _create_scene_render_context(
+                            task_id,
+                            scene_render_plan_path,
+                            scene_timeline_path,
+                            scene_selections_path,
+                            downloaded_videos,
+                            legacy_material_root,
+                        )
+                    )
+                scene_render_materials_path = (
+                    scene_render_context.scene_render_materials_path
+                )
+            except LazyLegacyMaterialAcquisitionError as exc:
+                return _mark_task_failed(task_id, "materials", str(exc))
+            except Exception as exc:
+                # Only NoSelectedSceneCoverageError above permits republication.
+                # Every integrity, security, limit, schema, and publication failure
+                # disables the scene context and falls back without artifact repair.
+                scene_render_context = None
+                scene_render_materials_path = ""
+                scene_material_paths = []
+                logger.warning(
+                    "scene material finalization failed; using lazy legacy renderer: "
+                    f"{type(exc).__name__}"
+                )
+        else:
+            downloaded_videos = get_video_materials(
+                task_id, params, video_terms, audio_duration
             )
+            if not downloaded_videos:
+                return _mark_task_failed(
+                    task_id,
+                    "materials",
+                    "failed to prepare video materials",
+                )
 
     if stop_at == "materials":
         material_result = {"materials": downloaded_videos}
@@ -1443,15 +1607,44 @@ def _run_pipeline(
         params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
 
     # 6. Generate final videos
-    final_video_paths, combined_video_paths, generation_warnings = generate_final_videos(
-        task_id,
-        params,
-        downloaded_videos,
-        audio_file,
-        subtitle_path,
-        audio_duration,
-        scene_render_context,
-    )
+    try:
+        final_video_paths, combined_video_paths, generation_warnings = (
+            generate_final_videos(
+                task_id,
+                params,
+                downloaded_videos,
+                audio_file,
+                subtitle_path,
+                audio_duration,
+                scene_render_context,
+                legacy_loader,
+            )
+        )
+    except LazyLegacyMaterialAcquisitionError as exc:
+        return _mark_task_failed(task_id, "materials", str(exc))
+
+    acquired_legacy = legacy_loader.acquired_materials
+    if acquired_legacy is not None:
+        downloaded_videos = acquired_legacy
+
+    # Rendering may span multiple outputs, so the initially validated payload is
+    # not authoritative for task results. Revalidate once more after rendering
+    # and publish only paths from that final strict payload. Failure here is
+    # diagnostic only: completed outputs and any legacy fallback remain valid.
+    if scene_render_context is not None:
+        try:
+            final_scene_payload = _load_scene_render_payload(scene_render_context)
+        except Exception as exc:
+            logger.warning(
+                "final scene material revalidation failed; omitting scene_materials "
+                f"from task results: {type(exc).__name__}"
+            )
+        else:
+            scene_material_paths = list(
+                dict.fromkeys(
+                    row["local_path"] for row in final_scene_payload["materials"]
+                )
+            )
 
     if not final_video_paths:
         return _mark_task_failed(
@@ -1509,6 +1702,8 @@ def _run_pipeline(
         kwargs["scene_render_plan_path"] = scene_render_plan_path
     if scene_render_materials_path:
         kwargs["scene_render_materials_path"] = scene_render_materials_path
+    if scene_material_paths:
+        kwargs["scene_materials"] = scene_material_paths
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )
