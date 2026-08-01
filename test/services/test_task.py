@@ -3,7 +3,8 @@ import os
 import shutil
 import sys
 import tempfile
-from concurrent.futures import Future
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -367,9 +368,9 @@ class TestTaskService(unittest.TestCase):
                 state.get_task("preview-pipeline")["scene_render_plan_path"],
                 str(render_plan_path),
             )
-            get_materials.assert_called_once()
+            get_materials.assert_not_called()
             render.assert_called_once()
-            self.assertIs(render.call_args.args[2], materials)
+            self.assertEqual(render.call_args.args[2], [])
 
             missing_plan = Path(tmp) / "missing-scene-render-plan.json"
             result, _, _, _, _, get_materials, _, materials = (
@@ -1992,7 +1993,7 @@ class TestTaskService(unittest.TestCase):
                 patch.object(
                     tm.scene_render_materials,
                     "load_scene_render_materials",
-                    return_value={},
+                    return_value={"materials": [], "scenes": []},
                 ),
                 patch.object(
                     tm.material, "resolve_material_directory", return_value=str(root)
@@ -2009,17 +2010,14 @@ class TestTaskService(unittest.TestCase):
                         events=events,
                     )
                 )
-            get_materials.assert_called_once_with(
-                "preview-pipeline", unittest.mock.ANY, ["term"], 5
-            )
-            self.assertIs(finalize.call_args.kwargs["legacy_material_paths"], materials)
-            self.assertIs(render.call_args.args[2], materials)
+            get_materials.assert_not_called()
+            self.assertEqual(finalize.call_args.kwargs["legacy_material_paths"], [])
+            self.assertEqual(render.call_args.args[2], [])
             self.assertEqual(result["scene_render_materials_path"], str(artifact))
             self.assertEqual(
                 events,
                 [
                     "render_plan",
-                    "get_video_materials",
                     "scene_material_finalization",
                     "rendering",
                 ],
@@ -2096,7 +2094,7 @@ class TestTaskService(unittest.TestCase):
                     ),
                     patch.object(tm.utils, "task_dir", return_value=str(root)),
                 ):
-                    result, _, _, _, _, _, render, materials = (
+                    result, _, _, _, _, get_materials, render, materials = (
                         self._run_preview_pipeline(
                             tmp,
                             preview_result=str(preview),
@@ -2106,7 +2104,8 @@ class TestTaskService(unittest.TestCase):
                         )
                     )
                 self.assertNotIn("scene_render_materials_path", result)
-                self.assertIs(render.call_args.args[2], materials)
+                self.assertEqual(render.call_args.args[2], [])
+                get_materials.assert_not_called()
 
             with (
                 patch.object(
@@ -2124,7 +2123,7 @@ class TestTaskService(unittest.TestCase):
                 ),
                 patch.object(tm.utils, "task_dir", return_value=str(root)),
             ):
-                result, _, _, _, _, _, render, materials = self._run_preview_pipeline(
+                result, _, _, _, _, get_materials, render, materials = self._run_preview_pipeline(
                     tmp,
                     preview_result=str(preview),
                     selection_result=str(selection),
@@ -2132,7 +2131,8 @@ class TestTaskService(unittest.TestCase):
                     stop_at="video",
                 )
             self.assertNotIn("scene_render_materials_path", result)
-            self.assertIs(render.call_args.args[2], materials)
+            self.assertEqual(render.call_args.args[2], [])
+            get_materials.assert_not_called()
 
     def test_disabled_and_local_paths_never_finalize_scene_materials(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(
@@ -2195,8 +2195,217 @@ class TestTaskService(unittest.TestCase):
                         probe_error=invalid if isinstance(invalid, Exception) else None,
                     )
                 render = result[6]
-                self.assertIsNone(render.call_args.args[-1])
+                self.assertIsNone(render.call_args.args[-2])
 
+
+
+class TestLazyLegacyMaterials(unittest.TestCase):
+    def _loader(self):
+        return tm.LazyLegacyMaterials(
+            "lazy-task",
+            VideoParams(video_subject="subject", bgm_type=""),
+            ["term"],
+            5,
+        )
+
+    def test_concurrent_acquisition_is_exactly_once_and_preserves_identity(self):
+        materials = ["legacy.mp4"]
+        entered = threading.Event()
+        release = threading.Event()
+
+        def acquire(*_args, **kwargs):
+            self.assertFalse(kwargs["mark_failure"])
+            entered.set()
+            release.wait(2)
+            return materials
+
+        loader = self._loader()
+        with patch.object(tm, "get_video_materials", side_effect=acquire) as get:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [executor.submit(loader.acquire, "output fallback") for _ in range(4)]
+                self.assertTrue(entered.wait(1))
+                release.set()
+                results = [future.result() for future in futures]
+        get.assert_called_once()
+        self.assertTrue(all(result is materials for result in results))
+        self.assertIs(loader.acquired_materials, materials)
+
+    def test_terminal_empty_failure_is_cached_and_never_returned(self):
+        loader = self._loader()
+        with patch.object(tm, "get_video_materials", return_value=None) as get:
+            failures = []
+            for _ in range(2):
+                with self.assertRaises(tm.LazyLegacyMaterialAcquisitionError) as caught:
+                    loader.acquire("scene renderer unavailable")
+                failures.append(caught.exception)
+        get.assert_called_once()
+        self.assertIs(failures[0], failures[1])
+        self.assertIsNone(loader.acquired_materials)
+
+    def test_multiple_output_fallbacks_share_one_material_list(self):
+        materials = ["legacy.mp4"]
+        loader = self._loader()
+        params = VideoParams(video_subject="test", bgm_type="", video_count=2)
+        context = tm.SceneRenderContext(
+            "materials.json", "plan.json", "scenes.json", "selections.json",
+            [], "", "task",
+        )
+        with (
+            patch.object(tm, "get_video_materials", return_value=materials) as get,
+            patch.object(tm, "_load_scene_render_payload", return_value={}),
+            patch.object(tm.video, "combine_scene_videos", side_effect=RuntimeError),
+            patch.object(tm.video, "combine_videos") as legacy_render,
+            patch.object(tm.video, "generate_video"),
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            tm.generate_final_videos(
+                "task", params, [], "audio", "", 5, context, loader
+            )
+        get.assert_called_once()
+        self.assertEqual(legacy_render.call_count, 2)
+        self.assertTrue(
+            all(call.kwargs["video_paths"] is materials for call in legacy_render.mock_calls)
+        )
+
+    def test_pipeline_retries_only_typed_coverage_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            context = tm.SceneRenderContext(
+                str(root / "materials.json"), str(root / "plan.json"),
+                str(root / "scenes.json"), str(root / "selections.json"),
+                ["legacy.mp4"], str(root), str(root),
+            )
+            payload = {"materials": [{"local_path": "legacy.mp4"}], "scenes": []}
+            preview = root / "previews.json"
+            selection = root / "selections.json"
+            plan = root / "plan.json"
+            for path in (preview, selection, plan):
+                path.write_text("{}", encoding="utf-8")
+            with patch.object(
+                tm, "_create_scene_render_context",
+                side_effect=[
+                    tm.scene_render_materials.NoSelectedSceneCoverageError("coverage"),
+                    (context, payload),
+                ],
+            ) as create:
+                result = TestTaskService()._run_preview_pipeline(
+                    tmp, stop_at="video", preview_result=str(preview),
+                    selection_result=str(selection), render_plan_result=str(plan),
+                )
+            self.assertEqual(create.call_count, 2)
+            get_materials = result[5]
+            get_materials.assert_called_once_with(
+                "preview-pipeline", unittest.mock.ANY, ["term"], 5,
+                mark_failure=False,
+            )
+
+        for failure in (ValueError("corrupt"), tm.scene_render_materials.AcquisitionLimitError("limit")):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                preview = root / "previews.json"
+                selection = root / "selections.json"
+                plan = root / "plan.json"
+                for path in (preview, selection, plan):
+                    path.write_text("{}", encoding="utf-8")
+                with patch.object(
+                    tm, "_create_scene_render_context", side_effect=failure
+                ) as create:
+                    result = TestTaskService()._run_preview_pipeline(
+                        tmp, stop_at="video", preview_result=str(preview),
+                        selection_result=str(selection), render_plan_result=str(plan),
+                    )
+                create.assert_called_once()
+                result[5].assert_not_called()
+
+    def test_scene_material_result_uses_validated_stable_unique_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            preview = root / "previews.json"
+            selection = root / "selections.json"
+            plan = root / "plan.json"
+            artifact = root / "materials.json"
+            for path in (preview, selection, plan, artifact):
+                path.write_text("{}", encoding="utf-8")
+            context = tm.SceneRenderContext(
+                str(artifact), str(plan), str(root / "scenes.json"),
+                str(selection), ["legacy.mp4"], str(root), str(root),
+            )
+            payload = {
+                "materials": [
+                    {"origin": "selected_url", "local_path": "selected.mp4"},
+                    {"origin": "legacy_fallback", "local_path": "legacy.mp4"},
+                    {"origin": "selected_url", "local_path": "selected.mp4"},
+                ],
+                "scenes": [],
+            }
+            with patch.object(
+                tm, "_create_scene_render_context", return_value=(context, payload)
+            ):
+                result, state, *_ = TestTaskService()._run_preview_pipeline(
+                    tmp, stop_at="video", preview_result=str(preview),
+                    selection_result=str(selection), render_plan_result=str(plan),
+                )
+            self.assertEqual(result["materials"], [])
+            self.assertEqual(
+                result["scene_materials"], ["selected.mp4", "legacy.mp4"]
+            )
+            self.assertEqual(
+                state.get_task("preview-pipeline")["scene_materials"],
+                ["selected.mp4", "legacy.mp4"],
+            )
+
+    def test_lazy_failure_has_one_materials_state_transition_and_no_render(self):
+        class CountingState(MemoryState):
+            def __init__(self):
+                super().__init__()
+                self.failure_transitions = 0
+
+            def update_task(
+                self,
+                task_id,
+                state=tm.const.TASK_STATE_PROCESSING,
+                progress=0,
+                **kwargs,
+            ):
+                if state == tm.const.TASK_STATE_FAILED:
+                    self.failure_transitions += 1
+                return super().update_task(task_id, state, progress, **kwargs)
+
+        state = CountingState()
+        params = VideoParams(
+            video_subject="subject", video_script="script",
+            match_materials_to_script=True, video_source="pexels", bgm_type="",
+        )
+        context_error = ValueError("corrupt artifact")
+        with (
+            patch.object(tm, "generate_script", return_value="script"),
+            patch.object(tm, "generate_terms", return_value=["term"]),
+            patch.object(tm, "save_script_data"),
+            patch.object(tm, "generate_audio", return_value=("audio", 5, object())),
+            patch.object(tm.voice, "get_audio_duration", return_value=5),
+            patch.object(tm, "generate_subtitle", return_value="subtitle"),
+            patch.object(tm.scene_timeline, "create_scene_timeline", return_value="scenes"),
+            patch("builtins.open", MagicMock()),
+            patch.object(tm.json, "load", return_value=[]),
+            patch.object(tm.scene_candidate, "retrieve_scene_candidates", return_value="candidates"),
+            patch.object(tm.os.path, "isfile", return_value=True),
+            patch.object(tm.scene_preview, "prepare_scene_previews", return_value="previews"),
+            patch.object(tm.scene_selection, "create_scene_selections", return_value="selections"),
+            patch.object(tm.os.path, "islink", return_value=False),
+            patch.object(tm.scene_render_plan, "create_scene_render_plan", return_value="plan"),
+            patch.object(tm, "_create_scene_render_context", side_effect=context_error),
+            patch.object(tm, "get_video_materials", return_value=None) as get,
+            patch.object(tm.video, "combine_videos") as legacy_render,
+            patch.object(tm.video, "combine_scene_videos") as scene_render,
+            patch.object(tm.sm, "state", state),
+        ):
+            result = tm.start("lazy-failure", params)
+        self.assertEqual(result["failed_stage"], "materials")
+        self.assertEqual(result["state"], tm.const.TASK_STATE_FAILED)
+        get.assert_called_once()
+        self.assertEqual(state.failure_transitions, 1)
+        legacy_render.assert_not_called()
+        scene_render.assert_not_called()
 
 
 class TestSceneRendererTaskIntegration(unittest.TestCase):

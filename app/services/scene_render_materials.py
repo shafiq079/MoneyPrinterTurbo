@@ -54,6 +54,10 @@ class AcquisitionLimitError(ValueError):
     """A task-wide acquisition bound was exceeded."""
 
 
+class NoSelectedSceneCoverageError(ValueError):
+    """Selected downloads cannot cover every scene without a legacy fallback."""
+
+
 class AcquisitionError(ValueError):
     def __init__(self, code: str):
         super().__init__(code)
@@ -338,7 +342,11 @@ def create_scene_render_materials(
     selected_root = _real_root(
         str(task_root / "scene_materials"), "selected material directory", create=True
     )
-    legacy_root = _real_root(legacy_material_root, "legacy material root")
+    legacy_root = (
+        _real_root(legacy_material_root, "legacy material root")
+        if legacy_material_paths
+        else None
+    )
 
     selected_requests = {}
     selected_identities = {}
@@ -432,6 +440,11 @@ def create_scene_render_materials(
             )
         if legacy_rows:
             return "fallback_legacy", None, legacy_rows[0]
+        if not legacy_material_paths:
+            raise NoSelectedSceneCoverageError(
+                "no selected material can provide complete scene coverage and no "
+                "legacy fallback was supplied"
+            )
         raise ValueError("scene has no validated fallback material")
 
     scene_rows = []
@@ -572,7 +585,11 @@ def load_scene_render_materials(
     selected_root = _real_root(
         str(task_root / "scene_materials"), "selected material directory"
     )
-    legacy_root = _real_root(legacy_material_root, "legacy material root")
+    legacy_root = (
+        _real_root(legacy_material_root, "legacy material root")
+        if legacy_material_paths
+        else None
+    )
     validated_legacy = []
     seen_legacy_paths = set()
     seen_legacy_ids = set()
@@ -606,6 +623,8 @@ def load_scene_render_materials(
             or row["origin"] not in ORIGINS
         ):
             raise ValueError("material row is invalid")
+        if row["origin"] == "legacy_fallback" and legacy_root is None:
+            raise ValueError("legacy material was not supplied by the task")
         root = selected_root if row["origin"] == "selected_url" else legacy_root
         metadata = _probe(
             Path(row["local_path"]), root, selected=row["origin"] == "selected_url"
