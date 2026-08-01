@@ -1269,6 +1269,7 @@ def _run_pipeline(
                 audio_duration=scene_timeline_duration,
                 subtitle_path=subtitle_path,
                 max_clip_duration=params.video_clip_duration,
+                min_scene_duration=params.video_scene_min_duration,
             )
         except Exception as exc:
             scene_pipeline_supported = False

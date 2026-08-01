@@ -75,6 +75,8 @@
     "Landscape": "Ngang 16:9",
     "Clip Duration": "Thời Lượng Tối Đa Mỗi Clip (giây)",
     "Clip Duration Help": "Quy định thời lượng của từng clip được sử dụng, không phải tổng thời lượng video.",
+    "Minimum Visual Scene Duration": "Thời Lượng Tối Thiểu Cảnh Hình (giây)",
+    "Minimum Visual Scene Duration Help": "Gộp các đoạn lời dẫn rất ngắn khi bật khớp theo thứ tự kịch bản. Không bao giờ vượt quá thời lượng tối đa.",
     "Clip Speed": "Tốc độ clip",
     "Clip Speed Help": "Chỉ điều chỉnh tốc độ phát của hình ảnh. Lời thoại, phụ đề và thời lượng đầu ra tối đa của từng clip không thay đổi.",
     "Number of Videos Generated Simultaneously": "Số video mỗi lần",
@@ -273,6 +275,7 @@
     "Please Enter the Coverr API Key": "Vui lòng nhập **API Key Coverr**",
     "Video Encoder": "Bộ Mã Hóa Video",
     "Default Video Encoder": "Mặc định (Khuyên dùng)",
-    "Video Encoder Help": "Tùy chọn nâng cao. Mặc định tuân theo chính sách mã hóa ổn định của ứng dụng, hiện là libx264. Nếu bộ mã hóa phần cứng không khả dụng, ứng dụng tự động chuyển về libx264."
+    "Video Encoder Help": "Tùy chọn nâng cao. Mặc định tuân theo chính sách mã hóa ổn định của ứng dụng, hiện là libx264. Nếu bộ mã hóa phần cứng không khả dụng, ứng dụng tự động chuyển về libx264.",
+    "Disabled": "Disabled"
   }
 }

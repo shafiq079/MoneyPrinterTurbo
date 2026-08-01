@@ -1,9 +1,10 @@
+import math
 import warnings
 from enum import Enum
 from typing import Any, List, Literal, Optional, Union
 
 import pydantic
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.config import config
 
@@ -101,6 +102,7 @@ class VideoParams(BaseModel):
     video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random.value
     video_transition_mode: Optional[VideoTransitionMode] = None
     video_clip_duration: Optional[int] = 5
+    video_scene_min_duration: Optional[float] = None
     video_clip_speed: Optional[float] = 1.0
     match_materials_to_script: bool = False
     video_count: Optional[int] = 1
@@ -110,7 +112,9 @@ class VideoParams(BaseModel):
         None  # Materials used to generate the video
     )
 
-    custom_audio_file: Optional[str] = None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles
+    custom_audio_file: Optional[str] = (
+        None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles
+    )
     video_language: Optional[str] = ""  # auto detect
 
     voice_name: Optional[str] = ""
@@ -125,7 +129,9 @@ class VideoParams(BaseModel):
     sonilo_bgm_prompt: str = Field(default="", max_length=2000)
 
     subtitle_enabled: Optional[bool] = True
-    subtitle_position: Optional[str] = config.ui.get("subtitle_position", "bottom")  # top, bottom, center, custom
+    subtitle_position: Optional[str] = config.ui.get(
+        "subtitle_position", "bottom"
+    )  # top, bottom, center, custom
     custom_position: float = config.ui.get("custom_position", 70.0)
     font_name: Optional[str] = "STHeitiMedium.ttc"
     text_fore_color: Optional[str] = "#FFFFFF"
@@ -139,6 +145,40 @@ class VideoParams(BaseModel):
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
+
+    @field_validator("video_scene_min_duration", mode="before")
+    @classmethod
+    def validate_scene_minimum_type(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("video_scene_min_duration must be a number")
+        return value
+
+    @model_validator(mode="after")
+    def validate_active_scene_duration_range(self):
+        if not self.match_materials_to_script or self.video_scene_min_duration is None:
+            return self
+        minimum = self.video_scene_min_duration
+        maximum = self.video_clip_duration
+        if not math.isfinite(minimum):
+            raise ValueError("video_scene_min_duration must be finite")
+        if minimum <= 0:
+            raise ValueError("video_scene_min_duration must be greater than zero")
+        if (
+            isinstance(maximum, bool)
+            or not isinstance(maximum, (int, float))
+            or not math.isfinite(maximum)
+            or maximum <= 0
+        ):
+            raise ValueError(
+                "video_clip_duration must be a finite positive number when "
+                "video_scene_min_duration is active"
+            )
+        if minimum > maximum:
+            raise ValueError(
+                "video_scene_min_duration must be less than or equal to "
+                "video_clip_duration"
+            )
+        return self
 
 
 class SubtitleRequest(BaseModel):
@@ -456,6 +496,7 @@ class BgmUploadResponse(BaseResponse):
             },
         }
 
+
 class VideoMaterialRetrieveResponse(BaseResponse):
     class Config:
         json_schema_extra = {
@@ -473,6 +514,7 @@ class VideoMaterialRetrieveResponse(BaseResponse):
                 },
             },
         }
+
 
 class VideoMaterialUploadResponse(BaseResponse):
     class Config:
