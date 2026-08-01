@@ -75,6 +75,8 @@
     "Landscape": "Paisagem 16:9",
     "Clip Duration": "Duração máxima por clipe (s)",
     "Clip Duration Help": "Define a duração de cada clipe utilizado, não a duração total do vídeo.",
+    "Minimum Visual Scene Duration": "Duração mínima da cena visual (s)",
+    "Minimum Visual Scene Duration Help": "Combina trechos de narração muito curtos quando a correspondência pela ordem do roteiro está ativa. Nunca substitui a duração máxima.",
     "Clip Speed": "Velocidade do clipe",
     "Clip Speed Help": "Ajusta apenas a reprodução do material visual. A narração, as legendas e a duração máxima de saída de cada clipe não mudam.",
     "Number of Videos Generated Simultaneously": "Vídeos por execução",
@@ -273,6 +275,7 @@
     "Please Enter the Coverr API Key": "Por favor, insira a **Chave de API do Coverr**",
     "Video Encoder": "Codificador de vídeo",
     "Default Video Encoder": "Padrão (recomendado)",
-    "Video Encoder Help": "Opção avançada. Padrão segue a política estável do aplicativo, atualmente libx264. Se um codificador de hardware não estiver disponível, o aplicativo retorna automaticamente para libx264."
+    "Video Encoder Help": "Opção avançada. Padrão segue a política estável do aplicativo, atualmente libx264. Se um codificador de hardware não estiver disponível, o aplicativo retorna automaticamente para libx264.",
+    "Disabled": "Disabled"
   }
 }

@@ -75,6 +75,8 @@
     "Landscape": "Yatay 16:9",
     "Clip Duration": "Maks. Klip Süresi (sn.)",
     "Clip Duration Help": "Toplam video süresini değil, kullanılan her klibin süresini belirler.",
+    "Minimum Visual Scene Duration": "Minimum Görsel Sahne Süresi (sn.)",
+    "Minimum Visual Scene Duration Help": "Senaryo sırası eşleştirmesi açıkken çok kısa anlatım parçalarını birleştirir. Maksimum klip süresini aşmaz.",
     "Clip Speed": "Klip Hızı",
     "Clip Speed Help": "Yalnızca görsel materyalin oynatma hızını ayarlar. Seslendirme, altyazılar ve her klibin maksimum çıktı süresi değişmez.",
     "Number of Videos Generated Simultaneously": "Oluşturulacak Video Sayısı",
@@ -273,6 +275,7 @@
     "Please Enter the Coverr API Key": "Lütfen **Coverr API Anahtarını** girin",
     "Video Encoder": "Video Kodlayıcı",
     "Default Video Encoder": "Varsayılan (Önerilen)",
-    "Video Encoder Help": "Gelişmiş seçenek. Varsayılan, uygulamanın kararlı kodlayıcı politikasını izler; şu anda libx264 kullanılır. Donanım kodlayıcı kullanılamıyorsa uygulama otomatik olarak libx264'e döner."
+    "Video Encoder Help": "Gelişmiş seçenek. Varsayılan, uygulamanın kararlı kodlayıcı politikasını izler; şu anda libx264 kullanılır. Donanım kodlayıcı kullanılamıyorsa uygulama otomatik olarak libx264'e döner.",
+    "Disabled": "Disabled"
   }
 }

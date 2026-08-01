@@ -75,6 +75,8 @@
     "Landscape": "Lanskap 16:9",
     "Clip Duration": "Durasi Maks. per Klip (detik)",
     "Clip Duration Help": "Menentukan durasi setiap klip yang digunakan, bukan durasi total video.",
+    "Minimum Visual Scene Duration": "Durasi Minimum Adegan Visual (detik)",
+    "Minimum Visual Scene Duration Help": "Menggabungkan potongan narasi yang sangat pendek saat pencocokan urutan skrip aktif. Tidak pernah melampaui durasi maksimum.",
     "Clip Speed": "Kecepatan Klip",
     "Clip Speed Help": "Hanya menyesuaikan kecepatan materi visual. Sulih suara, subtitle, dan durasi keluaran maksimum setiap klip tidak berubah.",
     "Number of Videos Generated Simultaneously": "Video per Proses",
@@ -273,6 +275,7 @@
     "Please Enter the Coverr API Key": "Silakan Masukkan **Kunci API Coverr**",
     "Video Encoder": "Encoder Video",
     "Default Video Encoder": "Default (Direkomendasikan)",
-    "Video Encoder Help": "Opsi lanjutan. Default mengikuti kebijakan encoder stabil aplikasi, saat ini libx264. Jika encoder perangkat keras tidak tersedia, aplikasi otomatis kembali ke libx264."
+    "Video Encoder Help": "Opsi lanjutan. Default mengikuti kebijakan encoder stabil aplikasi, saat ini libx264. Jika encoder perangkat keras tidak tersedia, aplikasi otomatis kembali ke libx264.",
+    "Disabled": "Disabled"
   }
 }

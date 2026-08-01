@@ -75,6 +75,8 @@
     "Landscape": "Landschaft 16:9",
     "Clip Duration": "Max. Dauer pro Clip (Sek.)",
     "Clip Duration Help": "Legt die Dauer jedes verwendeten Clips fest, nicht die Gesamtlänge des Videos.",
+    "Minimum Visual Scene Duration": "Minimale Dauer visueller Szenen (Sek.)",
+    "Minimum Visual Scene Duration Help": "Führt sehr kurze Erzählabschnitte bei aktivierter Skriptreihenfolge zu längeren visuellen Szenen zusammen. Der Höchstwert wird nicht überschritten.",
     "Clip Speed": "Clip-Geschwindigkeit",
     "Clip Speed Help": "Passt nur die Wiedergabegeschwindigkeit des Bildmaterials an. Sprachspur, Untertitel und maximale Ausgabedauer jedes Clips bleiben unverändert.",
     "Number of Videos Generated Simultaneously": "Videos pro Durchlauf",
@@ -273,6 +275,7 @@
     "Video Source Settings": "**Videoquellen-Einstellungen**",
     "Coverr": "Coverr",
     "Coverr API Key": "Coverr API-Schlüssel ([API-Schlüssel holen](https://coverr.co/developers?ctx=header_navigation))",
-    "Please Enter the Coverr API Key": "Bitte geben Sie den **Coverr API-Schlüssel** ein"
+    "Please Enter the Coverr API Key": "Bitte geben Sie den **Coverr API-Schlüssel** ein",
+    "Disabled": "Disabled"
   }
 }

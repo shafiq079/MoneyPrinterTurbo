@@ -240,6 +240,9 @@ def _initialize_session_state():
         "match_materials_to_script": bool(
             config.app.get("match_materials_to_script", False)
         ),
+        # API and restored legacy tasks default to None. A genuinely new WebUI
+        # task starts with the recommended matching-mode pacing value.
+        f"video_scene_min_duration_select_{initial_ui_language}": 2.0,
         "ui_language": initial_ui_language,
         # 已落盘的本地素材允许用户只修改文案后继续复用。
         "local_video_materials": [],
@@ -913,6 +916,11 @@ def _apply_pending_task_restore():
     )
     _set_stable_widget_value(
         "video_clip_duration_select", params.get("video_clip_duration", 3)
+    )
+    # Unlike most widgets, None is meaningful here: an old restored task must not
+    # silently acquire the new WebUI-only default.
+    st.session_state[localized_widget_key("video_scene_min_duration_select")] = (
+        params.get("video_scene_min_duration")
     )
     _set_stable_widget_value(
         "video_clip_speed_slider",
@@ -2330,6 +2338,21 @@ def _render_video_settings(panel, params):
                 default_value=3,
                 key="video_clip_duration_select",
                 help=tr("Clip Duration Help"),
+            )
+            params.video_scene_min_duration = stable_selectbox(
+                tr("Minimum Visual Scene Duration"),
+                options=[
+                    value
+                    for value in [None, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
+                    if value is None or value <= params.video_clip_duration
+                ],
+                default_value=2.0,
+                key="video_scene_min_duration_select",
+                format_func=lambda value: (
+                    tr("Disabled") if value is None else f"{value:.1f}"
+                ),
+                help=tr("Minimum Visual Scene Duration Help"),
+                disabled=not params.match_materials_to_script,
             )
             clip_speed_key = localized_widget_key("video_clip_speed_slider")
             # session_state 可能来自旧任务、API 参数或旧版页面状态。控件创建前
