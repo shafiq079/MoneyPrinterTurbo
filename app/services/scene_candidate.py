@@ -15,7 +15,9 @@ from app.services.scene_timeline import NarrationScene
 
 DEFAULT_CANDIDATES_PER_SCENE = 6
 MAX_CANDIDATES_PER_SCENE = 12
-DEFAULT_PROVIDER_SEARCH_BUDGET = 20
+# Covers two distinct uncached queries for a normal 17-scene short-form task,
+# with bounded headroom and the existing absolute maximum retained below.
+DEFAULT_PROVIDER_SEARCH_BUDGET = 40
 MAX_PROVIDER_SEARCH_BUDGET = 60
 SUPPORTED_SOURCES = {"pexels", "pixabay"}
 

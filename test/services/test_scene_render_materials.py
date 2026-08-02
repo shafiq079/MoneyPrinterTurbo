@@ -146,6 +146,81 @@ class TestSceneRenderMaterials(unittest.TestCase):
                 ).hexdigest(),
             )
 
+    def test_unresolved_ranking_statuses_finalize_with_legacy_material(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scenes = [
+                {
+                    "index": index,
+                    "start_time": float(index - 1),
+                    "end_time": float(index),
+                    "duration": 1.0,
+                    "text": f"Scene {index}",
+                }
+                for index in range(1, 4)
+            ]
+            selection = {
+                "version": 1,
+                "source_candidate_manifest": {"version": 1, "sha256": "a" * 64},
+                "source_preview_manifest": {"version": 1, "sha256": "b" * 64},
+                "scenes": [
+                    {
+                        "scene_index": 1,
+                        "status": "ranking_unavailable",
+                        "fallback_reason": "vlm_content_invalid",
+                        "reuse_scene_index": None,
+                    },
+                    {
+                        "scene_index": 2,
+                        "status": "no_acceptable_candidate",
+                        "fallback_reason": "no_acceptable_candidate",
+                        "reuse_scene_index": None,
+                    },
+                    {
+                        "scene_index": 3,
+                        "status": "ranking_unavailable",
+                        "fallback_reason": "duplicate_candidate_unavailable",
+                        "reuse_scene_index": None,
+                    },
+                ],
+            }
+            scene_path = root / "scenes.json"
+            selection_path = root / "scene_selections.json"
+            scene_path.write_text(json.dumps(scenes), encoding="utf-8")
+            selection_path.write_text(json.dumps(selection), encoding="utf-8")
+            plan_path = scene_render_plan.create_scene_render_plan(
+                str(scene_path), str(selection_path)
+            )
+            legacy_root = root / "legacy"
+            legacy_root.mkdir()
+            legacy = legacy_root / "legacy.mp4"
+            legacy.write_bytes(b"legacy")
+            with patch.object(
+                service,
+                "_probe",
+                side_effect=lambda path, _root, selected: self._metadata(Path(path)),
+            ):
+                target = service.create_scene_render_materials(
+                    str(plan_path),
+                    str(scene_path),
+                    str(selection_path),
+                    [str(legacy)],
+                    str(legacy_root),
+                    str(root),
+                )
+            payload = json.loads(Path(target).read_text(encoding="utf-8"))
+            self.assertEqual(
+                [row["fallback_reason"] for row in payload["scenes"]],
+                [
+                    "ranking_unavailable",
+                    "no_acceptable_candidate",
+                    "duplicate_candidate_unavailable",
+                ],
+            )
+            self.assertTrue(
+                all(row["resolution"] == "fallback_legacy" for row in payload["scenes"])
+            )
+
     def test_failed_selected_uses_prior_then_legacy_without_claiming_selected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

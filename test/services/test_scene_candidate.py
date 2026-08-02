@@ -302,6 +302,105 @@ def test_rich_cache_hit_uses_no_budget_and_shared_query_resolves_once(tmp_path):
     assert [group["status"] for group in manifest["scenes"]] == ["complete", "complete"]
 
 
+def test_default_budget_covers_two_queries_for_seventeen_scenes(tmp_path):
+    scenes = [_scene(index, f"Meaningful scene {index}") for index in range(1, 18)]
+    generated = {
+        scene.index: [f"scene {scene.index} primary", f"scene {scene.index} secondary"]
+        for scene in scenes
+    }
+
+    def search(**kwargs):
+        query = kwargs["search_term"]
+        scene_number = query.split()[1]
+        kind = query.split()[2]
+        # The shared identity proves stable cross-query deduplication; each
+        # query also has enough unique results to exercise the scene cap.
+        return (
+            [
+                _item(f"{scene_number}-shared", 1),
+                _item(f"{scene_number}-{kind}-1", 2),
+                _item(f"{scene_number}-{kind}-2", 3),
+                _item(f"{scene_number}-{kind}-3", 4),
+            ],
+            True,
+        )
+
+    with (
+        patch.object(
+            scene_candidate.llm,
+            "generate_scene_queries",
+            return_value=(generated, None),
+        ),
+        patch.object(
+            scene_candidate.material_cache,
+            "load_material_candidate_search_cache",
+            return_value=None,
+        ),
+        patch.object(
+            scene_candidate.material,
+            "search_video_candidates_with_cache",
+            side_effect=search,
+        ) as provider_search,
+    ):
+        target = scene_candidate.retrieve_scene_candidates(
+            str(tmp_path), "Subject", scenes, "pexels", VideoAspect.portrait, 5
+        )
+
+    manifest = json.loads(Path(target).read_text(encoding="utf-8"))
+    assert manifest["provider_search_budget"] == 40
+    assert manifest["remote_searches_used"] == 34
+    assert provider_search.call_count == 34
+    for group in manifest["scenes"]:
+        assert group["status"] == "complete"
+        assert group["warning"] is None
+        assert len(group["candidates"]) == scene_candidate.DEFAULT_CANDIDATES_PER_SCENE
+        assert {item["matched_query"] for item in group["candidates"]} == set(
+            group["queries"]
+        )
+        identities = [item["provider_video_id"] for item in group["candidates"]]
+        assert len(identities) == len(set(identities))
+
+
+def test_hard_search_max_deterministically_bounds_larger_tasks(tmp_path):
+    scenes = [_scene(index, f"Scene {index}") for index in range(1, 32)]
+    generated = {
+        scene.index: [f"primary {scene.index}", f"secondary {scene.index}"]
+        for scene in scenes
+    }
+    with (
+        patch.object(
+            scene_candidate.llm,
+            "generate_scene_queries",
+            return_value=(generated, None),
+        ),
+        patch.object(
+            scene_candidate.material_cache,
+            "load_material_candidate_search_cache",
+            return_value=None,
+        ),
+        patch.object(
+            scene_candidate.material,
+            "search_video_candidates_with_cache",
+            return_value=([], True),
+        ) as provider_search,
+    ):
+        target = scene_candidate.retrieve_scene_candidates(
+            str(tmp_path),
+            "Subject",
+            scenes,
+            "pexels",
+            VideoAspect.portrait,
+            5,
+            provider_search_budget=scene_candidate.MAX_PROVIDER_SEARCH_BUDGET,
+        )
+    groups = json.loads(Path(target).read_text(encoding="utf-8"))["scenes"]
+    assert provider_search.call_count == scene_candidate.MAX_PROVIDER_SEARCH_BUDGET
+    assert [group["status"] for group in groups[-2:]] == [
+        "partial_budget_exhausted",
+        "partial_budget_exhausted",
+    ]
+
+
 def test_empty_search_uses_truthful_combined_status(tmp_path):
     with (
         patch.object(

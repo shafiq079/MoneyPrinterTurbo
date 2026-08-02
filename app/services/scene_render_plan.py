@@ -21,8 +21,29 @@ SELECTED_STATUSES = {
     "provider_rank_fallback",
     "vlm_selected",
 }
-UNRESOLVED_STATUSES = {"no_candidates", "no_safe_candidate"}
+UNRESOLVED_STATUSES = {
+    "no_candidates",
+    "no_safe_candidate",
+    "no_acceptable_candidate",
+    "ranking_unavailable",
+}
 KNOWN_STATUSES = SELECTED_STATUSES | UNRESOLVED_STATUSES | {"hold_no_search"}
+RANKING_UNAVAILABLE_REASONS = {
+    "incomplete_preview_coverage",
+    "ranking_derivative_too_large",
+    "ranking_not_configured",
+    "ranking_budget_exhausted",
+    "ranking_deadline_exhausted",
+    "vlm_request_failed",
+    "vlm_response_invalid",
+    "vlm_response_too_large",
+    "vlm_envelope_invalid",
+    "vlm_finish_reason_invalid",
+    "vlm_content_invalid",
+    "vlm_schema_invalid",
+    "vlm_rate_limited",
+    "duplicate_candidate_unavailable",
+}
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -36,6 +57,9 @@ class SceneRenderBinding(str, Enum):
 class SceneFallbackReason(str, Enum):
     no_candidates = "no_candidates"
     no_safe_candidate = "no_safe_candidate"
+    no_acceptable_candidate = "no_acceptable_candidate"
+    ranking_unavailable = "ranking_unavailable"
+    duplicate_candidate_unavailable = "duplicate_candidate_unavailable"
     missing_selection = "missing_selection"
     unavailable_url = "unavailable_url"
     reuse_target_unresolved = "reuse_target_unresolved"
@@ -222,11 +246,27 @@ def _validate_selections(
             reuse = _strict_int(reuse, "reuse_scene_index")
             if reuse == index or reuse not in timeline_indexes:
                 _fail("reuse_scene_index is invalid")
+        fallback_reason = None
+        if status_name == "ranking_unavailable":
+            fallback_reason = _string(
+                row.get("fallback_reason"), "ranking fallback_reason", 64
+            )
+            if fallback_reason not in RANKING_UNAVAILABLE_REASONS:
+                _fail("ranking fallback_reason is unsupported")
+        elif status_name == "no_acceptable_candidate":
+            fallback_reason = row.get("fallback_reason")
+            if fallback_reason not in {None, "no_acceptable_candidate"}:
+                _fail("semantic fallback_reason is unsupported")
         if status_name in SELECTED_STATUSES:
             identity = _candidate_identity(row)
         else:
             identity = None
-        by_index[index] = {"status": status_name, "reuse": reuse, "identity": identity}
+        by_index[index] = {
+            "status": status_name,
+            "reuse": reuse,
+            "identity": identity,
+            "fallback_reason": fallback_reason,
+        }
         previous = index
     return by_index
 
@@ -305,8 +345,14 @@ def _build_rows(timeline: list[dict], selections: dict[int, dict]) -> list[dict]
         elif selection["status"] in SELECTED_STATUSES:
             results[scene["scene_index"]] = _selected(scene, selection["identity"])
         else:
+            reason = selection["status"]
+            if (
+                reason == "ranking_unavailable"
+                and selection["fallback_reason"] == "duplicate_candidate_unavailable"
+            ):
+                reason = "duplicate_candidate_unavailable"
             results[scene["scene_index"]] = _fallback(
-                scene, SceneFallbackReason(selection["status"])
+                scene, SceneFallbackReason(reason)
             )
 
     meaningful_indexes = [
