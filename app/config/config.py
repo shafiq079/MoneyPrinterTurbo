@@ -347,6 +347,8 @@ class SceneRankingConfig:
     read_timeout_seconds: int
     total_deadline_seconds: int
     max_attempts_per_scene: int
+    max_concurrent_scene_rankings: int
+    max_remote_attempts_per_minute: int
 
 
 _SCENE_RANKING_DEFAULTS = {
@@ -361,6 +363,8 @@ _SCENE_RANKING_DEFAULTS = {
     "read_timeout_seconds": 45,
     "total_deadline_seconds": 300,
     "max_attempts_per_scene": 2,
+    "max_concurrent_scene_rankings": 4,
+    "max_remote_attempts_per_minute": 30,
 }
 _SCENE_RANKING_INTEGER_BOUNDS = {
     "max_remote_scene_requests_per_task": (0, 60),
@@ -368,6 +372,8 @@ _SCENE_RANKING_INTEGER_BOUNDS = {
     "read_timeout_seconds": (1, 120),
     "total_deadline_seconds": (1, 900),
     "max_attempts_per_scene": (1, 2),
+    "max_concurrent_scene_rankings": (1, 6),
+    "max_remote_attempts_per_minute": (1, 60),
 }
 _SCENE_RANKING_API_KEY_MAX_BYTES = 4096
 _SCENE_RANKING_CONTROL = re.compile(r"[\x00-\x1f\x7f]")

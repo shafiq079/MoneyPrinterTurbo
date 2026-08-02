@@ -486,7 +486,7 @@ def test_rich_upgrade_and_cache_safety(tmp_path):
             rich, used_remote = material.search_video_candidates_with_cache(source="pixabay", search_term="upgrade", minimum_duration=5, video_aspect=VideoAspect.portrait)
         assert used_remote and rich == [rich_item]
         remote.assert_called_once()
-        assert json.loads(cache_path.read_text(encoding="utf-8"))["version"] == 2
+        assert json.loads(cache_path.read_text(encoding="utf-8"))["version"] == 3
         assert material_cache.load_material_search_cache(**args) == [rich_item.to_material_info()]
         serialized = cache_path.read_text(encoding="utf-8")
         assert "api-key-secret" not in serialized

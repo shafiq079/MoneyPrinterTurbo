@@ -1,8 +1,11 @@
 import os
 import random
 import threading
+import re
+import unicodedata
 from typing import Callable, List
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import urlencode
+from urllib.parse import urlsplit
 
 import requests
 from loguru import logger
@@ -21,6 +24,71 @@ from app.utils import utils
 # Thread-safe counter for API key rotation
 _api_key_counter = 0
 _api_key_lock = threading.Lock()
+MAX_SEMANTIC_LABELS = 16
+MAX_SEMANTIC_LABEL_CHARS = 80
+MAX_SEMANTIC_AGGREGATE_BYTES = 512
+_SEMANTIC_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_PEXELS_VIDEO_PATH = re.compile(
+    r"^/video/(?P<slug>[a-z0-9]+(?:-[a-z0-9]+)*)-(?P<id>[0-9]{1,32})/?$"
+)
+
+
+def _bounded_semantic_labels(values) -> tuple[str, ...]:
+    result = []
+    seen = set()
+    total = 0
+    for raw in values:
+        if not isinstance(raw, str) or _SEMANTIC_CONTROL.search(raw):
+            return ()
+        value = " ".join(unicodedata.normalize("NFKC", raw).casefold().split())
+        if not value or len(value) > MAX_SEMANTIC_LABEL_CHARS:
+            continue
+        encoded = len(value.encode("utf-8"))
+        if total + encoded > MAX_SEMANTIC_AGGREGATE_BYTES:
+            break
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+            total += encoded
+        if len(result) == MAX_SEMANTIC_LABELS:
+            break
+    return tuple(result)
+
+
+def _pexels_semantic_labels(page_url: str, provider_video_id: str) -> tuple[str, ...]:
+    if not isinstance(page_url, str) or len(page_url) > 2048 or "%" in page_url:
+        return ()
+    try:
+        parsed = urlsplit(page_url)
+        if (
+            parsed.scheme != "https"
+            or (parsed.hostname or "").lower() not in {"pexels.com", "www.pexels.com"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            return ()
+    except ValueError:
+        return ()
+    match = _PEXELS_VIDEO_PATH.fullmatch(parsed.path)
+    if not match or match.group("id") != provider_video_id:
+        return ()
+    return _bounded_semantic_labels([match.group("slug").replace("-", " ")])
+
+
+def _pixabay_semantic_labels(tags) -> tuple[str, ...]:
+    if (
+        not isinstance(tags, str)
+        or len(tags.encode("utf-8")) > MAX_SEMANTIC_AGGREGATE_BYTES
+        or _SEMANTIC_CONTROL.search(tags)
+    ):
+        return ()
+    parts = tags.split(",")
+    if len(parts) > MAX_SEMANTIC_LABELS:
+        return ()
+    return _bounded_semantic_labels(parts)
 
 
 def _get_tls_verify() -> bool:
@@ -56,25 +124,6 @@ def get_api_key(cfg_key: str):
     with _api_key_lock:
         _api_key_counter += 1
         return api_keys[_api_key_counter % len(api_keys)]
-
-
-def _redact_secret(message: str, secret: str) -> str:
-    """
-    对即将写入日志的异常文本做最小范围脱敏。
-
-    requests 的连接异常可能包含完整请求 URL，而 Pixabay API Key 通过查询
-    参数传递。这里同时替换原始值和 URL 编码值，既保留网络错误信息用于排查，
-    又避免密钥进入日志文件。
-    """
-    safe_message = str(message)
-    if not secret:
-        return safe_message
-
-    safe_message = safe_message.replace(secret, "***")
-    encoded_secret = quote_plus(secret)
-    if encoded_secret != secret:
-        safe_message = safe_message.replace(encoded_secret, "***")
-    return safe_message
 
 
 def _is_cloudflare_challenge(response: requests.Response) -> bool:
@@ -139,7 +188,7 @@ def search_video_candidates_pexels(
         response = r.json()
         video_items = []
         if "videos" not in response:
-            logger.error(f"search videos failed: {response}")
+            logger.error("pexels video search returned an invalid response envelope")
             return video_items
         videos = response["videos"]
         # loop through each video in the result
@@ -155,6 +204,9 @@ def search_video_candidates_pexels(
                 h = int(video["height"])
                 if w == video_width and h == video_height:
                     video_id = str(v.get("id") or utils.md5(video["link"]))
+                    semantic_labels = _pexels_semantic_labels(
+                        str(v.get("url") or ""), video_id
+                    )
                     item = ProviderVideoCandidate(
                         provider="pexels",
                         provider_video_id=video_id,
@@ -165,12 +217,16 @@ def search_video_candidates_pexels(
                         width=w,
                         height=h,
                         provider_rank=rank,
+                        semantic_labels=semantic_labels,
+                        semantic_source=(
+                            "provider_page_slug" if semantic_labels else "none"
+                        ),
                     )
                     video_items.append(item)
                     break
         return video_items
-    except Exception as e:
-        logger.error(f"search videos failed: {str(e)}")
+    except Exception as exc:
+        logger.error(f"pexels video search failed: error={type(exc).__name__}")
 
     return []
 
@@ -254,7 +310,7 @@ def search_video_candidates_pixabay(
 
         video_items = []
         if "hits" not in response:
-            logger.error(f"search videos failed: {response}")
+            logger.error("pixabay video search returned an invalid response envelope")
             return video_items
         videos = response["hits"]
         # loop through each video in the result
@@ -272,6 +328,7 @@ def search_video_candidates_pixabay(
                 if w >= video_width:
                     h = int(video.get("height") or video_height)
                     video_id = str(v.get("id") or utils.md5(video["url"]))
+                    semantic_labels = _pixabay_semantic_labels(v.get("tags"))
                     item = ProviderVideoCandidate(
                         provider="pixabay",
                         provider_video_id=video_id,
@@ -287,21 +344,16 @@ def search_video_candidates_pixabay(
                         width=w,
                         height=h,
                         provider_rank=rank,
+                        semantic_labels=semantic_labels,
+                        semantic_source=(
+                            "provider_tags" if semantic_labels else "none"
+                        ),
                     )
                     video_items.append(item)
                     break
         return video_items
-    except Exception as e:
-        error_message = _redact_secret(str(e), api_key)
-        # ProxyError 等异常可能回显完整代理 URL，其中可能包含用户名和密码。
-        # 仅替换用户实际配置的代理值，不对普通错误文本做宽泛正则处理，
-        # 避免误删 DNS、超时、证书等真正有助于排查的信息。
-        for proxy_url in config.proxy.values():
-            error_message = _redact_secret(error_message, str(proxy_url))
-        logger.error(
-            "pixabay search request failed: "
-            f"error={type(e).__name__}, detail={error_message}"
-        )
+    except Exception as exc:
+        logger.error(f"pixabay search request failed: error={type(exc).__name__}")
 
     return []
 

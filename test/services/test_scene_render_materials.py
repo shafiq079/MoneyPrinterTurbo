@@ -195,12 +195,15 @@ class TestSceneRenderMaterials(unittest.TestCase):
             legacy_root.mkdir()
             legacy = legacy_root / "legacy.mp4"
             legacy.write_bytes(b"legacy")
-            with patch.object(
-                service,
-                "_probe",
-                side_effect=lambda path, _root, selected: self._metadata(Path(path)),
+            with (
+                patch.object(
+                    service,
+                    "_probe",
+                    side_effect=lambda path, _root, selected: self._metadata(Path(path)),
+                ),
+                self.assertRaises(service.IncompleteMeaningfulSceneCoverageError),
             ):
-                target = service.create_scene_render_materials(
+                service.create_scene_render_materials(
                     str(plan_path),
                     str(scene_path),
                     str(selection_path),
@@ -208,18 +211,7 @@ class TestSceneRenderMaterials(unittest.TestCase):
                     str(legacy_root),
                     str(root),
                 )
-            payload = json.loads(Path(target).read_text(encoding="utf-8"))
-            self.assertEqual(
-                [row["fallback_reason"] for row in payload["scenes"]],
-                [
-                    "ranking_unavailable",
-                    "no_acceptable_candidate",
-                    "duplicate_candidate_unavailable",
-                ],
-            )
-            self.assertTrue(
-                all(row["resolution"] == "fallback_legacy" for row in payload["scenes"])
-            )
+            self.assertFalse((root / "scene_render_materials.json").exists())
 
     def test_failed_selected_uses_prior_then_legacy_without_claiming_selected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -248,8 +240,9 @@ class TestSceneRenderMaterials(unittest.TestCase):
                         Path(path)
                     ),
                 ),
+                self.assertRaises(service.IncompleteMeaningfulSceneCoverageError),
             ):
-                target = service.create_scene_render_materials(
+                service.create_scene_render_materials(
                     str(plan_path),
                     str(scene_path),
                     str(selection_path),
@@ -257,12 +250,7 @@ class TestSceneRenderMaterials(unittest.TestCase):
                     str(legacy_root),
                     str(root),
                 )
-            row = json.loads(Path(target).read_text(encoding="utf-8"))["scenes"][2]
-            self.assertEqual(row["requested_binding"], "selected")
-            self.assertEqual(row["resolution"], "fallback_previous_selected")
-            self.assertEqual(row["resolved_visual_source_scene_index"], 1)
-            self.assertEqual(row["acquisition_error"], "download_failed")
-            self.assertIsNone(row["fallback_reason"])
+            self.assertFalse((root / "scene_render_materials.json").exists())
 
     def test_empty_legacy_root_is_not_required_or_created(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -317,7 +305,7 @@ class TestSceneRenderMaterials(unittest.TestCase):
                     service, "_download",
                     side_effect=service.AcquisitionError("download_failed"),
                 ),
-                self.assertRaises(service.NoSelectedSceneCoverageError),
+                self.assertRaises(service.IncompleteMeaningfulSceneCoverageError),
             ):
                 service.create_scene_render_materials(
                     str(plan_path), str(scene_path), str(selection_path), [],
@@ -939,94 +927,18 @@ class TestSceneRenderMaterials(unittest.TestCase):
                 with self.subTest(candidate=candidate), self.assertRaises(ValueError):
                     service._contained_file(str(candidate), trusted.resolve(), "material")
 
-    def test_loader_rejects_non_nearest_previous_and_next_fallbacks(self):
+    def test_meaningful_fallback_rows_are_rejected_before_download(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            scenes = [
-                {"index": index, "start_time": index - 1.0, "end_time": float(index),
-                 "duration": 1.0, "text": f"scene {index}"}
-                for index in range(1, 5)
-            ]
-
-            def selected(index):
-                candidate_id = f"pexels:{index}"
-                return {
-                    "scene_index": index,
-                    "status": "provider_rank_selected",
-                    "reuse_scene_index": None,
-                    "selected_candidate_id": candidate_id,
-                    "selected_candidate": {
-                        "candidate_id": candidate_id,
-                        "provider": "pexels",
-                        "provider_video_id": str(index),
-                        "video_url": f"https://cdn.example/{index}.mp4",
-                    },
-                    "candidates": [{"candidate_id": candidate_id}],
-                }
-
-            selection = {
-                "version": 1,
-                "source_candidate_manifest": {"version": 1, "sha256": "a" * 64},
-                "source_preview_manifest": {"version": 1, "sha256": "b" * 64},
-                "scenes": [
-                    {"scene_index": 1, "status": "no_candidates", "reuse_scene_index": None},
-                    selected(2),
-                    selected(3),
-                    {"scene_index": 4, "status": "no_candidates", "reuse_scene_index": None},
-                ],
-            }
-            scene_path = root / "scenes.json"
-            selection_path = root / "scene_selections.json"
-            scene_path.write_text(json.dumps(scenes), encoding="utf-8")
+            scene_path, selection_path, _ = self._sources(root)
+            selection = json.loads(selection_path.read_text(encoding="utf-8"))
+            selection["scenes"][0] = {"scene_index": 1, "status": "no_candidates", "reuse_scene_index": None}
             selection_path.write_text(json.dumps(selection), encoding="utf-8")
-            plan_path = scene_render_plan.create_scene_render_plan(
-                str(scene_path), str(selection_path)
-            )
-            legacy_root = root / "legacy"
-            legacy_root.mkdir()
-
-            def download(_url, destination, selected_root):
-                destination.write_bytes(destination.name.encode())
-                return service._probe(destination, selected_root, selected=True)
-
-            fake_clip = MagicMock(duration=5.0, fps=30.0, size=(1920, 1080))
-            with (
-                patch.object(service, "VideoFileClip", return_value=fake_clip),
-                patch.object(service, "_download", side_effect=download),
-            ):
-                target = Path(
-                    service.create_scene_render_materials(
-                        plan_path,
-                        str(scene_path),
-                        str(selection_path),
-                        [],
-                        str(legacy_root),
-                        str(root),
-                    )
-                )
-                original = json.loads(target.read_text(encoding="utf-8"))
-                cases = (
-                    (0, 3, original["scenes"][2]["material_id"]),
-                    (3, 2, original["scenes"][1]["material_id"]),
-                )
-                for row_index, source_index, material_id in cases:
-                    with self.subTest(row_index=row_index):
-                        tampered = json.loads(json.dumps(original))
-                        tampered["scenes"][row_index].update(
-                            resolved_visual_source_scene_index=source_index,
-                            material_id=material_id,
-                        )
-                        target.write_text(json.dumps(tampered), encoding="utf-8")
-                        with self.assertRaises(ValueError):
-                            service.load_scene_render_materials(
-                                str(target),
-                                plan_path,
-                                str(scene_path),
-                                str(selection_path),
-                                [],
-                                str(legacy_root),
-                                str(root),
-                            )
+            plan_path = scene_render_plan.create_scene_render_plan(str(scene_path), str(selection_path))
+            with patch.object(service, "_download") as download, self.assertRaises(service.IncompleteMeaningfulSceneCoverageError):
+                service.create_scene_render_materials(plan_path, str(scene_path), str(selection_path), [], "", str(root))
+            download.assert_not_called()
+            self.assertFalse((root / "scene_render_materials.json").exists())
 
 
 if __name__ == "__main__":

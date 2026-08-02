@@ -58,18 +58,69 @@ def test_query_generation_uses_one_batched_call_and_ignores_holds():
     response = json.dumps(
         {
             "scenes": [
-                {"scene_index": 1, "queries": ["busy station", "busy station"]},
-                {"scene_index": 3, "queries": ["contactless card payment"]},
+                {
+                    "scene_index": 1,
+                    "queries": ["busy station", "busy station"],
+                    "requirements": {
+                        "primary_entities": [
+                            {"canonical": "station", "aliases": ["train station"]}
+                        ],
+                        "actions": [],
+                        "contexts": [],
+                    },
+                },
+                {
+                    "scene_index": 3,
+                    "queries": ["contactless card payment"],
+                    "requirements": {
+                        "primary_entities": [
+                            {"canonical": "payment card", "aliases": ["credit card"]}
+                        ],
+                        "actions": [],
+                        "contexts": [],
+                    },
+                },
             ]
         }
     )
     with patch.object(llm, "_generate_response", return_value=response) as generate:
         queries, warning = llm.generate_scene_queries("City life", scenes)
 
-    assert queries == {1: ["busy station"], 3: ["contactless card payment"]}
+    assert list(queries[1].queries) == ["busy station"]
+    assert queries[1].requirements.primary_entities[0].canonical == "station"
+    assert list(queries[3].queries) == ["contactless card payment"]
     assert warning is None
     assert generate.call_count == 1
     assert '"scene_index": 2' not in generate.call_args.args[0]
+
+
+@pytest.mark.parametrize(
+    "generic", ["hands", "beans", "farm", "factory", "machine", "liquid", "person"]
+)
+def test_query_plan_rejects_generic_only_primary_entities(generic):
+    scene = _scene(1, "A concrete narration scene")
+    response = json.dumps(
+        {
+            "scenes": [
+                {
+                    "scene_index": 1,
+                    "queries": ["concrete footage"],
+                    "requirements": {
+                        "primary_entities": [{"canonical": generic, "aliases": []}],
+                        "actions": [],
+                        "contexts": [],
+                    },
+                }
+            ]
+        }
+    )
+    with (
+        patch.object(llm, "_max_retries", 1),
+        patch.object(llm, "_generate_response", return_value=response),
+    ):
+        plans, warning = llm.generate_scene_queries("Subject", [scene])
+    assert plans == {}
+    assert warning is not None
 
 
 @pytest.mark.parametrize("response", ["not json", "Error: unavailable"])
@@ -118,8 +169,7 @@ def test_partial_duplicate_and_unknown_llm_scenes_fall_back_safely(tmp_path):
         )
 
     groups = json.loads(Path(target).read_text(encoding="utf-8"))["scenes"]
-    assert groups[0]["queries"] == ["valid first footage"]
-    assert groups[0]["query_source"] == "llm"
+    assert groups[0]["query_source"] == "fallback"
     assert groups[1]["query_source"] == "fallback"
     assert groups[2]["query_source"] == "fallback"
 
@@ -399,6 +449,83 @@ def test_hard_search_max_deterministically_bounds_larger_tasks(tmp_path):
         "partial_budget_exhausted",
         "partial_budget_exhausted",
     ]
+
+
+def test_semantic_filter_checks_full_results_before_diverse_cap(tmp_path):
+    scene = _scene(1, "Chocolate begins as a bitter cacao seed")
+    requirements = llm.SceneSemanticRequirements(
+        primary_entities=(llm.SemanticTermGroup("cacao", ("cocoa",)),),
+        actions=(),
+        contexts=(),
+    )
+    plan = llm.SceneQueryPlan(("cacao seed", "cocoa pod"), requirements)
+
+    def evidence(identifier, rank, label):
+        item = _item(identifier, rank)
+        item.semantic_labels = (label,)
+        item.semantic_source = "provider_page_slug"
+        return item
+
+    results = {
+        "cacao seed": [
+            *[evidence(f"coffee-{rank}", rank, "coffee beans") for rank in range(1, 8)],
+            evidence("late-cacao", 8, "cacao seeds drying"),
+        ],
+        "cocoa pod": [
+            evidence("late-cacao", 1, "cocoa seeds drying"),
+            evidence("pod", 2, "cocoa pod harvest"),
+        ],
+    }
+    with (
+        patch.object(
+            scene_candidate.llm,
+            "generate_scene_queries",
+            return_value=({1: plan}, None),
+        ),
+        patch.object(
+            scene_candidate.material_cache,
+            "load_material_candidate_search_cache",
+            return_value=None,
+        ),
+        patch.object(
+            scene_candidate.material,
+            "search_video_candidates_with_cache",
+            side_effect=lambda **kwargs: (results[kwargs["search_term"]], True),
+        ),
+    ):
+        target = scene_candidate.retrieve_scene_candidates(
+            str(tmp_path),
+            "Chocolate",
+            [scene],
+            "pexels",
+            VideoAspect.portrait,
+            5,
+            semantic_filter_enabled=True,
+        )
+    group = json.loads(Path(target).read_text(encoding="utf-8"))["scenes"][0]
+    assert group["status"] == "complete"
+    assert [item["provider_video_id"] for item in group["candidates"]] == [
+        "late-cacao",
+        "pod",
+    ]
+    assert [item["matched_query"] for item in group["candidates"]] == [
+        "cocoa pod",
+        "cocoa pod",
+    ]
+    assert all(
+        "coffee" not in item["provider_video_id"] for item in group["candidates"]
+    )
+
+
+def test_actions_cannot_replace_missing_primary_entity():
+    requirements = scene_candidate.SemanticRequirements(
+        primary_entities=[{"canonical": "cacao", "aliases": ["cocoa"]}],
+        actions=[{"canonical": "drying", "aliases": []}],
+        contexts=[{"canonical": "farm", "aliases": []}],
+    )
+    coffee = _item("coffee")
+    coffee.semantic_labels = ("coffee beans drying on farm",)
+    assert not scene_candidate.semantic_support(coffee, requirements)
 
 
 def test_empty_search_uses_truthful_combined_status(tmp_path):

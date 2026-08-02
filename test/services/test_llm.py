@@ -23,6 +23,32 @@ from app.models.llm_provider import (
 from app.models.schema import VideoScriptRequest, VideoSocialMetadataRequest
 from app.services import llm
 
+
+def test_scene_query_plan_has_strict_typed_semantic_requirements():
+    scene = types.SimpleNamespace(index=1, text="可可豆在阳光下晾晒")
+    response = json.dumps(
+        {
+            "scenes": [
+                {
+                    "scene_index": 1,
+                    "queries": ["cacao beans drying in sun"],
+                    "requirements": {
+                        "primary_entities": [
+                            {"canonical": "cacao", "aliases": ["cocoa"]}
+                        ],
+                        "actions": [{"canonical": "drying", "aliases": []}],
+                        "contexts": [],
+                    },
+                }
+            ]
+        }
+    )
+    with patch.object(llm, "_generate_response", return_value=response):
+        plans, warning = llm.generate_scene_queries("巧克力", [scene])
+    assert warning is None
+    assert plans[1].queries == ("cacao beans drying in sun",)
+    assert plans[1].requirements.primary_entities[0].aliases == ("cocoa",)
+
 RUN_INTEGRATION_TESTS = os.environ.get("MPT_RUN_INTEGRATION_TESTS", "").lower() in {
     "1",
     "true",

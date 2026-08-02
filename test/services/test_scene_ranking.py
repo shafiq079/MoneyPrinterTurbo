@@ -411,6 +411,37 @@ def test_http_429_remains_separately_classified_and_bounded():
     assert error.value.attempts == 2
 
 
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (requests.ConnectTimeout("secret detail"), "vlm_connect_timeout"),
+        (requests.ReadTimeout("secret detail"), "vlm_read_timeout"),
+        (requests.exceptions.SSLError("secret detail"), "vlm_tls_failed"),
+        (requests.exceptions.ProxyError("secret detail"), "vlm_proxy_failed"),
+        (requests.ConnectionError("secret detail"), "vlm_connection_failed"),
+    ],
+)
+def test_transport_failures_use_bounded_reason_codes(failure, reason):
+    prepared = scene_ranking.prepare(
+        _scene(1), [_jpeg()], "nvidia_hosted", scene_ranking.MODEL, "16:9"
+    )
+    cfg = SimpleNamespace(
+        max_attempts_per_scene=1, connect_timeout_seconds=10, read_timeout_seconds=45
+    )
+    with pytest.raises(scene_ranking.RankingError) as error:
+        scene_ranking.request_remote(
+            prepared,
+            1,
+            "x",
+            cfg,
+            session=Session([failure]),
+            monotonic=lambda: 1,
+            deadline=100,
+        )
+    assert error.value.reason == reason
+    assert "secret detail" not in error.value.reason
+
+
 def test_transport_retry_retry_after_and_deadline_attempt_counts():
     prepared = scene_ranking.prepare(
         _scene(1), [_jpeg()], "nvidia_hosted", scene_ranking.MODEL, "16:9"

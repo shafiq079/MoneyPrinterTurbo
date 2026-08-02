@@ -42,6 +42,16 @@ RANKING_UNAVAILABLE_REASONS = {
     "vlm_content_invalid",
     "vlm_schema_invalid",
     "vlm_rate_limited",
+    "vlm_http_client_rejected",
+    "vlm_http_server_failed",
+    "vlm_connect_timeout",
+    "vlm_read_timeout",
+    "vlm_connection_failed",
+    "vlm_tls_failed",
+    "vlm_proxy_failed",
+    "vlm_transport_failed",
+    "ranking_start_deadline_exhausted",
+    "ranking_attempt_deadline_exhausted",
     "duplicate_candidate_unavailable",
 }
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")

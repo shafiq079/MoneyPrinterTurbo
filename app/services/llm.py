@@ -1,6 +1,8 @@
 import json
 import logging
 import re
+import unicodedata
+from dataclasses import dataclass
 from time import perf_counter
 from typing import List
 
@@ -25,6 +27,100 @@ _SENSITIVE_QUERY_RE = re.compile(
     r"([?&](?:api[_-]?key|access[_-]?token|token|key|secret|password)=)([^&#\s]+)",
     re.IGNORECASE,
 )
+
+_GENERIC_PRIMARY_TERMS = frozenset(
+    "person people man woman child hand hands object item thing food bean beans seed seeds farm factory machine machinery liquid material process production worker footage video close up".split()
+)
+
+
+@dataclass(frozen=True)
+class SemanticTermGroup:
+    canonical: str
+    aliases: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SceneSemanticRequirements:
+    primary_entities: tuple[SemanticTermGroup, ...]
+    actions: tuple[SemanticTermGroup, ...] = ()
+    contexts: tuple[SemanticTermGroup, ...] = ()
+
+
+@dataclass(frozen=True)
+class SceneQueryPlan:
+    queries: tuple[str, ...]
+    requirements: SceneSemanticRequirements
+
+
+def _query_no_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate scene query key")
+        result[key] = value
+    return result
+
+
+def _semantic_phrase(value, maximum=48) -> str:
+    if not isinstance(value, str) or re.search(r"[\x00-\x1f\x7f]", value):
+        raise ValueError("invalid semantic phrase")
+    result = " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+    if not 2 <= len(result) <= maximum:
+        raise ValueError("semantic phrase is outside the supported range")
+    return result
+
+
+def _term_group(payload, *, primary=False) -> SemanticTermGroup:
+    if not isinstance(payload, dict) or set(payload) != {"canonical", "aliases"}:
+        raise ValueError("invalid semantic term group")
+    canonical = _semantic_phrase(payload["canonical"])
+    aliases = payload["aliases"]
+    if not isinstance(aliases, list) or len(aliases) > 4:
+        raise ValueError("invalid semantic aliases")
+    normalized = []
+    seen = {canonical}
+    for alias in aliases:
+        alias = _semantic_phrase(alias)
+        if alias not in seen:
+            seen.add(alias)
+            normalized.append(alias)
+    if primary and all(
+        all(token in _GENERIC_PRIMARY_TERMS for token in phrase.split())
+        for phrase in (canonical, *normalized)
+    ):
+        raise ValueError("primary entity group is overly generic")
+    return SemanticTermGroup(canonical, tuple(normalized))
+
+
+def _requirements(payload) -> SceneSemanticRequirements:
+    if not isinstance(payload, dict) or set(payload) != {
+        "primary_entities",
+        "actions",
+        "contexts",
+    }:
+        raise ValueError("invalid semantic requirements")
+    bounds = {"primary_entities": (1, 4), "actions": (0, 3), "contexts": (0, 3)}
+    parsed = {}
+    total = 0
+    for field, (minimum, maximum) in bounds.items():
+        values = payload[field]
+        if not isinstance(values, list) or not minimum <= len(values) <= maximum:
+            raise ValueError(
+                "semantic requirement count is outside the supported range"
+            )
+        groups = tuple(
+            _term_group(value, primary=field == "primary_entities") for value in values
+        )
+        total += sum(
+            len(text.encode("utf-8"))
+            for group in groups
+            for text in (group.canonical, *group.aliases)
+        )
+        parsed[field] = groups
+    if total > 512:
+        raise ValueError("semantic requirements are too large")
+    return SceneSemanticRequirements(**parsed)
+
 
 DEFAULT_SCRIPT_SYSTEM_PROMPT = """
 # Role: Video Script Generator
@@ -688,8 +784,8 @@ Please note that you must use English for generating video search terms; Chinese
 
 def generate_scene_queries(
     video_subject: str, scenes: list, max_queries_per_scene: int = 3
-) -> tuple[dict[int, list[str]], str | None]:
-    """Generate queries for all meaningful scenes in one batched LLM request."""
+) -> tuple[dict[int, SceneQueryPlan], str | None]:
+    """Generate English queries and independent typed semantic requirements."""
     meaningful = [scene for scene in scenes if scene.text.strip()]
     if not meaningful:
         return {}, None
@@ -698,10 +794,13 @@ def generate_scene_queries(
     ]
     prompt = f"""
 # Role: Scene Stock-Footage Query Generator
-Generate 1-{max_queries_per_scene} concrete English stock-footage search queries for
-every narration scene. Describe visible subjects, actions, settings, or shots; do
-not summarize abstract ideas. Return JSON only in this exact shape:
-{{"scenes":[{{"scene_index":1,"queries":["concrete visible footage"]}}]}}
+Generate 1-{max_queries_per_scene} concrete English stock-footage search queries and
+typed English visual requirements for every narration scene. primary_entities are
+specific visible identities; every group is required and aliases within a group are
+alternatives. Never use generic identities such as person, hands, beans, farm,
+factory, machine, liquid, or footage. Actions and contexts are optional evidence.
+Return JSON only in this exact shape and with no additional fields:
+{{"scenes":[{{"scene_index":1,"queries":["cacao pod harvest"],"requirements":{{"primary_entities":[{{"canonical":"cacao","aliases":["cocoa"]}}],"actions":[{{"canonical":"harvest","aliases":["picking"]}}],"contexts":[]}}}}]}}
 
 Video subject: {video_subject}
 Scenes: {json.dumps(scene_payload, ensure_ascii=False)}
@@ -711,47 +810,65 @@ Scenes: {json.dumps(scene_payload, ensure_ascii=False)}
         try:
             response = _generate_response(prompt)
             if response.startswith("Error: "):
-                raise ValueError(response)
-            payload = json.loads(_strip_code_fence(response))
-            entries = payload.get("scenes") if isinstance(payload, dict) else None
+                raise ValueError("scene query provider error")
+            payload = json.loads(
+                _strip_code_fence(response),
+                object_pairs_hook=_query_no_duplicates,
+                parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+            )
+            if not isinstance(payload, dict) or set(payload) != {"scenes"}:
+                raise ValueError("scene query response has invalid root fields")
+            entries = payload["scenes"]
             if not isinstance(entries, list):
                 raise ValueError("scene query response has no scenes list")
             valid_indices = {scene.index for scene in meaningful}
-            result: dict[int, list[str]] = {}
-            duplicate_indices = set()
+            result: dict[int, SceneQueryPlan] = {}
             for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
+                if not isinstance(entry, dict) or set(entry) != {
+                    "scene_index",
+                    "queries",
+                    "requirements",
+                }:
+                    raise ValueError("scene query entry has invalid fields")
                 index = entry.get("scene_index")
                 queries = entry.get("queries")
-                if index not in valid_indices or not isinstance(queries, list):
-                    continue
+                if (
+                    type(index) is not int
+                    or index not in valid_indices
+                    or not isinstance(queries, list)
+                    or not 1 <= len(queries) <= max_queries_per_scene
+                ):
+                    raise ValueError("scene query entry is invalid")
                 if index in result:
-                    duplicate_indices.add(index)
-                    continue
+                    raise ValueError("duplicate scene query index")
                 normalized = []
                 seen = set()
                 for query in queries:
-                    if not isinstance(query, str):
-                        continue
-                    query = " ".join(query.split()).strip(" ,.;:!?\n\t")
+                    if not isinstance(query, str) or re.search(
+                        r"[\x00-\x1f\x7f]", query
+                    ):
+                        raise ValueError("invalid scene query")
+                    query = " ".join(query.split()).strip(" ,.;:!?")
                     key = query.casefold()
-                    if query and key not in seen:
+                    if not 1 <= len(query) <= 80:
+                        raise ValueError("scene query is outside the supported range")
+                    if key not in seen:
                         normalized.append(query)
                         seen.add(key)
-                result[index] = normalized[:max_queries_per_scene]
-            for index in duplicate_indices:
-                result.pop(index, None)
-            warning = None
-            if set(result) != valid_indices or any(
-                not value for value in result.values()
-            ):
-                warning = (
-                    "LLM output was incomplete; deterministic fallbacks were used."
-                )
-            return result, warning
+                requirements = _requirements(entry["requirements"])
+                result[index] = SceneQueryPlan(tuple(normalized), requirements)
+            if set(result) != valid_indices:
+                raise ValueError("scene query response coverage is incomplete")
+            if [entry["scene_index"] for entry in entries] != [
+                scene.index for scene in meaningful
+            ]:
+                raise ValueError("scene query response order is invalid")
+            return result, None
         except Exception as exc:
-            logger.warning(f"failed to generate batched scene queries: {exc}")
+            logger.warning(
+                "failed to generate batched scene queries: "
+                f"error={type(exc).__name__}"
+            )
             if attempt + 1 == _max_retries:
                 return (
                     {},

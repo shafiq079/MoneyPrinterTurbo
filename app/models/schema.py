@@ -71,6 +71,10 @@ class ProviderVideoCandidate:
     width: int = 0
     height: int = 0
     provider_rank: int = 0
+    # Bounded provider-returned text used only as untrusted semantic evidence.
+    # Tuples keep the compatibility default immutable for legacy callers.
+    semantic_labels: tuple[str, ...] = ()
+    semantic_source: str = "none"
 
     def to_material_info(self) -> MaterialInfo:
         return MaterialInfo(

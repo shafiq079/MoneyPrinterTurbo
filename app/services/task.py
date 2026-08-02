@@ -1414,6 +1414,9 @@ def _run_pipeline(
                     source=params.video_source,
                     video_aspect=params.video_aspect,
                     minimum_duration=params.video_clip_duration,
+                    semantic_filter_enabled=(
+                        config.scene_ranking.get("enabled") is True
+                    ),
                 )
                 if scene_candidates_path and os.path.isfile(scene_candidates_path):
                     try:
@@ -1536,23 +1539,19 @@ def _run_pipeline(
                             "",
                         )
                     )
-                except scene_render_materials.NoSelectedSceneCoverageError:
+                except (
+                    scene_render_materials.NoSelectedSceneCoverageError,
+                    scene_render_materials.IncompleteMeaningfulSceneCoverageError,
+                ):
                     downloaded_videos = legacy_loader.acquire(
                         "selected materials do not provide complete scene coverage"
                     )
-                    legacy_material_root = material.resolve_material_directory(task_id)
-                    scene_render_context, _validated_payload = (
-                        _create_scene_render_context(
-                            task_id,
-                            scene_render_plan_path,
-                            scene_timeline_path,
-                            scene_selections_path,
-                            downloaded_videos,
-                            legacy_material_root,
-                        )
-                    )
+                    scene_render_context = None
+                    _validated_payload = None
                 scene_render_materials_path = (
                     scene_render_context.scene_render_materials_path
+                    if scene_render_context is not None
+                    else ""
                 )
             except LazyLegacyMaterialAcquisitionError as exc:
                 return _mark_task_failed(task_id, "materials", str(exc))

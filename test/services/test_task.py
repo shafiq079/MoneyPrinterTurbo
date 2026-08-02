@@ -2298,7 +2298,7 @@ class TestLazyLegacyMaterials(unittest.TestCase):
                     tmp, stop_at="video", preview_result=str(preview),
                     selection_result=str(selection), render_plan_result=str(plan),
                 )
-            self.assertEqual(create.call_count, 2)
+            self.assertEqual(create.call_count, 1)
             get_materials = result[5]
             get_materials.assert_called_once_with(
                 "preview-pipeline", unittest.mock.ANY, ["term"], 5,

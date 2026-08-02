@@ -163,6 +163,8 @@ class TestConfigPersistence:
         assert settings.enabled is False
         assert settings.api_key == "unit-test-key"
         assert settings.max_remote_scene_requests_per_task == 20
+        assert settings.max_concurrent_scene_rankings == 4
+        assert settings.max_remote_attempts_per_minute == 30
         assert settings.model == "nvidia/nemotron-nano-12b-v2-vl"
 
     def test_scene_ranking_example_has_only_empty_secret(self):
@@ -186,6 +188,8 @@ class TestConfigPersistence:
             "read_timeout_seconds": (1, 120),
             "total_deadline_seconds": (1, 900),
             "max_attempts_per_scene": (1, 2),
+            "max_concurrent_scene_rankings": (1, 6),
+            "max_remote_attempts_per_minute": (1, 60),
         }
         for name, (lower, upper) in bounds.items():
             for valid in (lower, upper):
