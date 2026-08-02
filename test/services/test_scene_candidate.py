@@ -210,7 +210,11 @@ def test_default_six_limit_is_applied_after_dedup_and_preserves_utf8(tmp_path):
     assert manifest["scenes"][0]["text"] == "城市街道上的行人"
     assert [
         item["provider_video_id"] for item in manifest["scenes"][0]["candidates"]
-    ] == ["1", "2", "3", "4", "5", "6"]
+    ] == ["1", "2", "7", "3", "8", "4"]
+    assert {item["matched_query"] for item in manifest["scenes"][0]["candidates"]} == {
+        "city street",
+        "walking people",
+    }
 
 
 @pytest.mark.parametrize("limit", [0, -1, scene_candidate.MAX_CANDIDATES_PER_SCENE + 1])

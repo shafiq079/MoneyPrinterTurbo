@@ -148,7 +148,7 @@ def retrieve_scene_candidates(
     resolved: dict[str, list[ProviderVideoCandidate]] = {}
     skipped: dict[int, int] = {scene.index: 0 for scene in scenes}
     attempted: dict[int, int] = {scene.index: 0 for scene in scenes}
-    found: dict[int, list[tuple[str, ProviderVideoCandidate]]] = {
+    found: dict[int, list[tuple[str, list[ProviderVideoCandidate]]]] = {
         scene.index: [] for scene in scenes
     }
     remote_used = 0
@@ -189,7 +189,7 @@ def retrieve_scene_candidates(
                     remote_used += int(used_remote)
                 resolved[cache_key] = items
             attempted[scene.index] += 1
-            found[scene.index].extend((query, item) for item in items)
+            found[scene.index].append((query, items))
 
     groups = []
     for position, scene in enumerate(scenes):
@@ -211,13 +211,25 @@ def retrieve_scene_candidates(
             continue
         unique = []
         seen = set()
-        for query, item in found[scene.index]:
-            identity = (item.provider, item.provider_video_id)
-            if identity in seen:
-                continue
-            seen.add(identity)
-            unique.append(_candidate(item, query))
-        unique = unique[:candidates_per_scene]
+        result_sets = found[scene.index]
+        # Interleave provider-ranked result sets so a prolific first query
+        # cannot starve later queries.  Each row retains its originating query
+        # and rank; identity deduplication is stable on first occurrence.
+        max_results = max((len(items) for _, items in result_sets), default=0)
+        for rank_position in range(max_results):
+            for query, items in result_sets:
+                if rank_position >= len(items):
+                    continue
+                item = items[rank_position]
+                identity = (item.provider, item.provider_video_id)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                unique.append(_candidate(item, query))
+                if len(unique) == candidates_per_scene:
+                    break
+            if len(unique) == candidates_per_scene:
+                break
         warning = None
         if skipped[scene.index]:
             if attempted[scene.index]:

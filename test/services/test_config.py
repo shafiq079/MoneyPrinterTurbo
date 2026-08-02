@@ -162,12 +162,22 @@ class TestConfigPersistence:
             )
         assert settings.enabled is False
         assert settings.api_key == "unit-test-key"
-        assert settings.max_remote_scene_requests_per_task == 12
+        assert settings.max_remote_scene_requests_per_task == 20
+        assert settings.model == "nvidia/nemotron-nano-12b-v2-vl"
 
     def test_scene_ranking_example_has_only_empty_secret(self):
         section = self._load_example_config()["scene_ranking"]
         assert section["enabled"] is False
         assert section["api_key"] == ""
+
+    def test_scene_ranking_accepts_bounded_nvidia_model_names(self):
+        with patch.object(
+            config, "scene_ranking", {"model": "nvidia/llama-3.2-nv-vision-safe"}
+        ):
+            assert (
+                config.get_scene_ranking_config({}).model
+                == "nvidia/llama-3.2-nv-vision-safe"
+            )
 
     def test_scene_ranking_strict_types_and_bounds(self):
         bounds = {

@@ -421,6 +421,7 @@ def test_atomic_publication_failure_leaves_no_partial_artifact(artifacts):
         (5, 5, [0, 1, 2, 3, 4]),
         (6, 2, [1, 4]),
         (7, 3, [1, 3, 5]),
+        (17, 20, list(range(17))),
     ],
 )
 def test_centered_stratified_allocation(count, budget, expected):
@@ -577,7 +578,8 @@ def test_invalid_requested_config_skips_derivative_cache_and_network(
         target = scene_selection.create_scene_selections(str(candidates), str(previews))
     raw = Path(target).read_text(encoding="utf-8")
     data = json.loads(raw)
-    assert data["scenes"][0]["status"] == "provider_rank_fallback"
+    assert data["scenes"][0]["status"] == "ranking_unavailable"
+    assert data["scenes"][0]["selected_candidate_id"] is None
     assert data["scenes"][0]["fallback_reason"] == "ranking_not_configured"
     assert data["scenes"][1]["status"] == "hold_no_search"
     assert data["scenes"][2]["status"] == "no_candidates"
@@ -653,6 +655,116 @@ def test_mixed_safety_and_all_tie_breaks():
     assert scene["selected_candidate_id"] == "pexels:b"
 
 
+def test_low_relevance_and_high_mismatch_fail_closed():
+    candidates = [
+        {
+            "candidate_id": "pexels:low",
+            "provider_rank": 1,
+            "manifest_position": 0,
+            "local_order": None,
+            "preview_sha256": "a" * 64,
+            "_source": {
+                "candidate_id": "pexels:low",
+                "provider": "pexels",
+                "provider_video_id": "low",
+                "provider_page_url": None,
+                "video_url": "https://example.invalid/low.mp4",
+                "provider_rank": 1,
+            },
+        },
+        {
+            "candidate_id": "pexels:mismatch",
+            "provider_rank": 2,
+            "manifest_position": 1,
+            "local_order": None,
+            "preview_sha256": "b" * 64,
+            "_source": {
+                "candidate_id": "pexels:mismatch",
+                "provider": "pexels",
+                "provider_video_id": "mismatch",
+                "provider_page_url": None,
+                "video_url": "https://example.invalid/mismatch.mp4",
+                "provider_rank": 2,
+            },
+        },
+    ]
+    scene = {"candidates": candidates, "selected_candidate": None, "warnings": []}
+    scene_selection._apply_ranking(
+        scene,
+        {
+            "assessments": [
+                {
+                    "label": "C01",
+                    "relevance": 59,
+                    "visual_quality": 100,
+                    "mismatch": 0,
+                    "unsafe": False,
+                },
+                {
+                    "label": "C02",
+                    "relevance": 100,
+                    "visual_quality": 100,
+                    "mismatch": 41,
+                    "unsafe": False,
+                },
+            ]
+        },
+    )
+    assert scene["status"] == "no_acceptable_candidate"
+    assert scene["selected_candidate_id"] is None
+
+
+def test_nonconsecutive_duplicate_is_replaced_but_adjacent_reuse_is_allowed():
+    def ranked(index, identities, selected=0):
+        rows = []
+        for order, identity in enumerate(identities, 1):
+            source = {
+                "candidate_id": f"pexels:{identity}",
+                "provider": "pexels",
+                "provider_video_id": identity,
+                "provider_page_url": None,
+                "video_url": f"https://example.invalid/{identity}.mp4",
+                "provider_rank": order,
+            }
+            rows.append(
+                {
+                    "candidate_id": source["candidate_id"],
+                    "provider_rank": order,
+                    "manifest_position": order - 1,
+                    "local_order": order,
+                    "preview_sha256": f"{index + order:064x}",
+                    "_source": source,
+                    "assessment": {},
+                    "score_basis_points": 9000,
+                    "safety_excluded": False,
+                }
+            )
+        source = rows[selected]["_source"]
+        return {
+            "scene_index": index,
+            "status": "vlm_selected",
+            "warnings": [],
+            "visual_safety_evaluated": True,
+            "fallback_reason": None,
+            "selected_candidate_id": source["candidate_id"],
+            "selected_candidate": dict(source),
+            "selected_preview_sha256": rows[selected]["preview_sha256"],
+            "candidates": rows,
+        }
+
+    scenes = [
+        ranked(1, ["shared"]),
+        ranked(2, ["middle"]),
+        ranked(3, ["shared", "alternate"]),
+    ]
+    scene_selection._suppress_nonconsecutive_duplicates(scenes)
+    assert scenes[2]["selected_candidate_id"] == "pexels:alternate"
+
+    adjacent = [ranked(1, ["shared"]), ranked(2, ["shared"])]
+    scene_selection._suppress_nonconsecutive_duplicates(adjacent)
+    assert adjacent[1]["selected_candidate_id"] == "pexels:shared"
+
+
 def test_missing_key_cache_miss_falls_back_without_request(artifacts):
     candidates, previews, objects, _, _ = artifacts
     with (
@@ -668,7 +780,8 @@ def test_missing_key_cache_miss_falls_back_without_request(artifacts):
             str(candidates), str(previews), ranking_config=_ranking_config("")
         )
     data = json.loads(Path(target).read_text(encoding="utf-8"))
-    assert data["scenes"][0]["status"] == "provider_rank_fallback"
+    assert data["scenes"][0]["status"] == "ranking_unavailable"
+    assert data["scenes"][0]["selected_candidate_id"] is None
     assert data["scenes"][0]["fallback_reason"] == "ranking_not_configured"
     assert data["usage"]["vlm_requests_started"] == 0
     request.assert_not_called()

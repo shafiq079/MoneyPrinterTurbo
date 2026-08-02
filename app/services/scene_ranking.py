@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import math
+import copy
 import re
 import time
 from dataclasses import dataclass
@@ -35,6 +36,15 @@ STREAM = False
 PROFILES = ((1200, 960, 72), (1000, 800, 68), (800, 640, 58), (600, 480, 45))
 RETRYABLE = {408, 429, 500, 502, 503, 504}
 _RETRY_AFTER = re.compile(r"^[0-9]{1,3}$")
+DIAGNOSTIC_REASONS = frozenset(
+    {
+        "vlm_response_too_large",
+        "vlm_envelope_invalid",
+        "vlm_finish_reason_invalid",
+        "vlm_content_invalid",
+        "vlm_schema_invalid",
+    }
+)
 
 
 class RankingError(Exception):
@@ -121,6 +131,9 @@ def _request(model: str, prompt: str, jpeg: bytes) -> dict:
         "seed": SEED,
         "max_tokens": MAX_TOKENS,
         "stream": STREAM,
+        # NVIDIA's OpenAI-compatible endpoint supports JSON-object mode for
+        # hosted chat models. Strict application validation still follows.
+        "response_format": {"type": "json_object"},
     }
 
 
@@ -315,10 +328,12 @@ def parse_content(
         type(content) is not str
         or not content
         or len(content.encode("utf-8")) > MAX_CONTENT_BYTES
-        or content != content.strip()
-        or content.startswith("```")
     ):
         raise ValueError("invalid response content")
+    content = content.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*\n?(\{.*\})\s*```", content, re.DOTALL)
+    if fenced:
+        content = fenced.group(1)
     payload = json.loads(
         content,
         object_pairs_hook=_no_duplicates,
@@ -333,7 +348,7 @@ def _read_response(response) -> bytes:
         if chunk:
             body.extend(chunk)
             if len(body) > MAX_RESPONSE_BYTES:
-                raise RankingError("vlm_response_invalid")
+                raise RankingError("vlm_response_too_large")
     return bytes(body)
 
 
@@ -352,6 +367,7 @@ def request_remote(
     client = requests.Session() if owned else session
     attempts = 0
     try:
+        corrective_used = False
         for attempt in range(config.max_attempts_per_scene):
             remaining = deadline - monotonic()
             if remaining <= 0:
@@ -359,13 +375,29 @@ def request_remote(
             response = None
             try:
                 attempts += 1
+                request = prepared.request
+                if corrective_used:
+                    request = copy.deepcopy(prepared.request)
+                    request["messages"].append(
+                        {
+                            "role": "user",
+                            "content": "Return only the requested JSON object with exactly the specified fields and labels.",
+                        }
+                    )
+                request_bytes = json.dumps(
+                    request, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+                ).encode("utf-8")
+                if len(request_bytes) > MAX_REQUEST_BYTES:
+                    raise RankingError(
+                        "ranking_derivative_too_large", attempts=attempts
+                    )
                 response = client.post(
                     ENDPOINT,
                     headers={
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                     },
-                    data=prepared.request_bytes,
+                    data=request_bytes,
                     stream=True,
                     timeout=(
                         min(config.connect_timeout_seconds, remaining),
@@ -374,39 +406,58 @@ def request_remote(
                 )
                 body = _read_response(response)
                 if response.status_code != 200:
-                    raise RankingError(
-                        "vlm_request_failed", response.status_code in RETRYABLE
+                    reason = (
+                        "vlm_rate_limited"
+                        if response.status_code == 429
+                        else "vlm_request_failed"
                     )
-                envelope = json.loads(
-                    body.decode("utf-8"),
-                    object_pairs_hook=_no_duplicates,
-                    parse_constant=lambda value: (_ for _ in ()).throw(
-                        ValueError(value)
-                    ),
-                )
+                    raise RankingError(reason, response.status_code in RETRYABLE)
+                try:
+                    envelope = json.loads(
+                        body.decode("utf-8"),
+                        object_pairs_hook=_no_duplicates,
+                        parse_constant=lambda value: (_ for _ in ()).throw(
+                            ValueError(value)
+                        ),
+                    )
+                except (
+                    UnicodeError,
+                    ValueError,
+                    TypeError,
+                    json.JSONDecodeError,
+                ) as exc:
+                    raise RankingError(
+                        "vlm_envelope_invalid", attempts=attempts
+                    ) from exc
                 choices = envelope.get("choices") if type(envelope) is dict else None
                 if (
                     type(choices) is not list
                     or not choices
                     or type(choices[0]) is not dict
-                    or choices[0].get("finish_reason") != "stop"
                     or type(choices[0].get("message")) is not dict
                 ):
-                    raise RankingError("vlm_response_invalid")
-                return parse_content(
-                    choices[0]["message"].get("content"), scene_index, prepared.labels
-                ), attempts
+                    raise RankingError("vlm_envelope_invalid", attempts=attempts)
+                if choices[0].get("finish_reason") != "stop":
+                    raise RankingError("vlm_finish_reason_invalid", attempts=attempts)
+                try:
+                    return parse_content(
+                        choices[0]["message"].get("content"),
+                        scene_index,
+                        prepared.labels,
+                    ), attempts
+                except json.JSONDecodeError as exc:
+                    error = RankingError("vlm_content_invalid", attempts=attempts)
+                    error.__cause__ = exc
+                except (ValueError, KeyError, TypeError) as exc:
+                    error = RankingError("vlm_schema_invalid", attempts=attempts)
+                    error.__cause__ = exc
+                if not corrective_used and attempt + 1 < config.max_attempts_per_scene:
+                    corrective_used = True
+                    continue
+                raise error
             except requests.RequestException as exc:
                 error = RankingError("vlm_request_failed", True, attempts)
                 error.__cause__ = exc
-            except (
-                UnicodeError,
-                ValueError,
-                KeyError,
-                TypeError,
-                json.JSONDecodeError,
-            ):
-                error = RankingError("vlm_response_invalid", attempts=attempts)
             except RankingError as exc:
                 error = exc
                 error.attempts = attempts

@@ -354,7 +354,9 @@ _SCENE_RANKING_DEFAULTS = {
     "provider": "nvidia_hosted",
     "api_key": "",
     "model": "nvidia/nemotron-nano-12b-v2-vl",
-    "max_remote_scene_requests_per_task": 12,
+    # A normal short-form task can contain 17 meaningful scenes.  This is a
+    # task-level cap, not the provider's requests-per-minute setting.
+    "max_remote_scene_requests_per_task": 20,
     "connect_timeout_seconds": 10,
     "read_timeout_seconds": 45,
     "total_deadline_seconds": 300,
@@ -369,6 +371,7 @@ _SCENE_RANKING_INTEGER_BOUNDS = {
 }
 _SCENE_RANKING_API_KEY_MAX_BYTES = 4096
 _SCENE_RANKING_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_SCENE_RANKING_MODEL = re.compile(r"^nvidia/[a-z0-9][a-z0-9._-]{0,127}$")
 
 
 def get_scene_ranking_config(environ=None) -> SceneRankingConfig:
@@ -383,7 +386,7 @@ def get_scene_ranking_config(environ=None) -> SceneRankingConfig:
             raise ValueError(f"scene_ranking.{name} must be a string")
     if values["provider"] != "nvidia_hosted":
         raise ValueError("unsupported scene ranking provider")
-    if values["model"] != "nvidia/nemotron-nano-12b-v2-vl":
+    if not _SCENE_RANKING_MODEL.fullmatch(values["model"]):
         raise ValueError("unsupported scene ranking model")
     for name, (minimum, maximum) in _SCENE_RANKING_INTEGER_BOUNDS.items():
         value = values[name]

@@ -22,6 +22,8 @@ from app.utils import utils
 MANIFEST_VERSION = 1
 SELECTION_POLICY_VERSION = "provider-rank-v1"
 RANKING_SELECTION_POLICY_VERSION = "nvidia-poster-rank-v1"
+MINIMUM_RELEVANCE = 60
+MAXIMUM_MISMATCH = 40
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 MAX_NORMALIZED_PREVIEW_OBJECT_BYTES = 4 * 1024 * 1024
 MAX_CANDIDATES_PER_SCENE = 12
@@ -71,9 +73,17 @@ WARNING_CODES = {
     "ranking_cache_corrupt",
     "vlm_request_failed",
     "vlm_response_invalid",
+    "vlm_response_too_large",
+    "vlm_envelope_invalid",
+    "vlm_finish_reason_invalid",
+    "vlm_content_invalid",
+    "vlm_schema_invalid",
+    "vlm_rate_limited",
     "ranking_not_configured",
     "ranking_budget_exhausted",
     "ranking_deadline_exhausted",
+    "no_acceptable_candidate",
+    "duplicate_candidate_unavailable",
     "additional_warnings_omitted",
 }
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -85,6 +95,8 @@ class SceneSelectionStatus(str, Enum):
     provider_rank_fallback = "provider_rank_fallback"
     vlm_selected = "vlm_selected"
     no_safe_candidate = "no_safe_candidate"
+    no_acceptable_candidate = "no_acceptable_candidate"
+    ranking_unavailable = "ranking_unavailable"
     hold_no_search = "hold_no_search"
     no_candidates = "no_candidates"
 
@@ -681,9 +693,12 @@ def _centered_allocation(count: int, budget: int) -> list[int]:
 
 
 def _fallback(scene: dict, reason: str) -> None:
-    scene["status"] = "provider_rank_fallback"
+    scene["status"] = "ranking_unavailable"
     scene["fallback_reason"] = reason[:64]
     scene["visual_safety_evaluated"] = False
+    scene["selected_candidate_id"] = None
+    scene["selected_candidate"] = None
+    scene["selected_preview_sha256"] = None
     scene["warnings"] = _warnings([*scene["warnings"], reason])
     for row in scene["candidates"]:
         row["assessment"] = None
@@ -694,6 +709,7 @@ def _fallback(scene: dict, reason: str) -> None:
 def _apply_ranking(scene: dict, response: dict) -> None:
     by_label = {item["label"]: item for item in response["assessments"]}
     safe_positions = []
+    acceptable_positions = []
     for position, row in enumerate(scene["candidates"]):
         item = by_label[f"C{position + 1:02d}"]
         assessment = {
@@ -712,6 +728,11 @@ def _apply_ranking(scene: dict, response: dict) -> None:
         row["local_order"] = None
         if not item["unsafe"]:
             safe_positions.append(position)
+            if (
+                item["relevance"] >= MINIMUM_RELEVANCE
+                and item["mismatch"] <= MAXIMUM_MISMATCH
+            ):
+                acceptable_positions.append(position)
     scene["visual_safety_evaluated"] = True
     scene["fallback_reason"] = None
     if not safe_positions:
@@ -720,8 +741,18 @@ def _apply_ranking(scene: dict, response: dict) -> None:
         scene["selected_candidate"] = None
         scene["selected_preview_sha256"] = None
         return
+    if not acceptable_positions:
+        scene["status"] = "no_acceptable_candidate"
+        scene["fallback_reason"] = "no_acceptable_candidate"
+        scene["selected_candidate_id"] = None
+        scene["selected_candidate"] = None
+        scene["selected_preview_sha256"] = None
+        scene["warnings"] = _warnings(
+            [*scene.get("warnings", []), "no_acceptable_candidate"]
+        )
+        return
     order = sorted(
-        safe_positions,
+        acceptable_positions,
         key=lambda position: (
             -scene["candidates"][position]["score_basis_points"],
             scene["candidates"][position]["provider_rank"],
@@ -751,6 +782,55 @@ def _apply_ranking(scene: dict, response: dict) -> None:
     scene["status"] = "vlm_selected"
     scene["selected_candidate_id"] = winner["candidate_id"]
     scene["selected_preview_sha256"] = winner["preview_sha256"]
+
+
+def _suppress_nonconsecutive_duplicates(scenes: list[dict]) -> None:
+    """Avoid repeating provider footage across nonadjacent meaningful scenes."""
+    last_selected_position: dict[tuple[str, str], int] = {}
+    meaningful_position = -1
+    for scene in scenes:
+        if scene["status"] == "hold_no_search":
+            continue
+        meaningful_position += 1
+        if scene["status"] != "vlm_selected":
+            continue
+        selected = scene["selected_candidate"]
+        identity = (selected["provider"], selected["provider_video_id"])
+        prior = last_selected_position.get(identity)
+        if prior is not None and prior != meaningful_position - 1:
+            alternatives = sorted(
+                (
+                    row
+                    for row in scene["candidates"]
+                    if row["local_order"] is not None
+                    and (
+                        row["_source"]["provider"],
+                        row["_source"]["provider_video_id"],
+                    )
+                    not in last_selected_position
+                ),
+                key=lambda row: row["local_order"],
+            )
+            if not alternatives:
+                _fallback(scene, "duplicate_candidate_unavailable")
+                continue
+            winner = alternatives[0]
+            source = winner["_source"]
+            scene["selected_candidate"] = {
+                key: source[key]
+                for key in (
+                    "candidate_id",
+                    "provider",
+                    "provider_video_id",
+                    "provider_page_url",
+                    "video_url",
+                    "provider_rank",
+                )
+            }
+            scene["selected_candidate_id"] = winner["candidate_id"]
+            scene["selected_preview_sha256"] = winner["preview_sha256"]
+            identity = (source["provider"], source["provider_video_id"])
+        last_selected_position[identity] = meaningful_position
 
 
 def create_scene_selections(
@@ -949,7 +1029,7 @@ def create_scene_selections(
                     ranking_scene,
                     [row["_preview_bytes"] for row in scene["candidates"]],
                     scene_ranking.PROVIDER,
-                    scene_ranking.MODEL,
+                    getattr(ranking_config, "model", scene_ranking.MODEL),
                     candidate_manifest["video_aspect"],
                 )
             except scene_ranking.RankingError as exc:
@@ -1018,6 +1098,8 @@ def create_scene_selections(
                 ranking_usage["vlm_attempts_started"] += exc.attempts
                 _fallback(scene, exc.reason)
 
+        _suppress_nonconsecutive_duplicates(scenes)
+
     for scene in scenes:
         for row in scene["candidates"]:
             row.pop("_preview_bytes", None)
@@ -1036,7 +1118,9 @@ def create_scene_selections(
         ),
         "ranking": {
             "provider": scene_ranking.PROVIDER if ranking_enabled else None,
-            "model": scene_ranking.MODEL if ranking_enabled else None,
+            "model": getattr(ranking_config, "model", scene_ranking.MODEL)
+            if ranking_enabled and ranking_config is not None
+            else (scene_ranking.MODEL if ranking_enabled else None),
             "prompt_version": scene_ranking.PROMPT_VERSION if ranking_enabled else None,
             "response_schema_version": scene_ranking.RESPONSE_SCHEMA_VERSION
             if ranking_enabled
@@ -1057,11 +1141,17 @@ def create_scene_selections(
             "provider_rank_fallback_scenes": sum(
                 scene["status"] == "provider_rank_fallback" for scene in scenes
             ),
+            "ranking_unavailable_scenes": sum(
+                scene["status"] == "ranking_unavailable" for scene in scenes
+            ),
             "vlm_selected_scenes": sum(
                 scene["status"] == "vlm_selected" for scene in scenes
             ),
             "no_safe_candidate_scenes": sum(
                 scene["status"] == "no_safe_candidate" for scene in scenes
+            ),
+            "no_acceptable_candidate_scenes": sum(
+                scene["status"] == "no_acceptable_candidate" for scene in scenes
             ),
             "hold_scenes": hold_count,
             "no_candidate_scenes": empty_count,
