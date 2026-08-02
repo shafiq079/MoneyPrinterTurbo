@@ -374,6 +374,17 @@ _SCENE_RANKING_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _SCENE_RANKING_MODEL = re.compile(r"^nvidia/[a-z0-9][a-z0-9._-]{0,127}$")
 
 
+def _validate_scene_ranking_api_key(value) -> str:
+    if (
+        type(value) is not str
+        or value != value.strip()
+        or len(value.encode("utf-8")) > _SCENE_RANKING_API_KEY_MAX_BYTES
+        or _SCENE_RANKING_CONTROL.search(value)
+    ):
+        raise ValueError("scene ranking API key is invalid")
+    return value
+
+
 def get_scene_ranking_config(environ=None) -> SceneRankingConfig:
     """Return a strictly validated, secret-bearing runtime snapshot."""
     values = {**_SCENE_RANKING_DEFAULTS, **dict(scene_ranking)}
@@ -392,13 +403,11 @@ def get_scene_ranking_config(environ=None) -> SceneRankingConfig:
         value = values[name]
         if type(value) is not int or not minimum <= value <= maximum:
             raise ValueError(f"scene_ranking.{name} is outside the supported range")
+    # Validate the persisted value even when an environment override is
+    # present. A valid machine secret must not mask malformed configuration.
+    configured_api_key = _validate_scene_ranking_api_key(values["api_key"])
     environment = os.environ if environ is None else environ
-    api_key = environment.get("NVIDIA_API_KEY", values["api_key"])
-    if (
-        type(api_key) is not str
-        or api_key != api_key.strip()
-        or len(api_key.encode("utf-8")) > _SCENE_RANKING_API_KEY_MAX_BYTES
-        or _SCENE_RANKING_CONTROL.search(api_key)
-    ):
-        raise ValueError("scene ranking API key is invalid")
+    api_key = _validate_scene_ranking_api_key(
+        environment.get("NVIDIA_API_KEY", configured_api_key)
+    )
     return SceneRankingConfig(**{**values, "api_key": api_key})

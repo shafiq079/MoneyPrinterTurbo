@@ -10,6 +10,13 @@ from PIL import Image
 from app.services import scene_selection
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_scene_ranking_config(monkeypatch):
+    """Keep provider-rank tests independent of developer config and secrets."""
+    monkeypatch.setattr(scene_selection.config, "scene_ranking", {"enabled": False})
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+
+
 def _candidate(identifier: str, rank: int) -> dict:
     return {
         "candidate_id": f"pexels:{identifier}",
@@ -562,6 +569,7 @@ def test_invalid_requested_config_skips_derivative_cache_and_network(
     artifacts, invalid_setting
 ):
     candidates, previews, objects, _, _ = artifacts
+    sleeper = MagicMock()
     with (
         patch.object(
             scene_selection.utils, "storage_dir", return_value=str(objects.parent)
@@ -573,9 +581,12 @@ def test_invalid_requested_config_skips_derivative_cache_and_network(
         ),
         patch.object(scene_selection.scene_ranking, "prepare") as prepare,
         patch.object(scene_selection.scene_ranking_cache, "load") as cache_load,
+        patch.object(scene_selection.scene_ranking_cache, "store") as cache_store,
         patch.object(scene_selection.scene_ranking, "request_remote") as request,
     ):
-        target = scene_selection.create_scene_selections(str(candidates), str(previews))
+        target = scene_selection.create_scene_selections(
+            str(candidates), str(previews), sleep=sleeper
+        )
     raw = Path(target).read_text(encoding="utf-8")
     data = json.loads(raw)
     assert data["scenes"][0]["status"] == "ranking_unavailable"
@@ -588,7 +599,9 @@ def test_invalid_requested_config_skips_derivative_cache_and_network(
     assert "malformed" not in raw
     prepare.assert_not_called()
     cache_load.assert_not_called()
+    cache_store.assert_not_called()
     request.assert_not_called()
+    sleeper.assert_not_called()
 
 
 def test_incomplete_preview_coverage_skips_cache_and_network(artifacts):

@@ -218,3 +218,27 @@ class TestConfigPersistence:
             pytest.raises(ValueError),
         ):
             config.get_scene_ranking_config({"NVIDIA_API_KEY": api_key})
+
+    @pytest.mark.parametrize("api_key", ["line\nbreak", "tab\tbreak", "nul\x00break"])
+    def test_malformed_configured_key_is_not_masked_by_valid_environment_key(
+        self, api_key
+    ):
+        with (
+            patch.object(
+                config,
+                "scene_ranking",
+                {"enabled": True, "api_key": api_key},
+            ),
+            pytest.raises(ValueError),
+        ):
+            config.get_scene_ranking_config({"NVIDIA_API_KEY": "valid-env-key"})
+
+    def test_empty_configured_api_key_is_valid_and_environment_can_override_it(self):
+        with patch.object(config, "scene_ranking", {"enabled": True, "api_key": ""}):
+            assert config.get_scene_ranking_config({}).api_key == ""
+            assert (
+                config.get_scene_ranking_config(
+                    {"NVIDIA_API_KEY": "valid-environment-key"}
+                ).api_key
+                == "valid-environment-key"
+            )
