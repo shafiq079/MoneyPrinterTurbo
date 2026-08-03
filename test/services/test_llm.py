@@ -1,11 +1,13 @@
 import json
 import os
+import subprocess
 import sys
 import tempfile
-import time
+import threading
 import tomllib
 import types
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -25,41 +27,63 @@ from app.models.schema import VideoScriptRequest, VideoSocialMetadataRequest
 from app.services import llm
 
 
-def _ipc_child_payload(sock, batch_index, _subject, batch, _maximum):
-    requirements = {
-        "primary_entities": [{"canonical": "cacao", "aliases": ["cocoa"]}],
-        "actions": [],
-        "contexts": [],
-    }
-    payload = {
-        "version": 1,
-        "batch_index": batch_index,
-        "ok": True,
-        "retryable": False,
-        "diagnostic": "complete",
-        "plans": [
+class _SemanticProvider(BaseHTTPRequestHandler):
+    reached = 0
+
+    def do_POST(self):
+        type(self).reached += 1
+        length = int(self.headers.get("content-length", "0"))
+        request = json.loads(self.rfile.read(length))
+        prompt = request["messages"][0]["content"]
+        scenes = json.loads(prompt.split("Scenes: ", 1)[1])
+        plans = [
             {
-                "scene_index": scene.index,
+                "scene_index": scene["scene_index"],
                 "queries": ["cacao harvest"],
-                "requirements": requirements,
+                "requirements": {
+                    "primary_entities": [{"canonical": "cacao", "aliases": ["cocoa"]}],
+                    "actions": [],
+                    "contexts": [],
+                },
             }
-            for scene in batch
-        ],
+            for scene in scenes
+        ]
+        content = json.dumps({"scenes": plans})
+        response = json.dumps(
+            {
+                "id": "mock",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "mock-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": content},
+                    }
+                ],
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+
+    def log_message(self, *_args):
+        pass
+
+
+def _provider_snapshot(server):
+    return {
+        "provider_id": "openai",
+        "adapter": "openai_compatible",
+        "model": "mock-model",
+        "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+        "api_key": "semantic-test-secret",
+        "api_version": "",
+        "extras": {},
     }
-    data = json.dumps(payload, separators=(",", ":")).encode()
-    sock.sendall(llm._SEMANTIC_IPC_HEADER.pack(len(data)) + data)
-    sock.close()
-
-
-def _ipc_child_partial(sock, *_args):
-    sock.sendall(llm._SEMANTIC_IPC_HEADER.pack(100) + b"partial")
-    sock.close()
-
-
-def _ipc_child_reverse(sock, batch_index, *args):
-    if batch_index == 0:
-        time.sleep(0.1)
-    _ipc_child_payload(sock, batch_index, *args)
 
 
 def test_scene_query_plan_has_strict_typed_semantic_requirements():
@@ -88,36 +112,66 @@ def test_scene_query_plan_has_strict_typed_semantic_requirements():
     assert plans[1].requirements.primary_entities[0].aliases == ("cocoa",)
 
 
-def test_semantic_ipc_drains_results_and_preserves_batch_order():
-    scenes = [types.SimpleNamespace(index=index, text="scene") for index in range(1, 9)]
-    works = [(0, tuple(scenes[:4])), (1, tuple(scenes[4:]))]
-    results, unreaped = llm._run_semantic_phase(
-        works,
-        "subject",
-        3,
-        time.monotonic() + 5,
-        context=__import__("multiprocessing").get_context("spawn"),
-        child_target=_ipc_child_reverse,
-    )
-    assert not unreaped
-    ordered = [item for index, _ in works for item in results[index][0]]
-    assert [index for index, _ in ordered] == list(range(1, 9))
+def test_dedicated_worker_reaches_mock_provider_and_returns_complete_plan():
+    _SemanticProvider.reached = 0
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _SemanticProvider)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        scenes = [
+            types.SimpleNamespace(index=index, text="scene") for index in range(1, 9)
+        ]
+        result = llm.generate_scene_query_plan(
+            "subject", scenes, provider_snapshot=_provider_snapshot(server)
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert result.state is llm.SemanticPlanState.complete
+    assert [index for index, _ in result.plans] == list(range(1, 9))
+    assert _SemanticProvider.reached == 2
 
 
-def test_semantic_ipc_truncated_frame_fails_without_blocking_join():
-    scene = types.SimpleNamespace(index=1, text="scene")
-    started = time.monotonic()
-    results, unreaped = llm._run_semantic_phase(
-        [(0, (scene,))],
-        "subject",
-        3,
-        time.monotonic() + 5,
-        context=__import__("multiprocessing").get_context("spawn"),
-        child_target=_ipc_child_partial,
+def test_dedicated_worker_never_reimports_hostile_parent_main(tmp_path):
+    _SemanticProvider.reached = 0
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _SemanticProvider)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    marker = tmp_path / "imports.txt"
+    script = tmp_path / "hostile_parent.py"
+    script.write_text(
+        """
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from app.services import llm
+marker = Path(__file__).with_name("imports.txt")
+marker.write_text(marker.read_text() + "x" if marker.exists() else "x")
+snapshot = {snapshot}
+result = llm.generate_scene_query_plan("subject", [SimpleNamespace(index=1, text="scene")], provider_snapshot=snapshot)
+print(json.dumps({{"state": result.state.value, "count": len(result.plans)}}))
+""".format(snapshot=repr(_provider_snapshot(server))),
+        encoding="utf-8",
     )
-    assert time.monotonic() - started < 3
-    assert not unreaped
-    assert results[0][1] is llm.SemanticPlanDiagnostic.ipc_invalid
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=Path(__file__).parents[2],
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[2])},
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert marker.read_text() == "x"
+    assert json.loads(completed.stdout.strip()) == {"state": "complete", "count": 1}
+    assert "semantic-test-secret" not in completed.stderr
+    assert _SemanticProvider.reached == 1
 
 
 def test_semantic_ipc_rejects_message_above_bound_without_deadlock():
@@ -131,6 +185,19 @@ def test_semantic_ipc_rejects_message_above_bound_without_deadlock():
     assert plans is None
     assert diagnostic is llm.SemanticPlanDiagnostic.ipc_invalid
     assert not retryable
+
+
+def test_semantic_worker_environment_excludes_parent_secrets(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "environment-secret")
+    monkeypatch.setenv("HTTPS_PROXY", "https://proxy-user:proxy-secret@example.test")
+    monkeypatch.setenv("AUTHORIZATION", "Bearer environment-secret")
+    environment = llm._minimal_worker_environment()
+    serialized = json.dumps(environment)
+    assert "environment-secret" not in serialized
+    assert "proxy-secret" not in serialized
+    assert "OPENAI_API_KEY" not in environment
+    assert "HTTPS_PROXY" not in environment
+    assert "AUTHORIZATION" not in environment
 
 
 RUN_INTEGRATION_TESTS = os.environ.get("MPT_RUN_INTEGRATION_TESTS", "").lower() in {

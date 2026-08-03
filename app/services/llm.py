@@ -1,15 +1,20 @@
 import json
 import logging
-import multiprocessing
+import os
 import re
 import selectors
+import signal
 import socket
 import struct
+import subprocess
+import sys
 import time
 import unicodedata
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from time import perf_counter
+from types import SimpleNamespace
 from typing import List
 
 from loguru import logger
@@ -24,6 +29,7 @@ SEMANTIC_BATCH_SIZE = 4
 MAX_SEMANTIC_SCENES = 40
 MAX_SEMANTIC_RESPONSE_BYTES = 256 * 1024
 MAX_SEMANTIC_IPC_BYTES = 12 * 1024
+MAX_SEMANTIC_REQUEST_BYTES = 64 * 1024
 SEMANTIC_ATTEMPT_SECONDS = 45
 SEMANTIC_TASK_SECONDS = 240
 SEMANTIC_CONCURRENCY = 2
@@ -944,16 +950,165 @@ def _plan_to_payload(index, plan):
     }
 
 
-def _semantic_attempt_child(
-    sock, batch_index, video_subject, batch, max_queries_per_scene
-):
-    try:
-        response = _generate_response(
-            _scene_query_prompt(video_subject, batch, max_queries_per_scene),
-            _raise_typed=True,
+def _semantic_provider_snapshot():
+    provider_id = str(config.app.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)).lower()
+    provider = get_llm_provider(provider_id)
+    if provider is None:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_failed, retryable=False
         )
-        plans = _parse_scene_query_batch(response, batch, max_queries_per_scene)
-        payload = {
+    model = provider.resolve_model_name(
+        config.app.get(provider.config_key("model_name"), "")
+    )
+    base_url = provider.resolve_base_url(
+        config.app.get(provider.config_key("base_url"), "")
+    )
+    api_key = config.app.get(provider.config_key("api_key"), "")
+    extras = {
+        field.config_suffix: config.app.get(
+            provider.config_key(field.config_suffix), ""
+        )
+        or field.default_value
+        for field in provider.extra_fields
+    }
+    values = [provider_id, provider.adapter, model, base_url, api_key, *extras.values()]
+    if any(
+        not isinstance(value, str)
+        or len(value) > 4096
+        or re.search(r"[\x00-\x1f\x7f]", value)
+        for value in values
+    ):
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.invalid_input, retryable=False
+        )
+    if provider.requires_api_key and not api_key:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_failed, retryable=False
+        )
+    return {
+        "provider_id": provider_id,
+        "adapter": provider.adapter,
+        "model": model,
+        "base_url": base_url,
+        "api_key": api_key,
+        "api_version": str(
+            config.app.get(provider.config_key("api_version"), "2024-02-15-preview")
+        ),
+        "extras": extras,
+    }
+
+
+def _semantic_generate_from_snapshot(snapshot, prompt):
+    """One semantic-only request using only the validated private snapshot."""
+    if not isinstance(snapshot, dict) or set(snapshot) != {
+        "provider_id",
+        "adapter",
+        "model",
+        "base_url",
+        "api_key",
+        "api_version",
+        "extras",
+    }:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.invalid_input, retryable=False
+        )
+    adapter = snapshot["adapter"]
+    if adapter not in {
+        "openai_compatible",
+        "cloudflare_ai_gateway",
+        "azure",
+        "modelscope",
+    }:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_failed, retryable=False
+        )
+    client = None
+    try:
+        if adapter == "azure":
+            client = AzureOpenAI(
+                api_key=snapshot["api_key"],
+                api_version=snapshot["api_version"],
+                azure_endpoint=snapshot["base_url"],
+                timeout=40,
+                max_retries=0,
+            )
+        else:
+            base_url = snapshot["base_url"]
+            headers = None
+            if adapter == "cloudflare_ai_gateway":
+                account = snapshot["extras"].get("account_id", "")
+                gateway = snapshot["extras"].get("gateway_id", "")
+                base_url = (
+                    f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1"
+                )
+                headers = {"cf-aig-gateway-id": gateway}
+            client = OpenAI(
+                api_key=snapshot["api_key"],
+                base_url=base_url,
+                default_headers=headers,
+                timeout=40,
+                max_retries=0,
+            )
+        kwargs = {
+            "model": snapshot["model"],
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if adapter == "modelscope":
+            kwargs["extra_body"] = {"enable_thinking": False}
+        response = client.chat.completions.create(**kwargs)
+        return _extract_chat_completion_text(response, snapshot["provider_id"])
+    except SemanticRequestFailure:
+        raise
+    except Exception as exc:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_failed, retryable=True
+        ) from exc
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _semantic_worker_payload(request):
+    try:
+        if (
+            not isinstance(request, dict)
+            or set(request)
+            != {
+                "version",
+                "batch_index",
+                "video_subject",
+                "scenes",
+                "max_queries_per_scene",
+                "provider",
+            }
+            or request["version"] != 1
+        ):
+            raise SemanticRequestFailure(
+                SemanticPlanDiagnostic.invalid_input, retryable=False
+            )
+        batch_index = request["batch_index"]
+        scenes = request["scenes"]
+        if (
+            type(batch_index) is not int
+            or not isinstance(scenes, list)
+            or not 1 <= len(scenes) <= SEMANTIC_BATCH_SIZE
+        ):
+            raise SemanticRequestFailure(
+                SemanticPlanDiagnostic.invalid_input, retryable=False
+            )
+        batch = tuple(
+            SimpleNamespace(index=item["index"], text=item["text"]) for item in scenes
+        )
+        response = _semantic_generate_from_snapshot(
+            request["provider"],
+            _scene_query_prompt(
+                request["video_subject"], batch, request["max_queries_per_scene"]
+            ),
+        )
+        plans = _parse_scene_query_batch(
+            response, batch, request["max_queries_per_scene"]
+        )
+        return {
             "version": 1,
             "batch_index": batch_index,
             "ok": True,
@@ -962,30 +1117,59 @@ def _semantic_attempt_child(
             "plans": [_plan_to_payload(index, plan) for index, plan in plans],
         }
     except SemanticRequestFailure as exc:
-        payload = {
+        return {
             "version": 1,
-            "batch_index": batch_index,
+            "batch_index": request.get("batch_index", -1)
+            if isinstance(request, dict)
+            else -1,
             "ok": False,
             "retryable": exc.retryable,
             "diagnostic": exc.code.value,
             "plans": [],
         }
     except Exception:
-        payload = {
+        return {
             "version": 1,
-            "batch_index": batch_index,
+            "batch_index": request.get("batch_index", -1)
+            if isinstance(request, dict)
+            else -1,
             "ok": False,
             "retryable": False,
-            "diagnostic": SemanticPlanDiagnostic.provider_failed.value,
+            "diagnostic": SemanticPlanDiagnostic.invalid_input.value,
             "plans": [],
         }
+
+
+def _recv_worker_request(sock):
+    header = bytearray()
+    while len(header) < 4:
+        chunk = sock.recv(4 - len(header))
+        if not chunk:
+            raise ValueError("truncated request header")
+        header.extend(chunk)
+    length = _SEMANTIC_IPC_HEADER.unpack(header)[0]
+    if length > MAX_SEMANTIC_REQUEST_BYTES:
+        raise ValueError("request too large")
+    body = bytearray()
+    while len(body) < length:
+        chunk = sock.recv(min(4096, length - len(body)))
+        if not chunk:
+            raise ValueError("truncated request body")
+        body.extend(chunk)
+    return json.loads(body, object_pairs_hook=_query_no_duplicates)
+
+
+def run_scene_query_worker(sock):
+    """Import-safe worker entry used only by ``python -m``."""
     try:
+        request = _recv_worker_request(sock)
+        payload = _semantic_worker_payload(request)
         data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
         if len(data) > MAX_SEMANTIC_IPC_BYTES:
             data = json.dumps(
                 {
                     "version": 1,
-                    "batch_index": batch_index,
+                    "batch_index": request.get("batch_index", -1),
                     "ok": False,
                     "retryable": False,
                     "diagnostic": SemanticPlanDiagnostic.ipc_too_large.value,
@@ -1030,19 +1214,53 @@ def _decode_semantic_ipc(data, batch_index, batch, max_queries_per_scene):
         return None, SemanticPlanDiagnostic.ipc_invalid, False
 
 
+def _minimal_worker_environment():
+    allowed = (
+        "PATH",
+        "PYTHONPATH",
+        "LD_LIBRARY_PATH",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+    )
+    result = {key: os.environ[key] for key in allowed if key in os.environ}
+    result.update({"PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"})
+    return result
+
+
+def _worker_request(batch_index, video_subject, batch, max_queries_per_scene, provider):
+    payload = {
+        "version": 1,
+        "batch_index": batch_index,
+        "video_subject": video_subject,
+        "scenes": [{"index": scene.index, "text": scene.text} for scene in batch],
+        "max_queries_per_scene": max_queries_per_scene,
+        "provider": provider,
+    }
+    data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+    if len(data) > MAX_SEMANTIC_REQUEST_BYTES:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.invalid_input, retryable=False
+        )
+    return _SEMANTIC_IPC_HEADER.pack(len(data)) + data
+
+
 def _run_semantic_phase(
     works,
     video_subject,
     max_queries_per_scene,
     deadline,
     *,
-    context,
-    child_target=_semantic_attempt_child,
+    provider_snapshot=None,
+    popen=subprocess.Popen,
 ):
     pending = list(works)
+    work_map = dict(works)
     active, results = {}, {}
     selector = selectors.DefaultSelector()
     unreaped = False
+    provider_snapshot = provider_snapshot or _semantic_provider_snapshot()
+    root = str(Path(__file__).resolve().parents[2])
 
     def cleanup(record, timed_out=False):
         nonlocal unreaped
@@ -1052,16 +1270,23 @@ def _run_semantic_phase(
         except Exception:
             pass
         sock.close()
-        if timed_out and process.is_alive():
-            process.terminate()
-        process.join(timeout=1)
-        if process.is_alive():
-            process.kill()
-            process.join(timeout=1)
-        if process.is_alive():
-            unreaped = True
-            return SemanticPlanDiagnostic.worker_unreaped
-        process.close()
+        if timed_out and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                unreaped = True
+                return SemanticPlanDiagnostic.worker_unreaped
         return SemanticPlanDiagnostic.worker_terminated if timed_out else None
 
     try:
@@ -1071,26 +1296,38 @@ def _run_semantic_phase(
                 and len(active) < SEMANTIC_CONCURRENCY
                 and time.monotonic() < deadline
             ):
-                batch_index, batch = pending.pop(0)
+                index, batch = pending.pop(0)
                 parent, child = socket.socketpair()
                 parent.setblocking(False)
-                process = context.Process(
-                    target=child_target,
-                    args=(
-                        child,
-                        batch_index,
+                child.set_inheritable(True)
+                try:
+                    process = popen(
+                        [
+                            sys.executable,
+                            "-m",
+                            "app.services.scene_query_worker",
+                            str(child.fileno()),
+                        ],
+                        cwd=root,
+                        env=_minimal_worker_environment(),
+                        pass_fds=(child.fileno(),),
+                        close_fds=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    outbound = _worker_request(
+                        index,
                         video_subject,
                         batch,
                         max_queries_per_scene,
-                    ),
-                    daemon=True,
-                )
-                try:
-                    process.start()
+                        provider_snapshot,
+                    )
                 except Exception:
                     parent.close()
                     child.close()
-                    results[batch_index] = (
+                    results[index] = (
                         None,
                         SemanticPlanDiagnostic.worker_start_failed,
                         False,
@@ -1101,72 +1338,101 @@ def _run_semantic_phase(
                 record = {
                     "sock": parent,
                     "process": process,
+                    "outbound": outbound,
+                    "sent": 0,
                     "buffer": bytearray(),
                     "length": None,
                     "deadline": min(
                         deadline, time.monotonic() + SEMANTIC_ATTEMPT_SECONDS
                     ),
                 }
-                active[batch_index] = record
-                selector.register(parent, selectors.EVENT_READ, batch_index)
+                active[index] = record
+                selector.register(
+                    parent, selectors.EVENT_READ | selectors.EVENT_WRITE, index
+                )
             if not active:
                 break
-            now = time.monotonic()
-            nearest = min(r["deadline"] for r in active.values())
-            events = selector.select(max(0, min(0.05, nearest - now)))
-            for key, _ in events:
+            nearest = min(record["deadline"] for record in active.values())
+            events = selector.select(max(0, min(0.05, nearest - time.monotonic())))
+            for key, mask in events:
                 index = key.data
                 record = active.get(index)
                 if record is None:
                     continue
-                try:
-                    chunk = record["sock"].recv(4096)
-                except BlockingIOError:
-                    continue
-                except OSError:
-                    chunk = b""
-                if chunk:
-                    record["buffer"].extend(chunk)
-                    if (
-                        record["length"] is None
-                        and len(record["buffer"]) >= _SEMANTIC_IPC_HEADER.size
-                    ):
-                        record["length"] = _SEMANTIC_IPC_HEADER.unpack(
-                            record["buffer"][:4]
-                        )[0]
-                        if record["length"] > MAX_SEMANTIC_IPC_BYTES:
-                            record["length"] = -1
-                    length = record["length"]
-                    if length == -1 or (
-                        length is not None and len(record["buffer"]) >= 4 + length
-                    ):
-                        if length == -1 or len(record["buffer"]) != 4 + length:
-                            value = (
-                                None,
-                                SemanticPlanDiagnostic.ipc_too_large
-                                if length == -1
-                                else SemanticPlanDiagnostic.ipc_invalid,
-                                False,
-                                False,
-                            )
-                        else:
-                            value = (
-                                *_decode_semantic_ipc(
-                                    bytes(record["buffer"][4:]),
-                                    index,
-                                    dict(works)[index],
-                                    max_queries_per_scene,
-                                ),
-                                False,
-                            )
+                sock = record["sock"]
+                if mask & selectors.EVENT_WRITE and record["sent"] < len(
+                    record["outbound"]
+                ):
+                    try:
+                        count = sock.send(record["outbound"][record["sent"] :])
+                        record["sent"] += count
+                        if record["sent"] == len(record["outbound"]):
+                            sock.shutdown(socket.SHUT_WR)
+                            selector.modify(sock, selectors.EVENT_READ, index)
+                    except (BlockingIOError, InterruptedError):
+                        pass
+                    except OSError:
                         cleanup(record)
                         active.pop(index)
-                        results[index] = value
-                else:
-                    value = (None, SemanticPlanDiagnostic.ipc_invalid, False, False)
-                    cleanup(record)
-                    active.pop(index)
-                    results[index] = value
+                        results[index] = (
+                            None,
+                            SemanticPlanDiagnostic.ipc_invalid,
+                            False,
+                            False,
+                        )
+                        continue
+                if mask & selectors.EVENT_READ and index in active:
+                    try:
+                        chunk = sock.recv(4096)
+                    except (BlockingIOError, InterruptedError):
+                        continue
+                    except OSError:
+                        chunk = b""
+                    if chunk:
+                        record["buffer"].extend(chunk)
+                        if record["length"] is None and len(record["buffer"]) >= 4:
+                            record["length"] = _SEMANTIC_IPC_HEADER.unpack(
+                                record["buffer"][:4]
+                            )[0]
+                            if record["length"] > MAX_SEMANTIC_IPC_BYTES:
+                                record["length"] = -1
+                        length = record["length"]
+                        if length == -1 or (
+                            length is not None and len(record["buffer"]) >= 4 + length
+                        ):
+                            valid = length != -1 and len(record["buffer"]) == 4 + length
+                            value = (
+                                (
+                                    *_decode_semantic_ipc(
+                                        bytes(record["buffer"][4:]),
+                                        index,
+                                        work_map[index],
+                                        max_queries_per_scene,
+                                    ),
+                                    False,
+                                )
+                                if valid
+                                else (
+                                    None,
+                                    SemanticPlanDiagnostic.ipc_too_large
+                                    if length == -1
+                                    else SemanticPlanDiagnostic.ipc_invalid,
+                                    False,
+                                    False,
+                                )
+                            )
+                            cleanup(record)
+                            active.pop(index)
+                            results[index] = value
+                    else:
+                        cleanup(record)
+                        active.pop(index)
+                        results[index] = (
+                            None,
+                            SemanticPlanDiagnostic.ipc_invalid,
+                            False,
+                            False,
+                        )
             now = time.monotonic()
             for index, record in list(active.items()):
                 if now >= record["deadline"]:
@@ -1181,7 +1447,7 @@ def _run_semantic_phase(
             if unreaped:
                 pending.clear()
                 break
-        for index, batch in pending:
+        for index, _batch in pending:
             results[index] = (
                 None,
                 SemanticPlanDiagnostic.task_deadline_exhausted,
@@ -1190,14 +1456,13 @@ def _run_semantic_phase(
             )
     finally:
         for index, record in list(active.items()):
-            diagnostic = cleanup(record, timed_out=True)
-            results[index] = (None, diagnostic, False, True)
+            results[index] = (None, cleanup(record, timed_out=True), False, True)
         selector.close()
     return results, unreaped
 
 
 def generate_scene_query_plan(
-    video_subject, scenes, max_queries_per_scene=3, *, process_context=None
+    video_subject, scenes, max_queries_per_scene=3, *, provider_snapshot=None
 ):
     meaningful = [scene for scene in scenes if scene.text.strip()]
     if not meaningful:
@@ -1219,10 +1484,13 @@ def generate_scene_query_plan(
         (i, tuple(meaningful[p : p + SEMANTIC_BATCH_SIZE]))
         for i, p in enumerate(range(0, len(meaningful), SEMANTIC_BATCH_SIZE))
     ]
-    context = process_context or multiprocessing.get_context("spawn")
     deadline = time.monotonic() + SEMANTIC_TASK_SECONDS
     first, unreaped = _run_semantic_phase(
-        batches, video_subject, max_queries_per_scene, deadline, context=context
+        batches,
+        video_subject,
+        max_queries_per_scene,
+        deadline,
+        provider_snapshot=provider_snapshot,
     )
     attempts = len(first)
     timed_out = sum(int(value[3]) for value in first.values())
@@ -1244,7 +1512,11 @@ def generate_scene_query_plan(
     second = {}
     if retry and time.monotonic() < deadline:
         second, unreaped = _run_semantic_phase(
-            retry, video_subject, max_queries_per_scene, deadline, context=context
+            retry,
+            video_subject,
+            max_queries_per_scene,
+            deadline,
+            provider_snapshot=provider_snapshot,
         )
         attempts += len(second)
         timed_out += sum(int(value[3]) for value in second.values())
