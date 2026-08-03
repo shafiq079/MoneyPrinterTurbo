@@ -1363,6 +1363,7 @@ def _run_pipeline(
     scene_render_plan_path = ""
     scene_render_materials_path = ""
     scene_render_context = None
+    scene_planning_state = None
     scene_pipeline_supported = params.video_source in scene_candidate.SUPPORTED_SOURCES
     scene_renderer_eligible = scene_pipeline_supported
     scene_timeline_duration = audio_duration
@@ -1407,7 +1408,7 @@ def _run_pipeline(
                     scene_timeline.NarrationScene.model_validate(item)
                     for item in timeline_data
                 ]
-                scene_candidates_path = scene_candidate.retrieve_scene_candidates(
+                candidate_result = scene_candidate.retrieve_scene_candidates_result(
                     task_dir=utils.task_dir(task_id),
                     video_subject=params.video_subject,
                     scenes=scenes,
@@ -1418,7 +1419,15 @@ def _run_pipeline(
                         config.scene_ranking.get("enabled") is True
                     ),
                 )
+                scene_candidates_path = candidate_result.artifact_path
+                scene_planning_state = candidate_result.planning_state
                 if scene_candidates_path and os.path.isfile(scene_candidates_path):
+                    if scene_planning_state in {
+                        scene_candidate.SceneCandidatePlanningState.semantic_plan_unavailable,
+                        scene_candidate.SceneCandidatePlanningState.complete_no_eligible_results,
+                    }:
+                        scene_renderer_eligible = False
+                        raise scene_candidate.SemanticScenePlanningUnavailable
                     try:
                         scene_previews_path = scene_preview.prepare_scene_previews(
                             scene_candidates_path
@@ -1474,6 +1483,11 @@ def _run_pipeline(
                             "scene preview preparation failed; continuing with the "
                             f"existing material path: {type(exc).__name__}"
                         )
+            except scene_candidate.SemanticScenePlanningUnavailable:
+                logger.warning(
+                    "scene semantic planning unavailable; using whole-output "
+                    "legacy materials"
+                )
             except Exception as exc:
                 logger.warning(
                     "scene candidate preparation failed; continuing with the "
@@ -1567,9 +1581,12 @@ def _run_pipeline(
                     f"{type(exc).__name__}"
                 )
         else:
-            downloaded_videos = get_video_materials(
-                task_id, params, video_terms, audio_duration
-            )
+            try:
+                downloaded_videos = legacy_loader.acquire(
+                    "scene renderer is unavailable"
+                )
+            except LazyLegacyMaterialAcquisitionError as exc:
+                return _mark_task_failed(task_id, "materials", str(exc))
             if not downloaded_videos:
                 return _mark_task_failed(
                     task_id,

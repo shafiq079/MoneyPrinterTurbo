@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import tomllib
 import types
 import unittest
@@ -22,6 +23,43 @@ from app.models.llm_provider import (
 )
 from app.models.schema import VideoScriptRequest, VideoSocialMetadataRequest
 from app.services import llm
+
+
+def _ipc_child_payload(sock, batch_index, _subject, batch, _maximum):
+    requirements = {
+        "primary_entities": [{"canonical": "cacao", "aliases": ["cocoa"]}],
+        "actions": [],
+        "contexts": [],
+    }
+    payload = {
+        "version": 1,
+        "batch_index": batch_index,
+        "ok": True,
+        "retryable": False,
+        "diagnostic": "complete",
+        "plans": [
+            {
+                "scene_index": scene.index,
+                "queries": ["cacao harvest"],
+                "requirements": requirements,
+            }
+            for scene in batch
+        ],
+    }
+    data = json.dumps(payload, separators=(",", ":")).encode()
+    sock.sendall(llm._SEMANTIC_IPC_HEADER.pack(len(data)) + data)
+    sock.close()
+
+
+def _ipc_child_partial(sock, *_args):
+    sock.sendall(llm._SEMANTIC_IPC_HEADER.pack(100) + b"partial")
+    sock.close()
+
+
+def _ipc_child_reverse(sock, batch_index, *args):
+    if batch_index == 0:
+        time.sleep(0.1)
+    _ipc_child_payload(sock, batch_index, *args)
 
 
 def test_scene_query_plan_has_strict_typed_semantic_requirements():
@@ -48,6 +86,52 @@ def test_scene_query_plan_has_strict_typed_semantic_requirements():
     assert warning is None
     assert plans[1].queries == ("cacao beans drying in sun",)
     assert plans[1].requirements.primary_entities[0].aliases == ("cocoa",)
+
+
+def test_semantic_ipc_drains_results_and_preserves_batch_order():
+    scenes = [types.SimpleNamespace(index=index, text="scene") for index in range(1, 9)]
+    works = [(0, tuple(scenes[:4])), (1, tuple(scenes[4:]))]
+    results, unreaped = llm._run_semantic_phase(
+        works,
+        "subject",
+        3,
+        time.monotonic() + 5,
+        context=__import__("multiprocessing").get_context("spawn"),
+        child_target=_ipc_child_reverse,
+    )
+    assert not unreaped
+    ordered = [item for index, _ in works for item in results[index][0]]
+    assert [index for index, _ in ordered] == list(range(1, 9))
+
+
+def test_semantic_ipc_truncated_frame_fails_without_blocking_join():
+    scene = types.SimpleNamespace(index=1, text="scene")
+    started = time.monotonic()
+    results, unreaped = llm._run_semantic_phase(
+        [(0, (scene,))],
+        "subject",
+        3,
+        time.monotonic() + 5,
+        context=__import__("multiprocessing").get_context("spawn"),
+        child_target=_ipc_child_partial,
+    )
+    assert time.monotonic() - started < 3
+    assert not unreaped
+    assert results[0][1] is llm.SemanticPlanDiagnostic.ipc_invalid
+
+
+def test_semantic_ipc_rejects_message_above_bound_without_deadlock():
+    payload = b"x" * (llm.MAX_SEMANTIC_IPC_BYTES + 1)
+    scene = types.SimpleNamespace(index=1, text="scene")
+
+    def decode():
+        return llm._decode_semantic_ipc(payload, 0, (scene,), 3)
+
+    plans, diagnostic, retryable = decode()
+    assert plans is None
+    assert diagnostic is llm.SemanticPlanDiagnostic.ipc_invalid
+    assert not retryable
+
 
 RUN_INTEGRATION_TESTS = os.environ.get("MPT_RUN_INTEGRATION_TESTS", "").lower() in {
     "1",

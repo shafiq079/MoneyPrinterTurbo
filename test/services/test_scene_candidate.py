@@ -479,8 +479,16 @@ def test_semantic_filter_checks_full_results_before_diverse_cap(tmp_path):
     with (
         patch.object(
             scene_candidate.llm,
-            "generate_scene_queries",
-            return_value=({1: plan}, None),
+            "generate_scene_query_plan",
+            return_value=llm.SemanticPlanResult(
+                llm.SemanticPlanState.complete,
+                ((1, plan),),
+                llm.SemanticPlanDiagnostic.complete,
+                1,
+                1,
+                1,
+                0,
+            ),
         ),
         patch.object(
             scene_candidate.material_cache,
@@ -515,6 +523,49 @@ def test_semantic_filter_checks_full_results_before_diverse_cap(tmp_path):
     assert all(
         "coffee" not in item["provider_video_id"] for item in group["candidates"]
     )
+
+
+def test_unavailable_semantic_plan_prohibits_scene_provider_work(tmp_path):
+    scene = _scene(1, "A meaningful scene")
+    unavailable = llm.SemanticPlanResult(
+        llm.SemanticPlanState.unavailable,
+        (),
+        llm.SemanticPlanDiagnostic.provider_failed,
+        1,
+        1,
+        2,
+        1,
+    )
+    with (
+        patch.object(
+            scene_candidate.llm,
+            "generate_scene_query_plan",
+            return_value=unavailable,
+        ),
+        patch.object(
+            scene_candidate.material_cache,
+            "load_material_candidate_search_cache",
+        ) as cache,
+        patch.object(
+            scene_candidate.material, "search_video_candidates_with_cache"
+        ) as search,
+    ):
+        result = scene_candidate.retrieve_scene_candidates_result(
+            str(tmp_path),
+            "Subject",
+            [scene],
+            "pexels",
+            VideoAspect.portrait,
+            5,
+            semantic_filter_enabled=True,
+        )
+    assert (
+        result.planning_state
+        is scene_candidate.SceneCandidatePlanningState.semantic_plan_unavailable
+    )
+    assert result.scene_query_remote_searches_used == 0
+    cache.assert_not_called()
+    search.assert_not_called()
 
 
 def test_actions_cannot_replace_missing_primary_entity():

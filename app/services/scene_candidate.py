@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 import unicodedata
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
@@ -22,6 +23,26 @@ DEFAULT_PROVIDER_SEARCH_BUDGET = 40
 MAX_PROVIDER_SEARCH_BUDGET = 60
 MAX_PROVIDER_RESULTS_PER_QUERY = 50
 SUPPORTED_SOURCES = {"pexels", "pixabay"}
+
+
+class SceneCandidatePlanningState(str, Enum):
+    complete = "complete"
+    complete_no_eligible_results = "complete_no_eligible_results"
+    semantic_plan_unavailable = "semantic_plan_unavailable"
+    not_required = "not_required"
+
+
+@dataclass(frozen=True)
+class SceneCandidateRetrievalResult:
+    artifact_path: str
+    planning_state: SceneCandidatePlanningState
+    scene_query_remote_searches_used: int
+
+
+class SemanticScenePlanningUnavailable(Exception):
+    """Internal task-orchestration boundary; never serialized."""
+
+
 GENERIC_PRIMARY_TERMS = frozenset(
     "person people man woman child hand hands object item thing food bean beans seed seeds farm factory machine machinery liquid material process production worker footage video close up".split()
 )
@@ -237,7 +258,7 @@ def _manifest_requirements(requirements) -> SemanticRequirements | None:
     )
 
 
-def retrieve_scene_candidates(
+def retrieve_scene_candidates_result(
     task_dir: str,
     video_subject: str,
     scenes: list[NarrationScene],
@@ -248,15 +269,32 @@ def retrieve_scene_candidates(
     candidates_per_scene: int = DEFAULT_CANDIDATES_PER_SCENE,
     provider_search_budget: int = DEFAULT_PROVIDER_SEARCH_BUDGET,
     semantic_filter_enabled: bool = False,
-) -> str:
+) -> SceneCandidateRetrievalResult:
     if source not in SUPPORTED_SOURCES:
-        return ""
+        return SceneCandidateRetrievalResult(
+            "", SceneCandidatePlanningState.not_required, 0
+        )
     if not 1 <= candidates_per_scene <= MAX_CANDIDATES_PER_SCENE:
         raise ValueError("candidates_per_scene is outside the supported range")
     if not 0 <= provider_search_budget <= MAX_PROVIDER_SEARCH_BUDGET:
         raise ValueError("provider_search_budget is outside the supported range")
 
-    generated, generation_warning = llm.generate_scene_queries(video_subject, scenes)
+    semantic_state = SceneCandidatePlanningState.not_required
+    if semantic_filter_enabled:
+        plan_result = llm.generate_scene_query_plan(video_subject, scenes)
+        generated = dict(plan_result.plans)
+        if plan_result.state is llm.SemanticPlanState.complete:
+            semantic_state = SceneCandidatePlanningState.complete
+            generation_warning = None
+        else:
+            semantic_state = SceneCandidatePlanningState.semantic_plan_unavailable
+            generation_warning = (
+                f"Semantic scene planning unavailable: {plan_result.diagnostic.value}."
+            )
+    else:
+        generated, generation_warning = llm.generate_scene_queries(
+            video_subject, scenes
+        )
     queries: dict[int, list[str]] = {}
     sources: dict[int, str] = {}
     requirements: dict[int, object | None] = {}
@@ -291,6 +329,8 @@ def retrieve_scene_candidates(
     # Round-robin by query position gives every narration scene an opportunity
     # before additional diversity is fetched for early scenes.
     for query_position in range(max_query_count):
+        if semantic_state is SceneCandidatePlanningState.semantic_plan_unavailable:
+            break
         for scene in scenes:
             scene_queries = queries[scene.index]
             if query_position >= len(scene_queries):
@@ -457,4 +497,13 @@ def retrieve_scene_candidates(
     finally:
         if temp_path is not None and temp_path.exists():
             temp_path.unlink(missing_ok=True)
-    return str(target)
+    if semantic_state is SceneCandidatePlanningState.complete and not any(
+        group.candidates for group in groups
+    ):
+        semantic_state = SceneCandidatePlanningState.complete_no_eligible_results
+    return SceneCandidateRetrievalResult(str(target), semantic_state, remote_used)
+
+
+def retrieve_scene_candidates(*args, **kwargs) -> str:
+    """Backward-compatible artifact-path wrapper."""
+    return retrieve_scene_candidates_result(*args, **kwargs).artifact_path
