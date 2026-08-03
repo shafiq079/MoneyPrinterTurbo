@@ -10,6 +10,13 @@ from PIL import Image
 from app.services import scene_selection
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_scene_ranking_config(monkeypatch):
+    """Keep provider-rank tests independent of developer config and secrets."""
+    monkeypatch.setattr(scene_selection.config, "scene_ranking", {"enabled": False})
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+
+
 def _candidate(identifier: str, rank: int) -> dict:
     return {
         "candidate_id": f"pexels:{identifier}",
@@ -23,12 +30,14 @@ def _candidate(identifier: str, rank: int) -> dict:
         "duration": 8,
         "width": 1080,
         "height": 1920,
+        "semantic_labels": ["city street"],
+        "semantic_source": "provider_page_slug",
     }
 
 
 def _candidate_manifest(path: Path) -> bytes:
     payload = {
-        "version": 1,
+        "version": 2,
         "provider": "pexels",
         "video_aspect": "9:16",
         "candidates_per_scene": 6,
@@ -48,6 +57,12 @@ def _candidate_manifest(path: Path) -> bytes:
                 "warning": None,
                 "reuse_scene_index": None,
                 "candidates": [_candidate("later", 3), _candidate("winner", 1)],
+                "requirements_status": "generated",
+                "semantic_requirements": {
+                    "primary_entities": [{"canonical": "city", "aliases": []}],
+                    "actions": [],
+                    "contexts": [],
+                },
             },
             {
                 "scene_index": 2,
@@ -61,6 +76,8 @@ def _candidate_manifest(path: Path) -> bytes:
                 "warning": None,
                 "reuse_scene_index": 1,
                 "candidates": [],
+                "requirements_status": "unavailable",
+                "semantic_requirements": None,
             },
             {
                 "scene_index": 3,
@@ -74,6 +91,8 @@ def _candidate_manifest(path: Path) -> bytes:
                 "warning": "provider response contained no results",
                 "reuse_scene_index": None,
                 "candidates": [],
+                "requirements_status": "unavailable",
+                "semantic_requirements": None,
             },
         ],
     }
@@ -111,7 +130,7 @@ def _preview_manifest(
     payload = {
         "version": 1,
         "source_candidate_manifest": {
-            "version": 1,
+            "version": 2,
             "sha256": hashlib.sha256(candidate_bytes).hexdigest(),
         },
         "normalization_version": "poster-jpeg-v1",
@@ -279,7 +298,7 @@ def test_strict_manifest_validation_rejects_inconsistent_inputs(artifacts, mutat
     candidate_payload = json.loads(candidates.read_text())
     preview_payload = json.loads(previews.read_text())
     if mutation == "candidate_version":
-        candidate_payload["version"] = 2
+        candidate_payload["version"] = 1
     elif mutation == "binding":
         preview_payload["source_candidate_manifest"]["sha256"] = "0" * 64
     elif mutation == "provider":
@@ -421,10 +440,58 @@ def test_atomic_publication_failure_leaves_no_partial_artifact(artifacts):
         (5, 5, [0, 1, 2, 3, 4]),
         (6, 2, [1, 4]),
         (7, 3, [1, 3, 5]),
+        (17, 20, list(range(17))),
     ],
 )
 def test_centered_stratified_allocation(count, budget, expected):
     assert scene_selection._centered_allocation(count, budget) == expected
+
+
+def test_scheduler_prioritizes_every_first_attempt_before_retries(monkeypatch):
+    calls = []
+    counts = {}
+
+    def attempt(_prepared, scene_index, *_args, **_kwargs):
+        calls.append(scene_index)
+        counts[scene_index] = counts.get(scene_index, 0) + 1
+        if counts[scene_index] == 1:
+            raise scene_selection.scene_ranking.RankingError(
+                "vlm_connection_failed", retryable=True
+            )
+        return {"scene_index": scene_index, "assessments": []}
+
+    now = [0.0]
+
+    def sleep(delay):
+        now[0] += delay
+
+    monkeypatch.setattr(
+        scene_selection.scene_ranking, "request_remote_attempt", attempt
+    )
+    config = SimpleNamespace(
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_remote_attempts_per_minute=60,
+        max_concurrent_scene_rankings=4,
+    )
+    misses = [({"scene_index": index}, object()) for index in range(1, 18)]
+    outcomes, usage = scene_selection._rank_remote_misses(
+        misses,
+        config,
+        "key",
+        session=object(),
+        clock=lambda: now[0],
+        sleeper=sleep,
+        deadline=100,
+    )
+    assert calls == [*range(1, 18), *range(1, 18)]
+    assert usage["eligible_remote_scenes"] == 17
+    assert usage["first_attempts_started"] == 17
+    assert usage["first_attempts_not_started"] == 0
+    assert usage["transport_retry_attempts_started"] == 17
+    assert all(
+        response is not None and error is None for _, response, error, _ in outcomes
+    )
 
 
 def _ranking_config(api_key="unit-test-key"):
@@ -473,8 +540,8 @@ def test_enabled_ranking_selects_safe_candidate_and_counts_usage(artifacts):
         patch.object(scene_selection.scene_ranking_cache, "store") as store,
         patch.object(
             scene_selection.scene_ranking,
-            "request_remote",
-            return_value=(_ranking_response(), 1),
+            "request_remote_attempt",
+            return_value=_ranking_response(),
         ) as request,
     ):
         target = scene_selection.create_scene_selections(
@@ -520,15 +587,14 @@ def test_all_unsafe_cache_hit_needs_no_key_or_fallback(artifacts):
 
 @pytest.mark.parametrize(
     ("attempts", "expected_requests", "expected_attempts"),
-    [(0, 0, 0), (1, 1, 1), (2, 1, 2)],
+    [(1, 1, 1), (2, 1, 2)],
 )
 def test_failed_remote_request_usage_is_exact(
     artifacts, attempts, expected_requests, expected_attempts
 ):
     candidates, previews, objects, _, _ = artifacts
     error = scene_selection.scene_ranking.RankingError(
-        "ranking_deadline_exhausted" if attempts == 0 else "vlm_request_failed",
-        attempts=attempts,
+        "vlm_connection_failed", retryable=attempts == 2
     )
     with (
         patch.object(
@@ -538,7 +604,7 @@ def test_failed_remote_request_usage_is_exact(
             scene_selection.scene_ranking_cache, "load", return_value=(None, False)
         ),
         patch.object(
-            scene_selection.scene_ranking, "request_remote", side_effect=error
+            scene_selection.scene_ranking, "request_remote_attempt", side_effect=error
         ),
     ):
         target = scene_selection.create_scene_selections(
@@ -561,6 +627,7 @@ def test_invalid_requested_config_skips_derivative_cache_and_network(
     artifacts, invalid_setting
 ):
     candidates, previews, objects, _, _ = artifacts
+    sleeper = MagicMock()
     with (
         patch.object(
             scene_selection.utils, "storage_dir", return_value=str(objects.parent)
@@ -572,12 +639,16 @@ def test_invalid_requested_config_skips_derivative_cache_and_network(
         ),
         patch.object(scene_selection.scene_ranking, "prepare") as prepare,
         patch.object(scene_selection.scene_ranking_cache, "load") as cache_load,
+        patch.object(scene_selection.scene_ranking_cache, "store") as cache_store,
         patch.object(scene_selection.scene_ranking, "request_remote") as request,
     ):
-        target = scene_selection.create_scene_selections(str(candidates), str(previews))
+        target = scene_selection.create_scene_selections(
+            str(candidates), str(previews), sleep=sleeper
+        )
     raw = Path(target).read_text(encoding="utf-8")
     data = json.loads(raw)
-    assert data["scenes"][0]["status"] == "provider_rank_fallback"
+    assert data["scenes"][0]["status"] == "ranking_unavailable"
+    assert data["scenes"][0]["selected_candidate_id"] is None
     assert data["scenes"][0]["fallback_reason"] == "ranking_not_configured"
     assert data["scenes"][1]["status"] == "hold_no_search"
     assert data["scenes"][2]["status"] == "no_candidates"
@@ -586,7 +657,9 @@ def test_invalid_requested_config_skips_derivative_cache_and_network(
     assert "malformed" not in raw
     prepare.assert_not_called()
     cache_load.assert_not_called()
+    cache_store.assert_not_called()
     request.assert_not_called()
+    sleeper.assert_not_called()
 
 
 def test_incomplete_preview_coverage_skips_cache_and_network(artifacts):
@@ -608,6 +681,53 @@ def test_incomplete_preview_coverage_skips_cache_and_network(artifacts):
     assert data["usage"]["vlm_attempts_started"] == 0
     cache_load.assert_not_called()
     request.assert_not_called()
+
+
+def test_ranking_enabled_rejects_missing_primary_evidence_before_vlm(artifacts):
+    candidates, previews, objects, _, _ = artifacts
+    candidate_payload = json.loads(candidates.read_text(encoding="utf-8"))
+    for candidate in candidate_payload["scenes"][0]["candidates"]:
+        candidate["semantic_labels"] = ["focus shot of coffee beans"]
+    candidate_bytes = json.dumps(candidate_payload).encode("utf-8")
+    candidates.write_bytes(candidate_bytes)
+    preview_payload = json.loads(previews.read_text(encoding="utf-8"))
+    preview_payload["source_candidate_manifest"]["sha256"] = hashlib.sha256(
+        candidate_bytes
+    ).hexdigest()
+    previews.write_text(json.dumps(preview_payload), encoding="utf-8")
+    with (
+        patch.object(
+            scene_selection.utils, "storage_dir", return_value=str(objects.parent)
+        ),
+        patch.object(scene_selection.scene_ranking, "request_remote_attempt") as request,
+        pytest.raises(ValueError, match="semantic evidence"),
+    ):
+        scene_selection.create_scene_selections(
+            str(candidates), str(previews), ranking_config=_ranking_config()
+        )
+    request.assert_not_called()
+
+
+def test_ranking_disabled_preserves_provider_rank_without_semantic_support(artifacts):
+    candidates, previews, objects, _, _ = artifacts
+    candidate_payload = json.loads(candidates.read_text(encoding="utf-8"))
+    for candidate in candidate_payload["scenes"][0]["candidates"]:
+        candidate["semantic_labels"] = []
+        candidate["semantic_source"] = "none"
+    candidate_bytes = json.dumps(candidate_payload).encode("utf-8")
+    candidates.write_bytes(candidate_bytes)
+    preview_payload = json.loads(previews.read_text(encoding="utf-8"))
+    preview_payload["source_candidate_manifest"]["sha256"] = hashlib.sha256(
+        candidate_bytes
+    ).hexdigest()
+    previews.write_text(json.dumps(preview_payload), encoding="utf-8")
+    with patch.object(
+        scene_selection.utils, "storage_dir", return_value=str(objects.parent)
+    ):
+        target = scene_selection.create_scene_selections(str(candidates), str(previews))
+    scene = json.loads(Path(target).read_text(encoding="utf-8"))["scenes"][0]
+    assert scene["status"] == "provider_rank_selected"
+    assert scene["selected_candidate_id"] == "pexels:winner"
 
 
 def test_mixed_safety_and_all_tie_breaks():
@@ -653,6 +773,116 @@ def test_mixed_safety_and_all_tie_breaks():
     assert scene["selected_candidate_id"] == "pexels:b"
 
 
+def test_low_relevance_and_high_mismatch_fail_closed():
+    candidates = [
+        {
+            "candidate_id": "pexels:low",
+            "provider_rank": 1,
+            "manifest_position": 0,
+            "local_order": None,
+            "preview_sha256": "a" * 64,
+            "_source": {
+                "candidate_id": "pexels:low",
+                "provider": "pexels",
+                "provider_video_id": "low",
+                "provider_page_url": None,
+                "video_url": "https://example.invalid/low.mp4",
+                "provider_rank": 1,
+            },
+        },
+        {
+            "candidate_id": "pexels:mismatch",
+            "provider_rank": 2,
+            "manifest_position": 1,
+            "local_order": None,
+            "preview_sha256": "b" * 64,
+            "_source": {
+                "candidate_id": "pexels:mismatch",
+                "provider": "pexels",
+                "provider_video_id": "mismatch",
+                "provider_page_url": None,
+                "video_url": "https://example.invalid/mismatch.mp4",
+                "provider_rank": 2,
+            },
+        },
+    ]
+    scene = {"candidates": candidates, "selected_candidate": None, "warnings": []}
+    scene_selection._apply_ranking(
+        scene,
+        {
+            "assessments": [
+                {
+                    "label": "C01",
+                    "relevance": 59,
+                    "visual_quality": 100,
+                    "mismatch": 0,
+                    "unsafe": False,
+                },
+                {
+                    "label": "C02",
+                    "relevance": 100,
+                    "visual_quality": 100,
+                    "mismatch": 41,
+                    "unsafe": False,
+                },
+            ]
+        },
+    )
+    assert scene["status"] == "no_acceptable_candidate"
+    assert scene["selected_candidate_id"] is None
+
+
+def test_nonconsecutive_duplicate_is_replaced_but_adjacent_reuse_is_allowed():
+    def ranked(index, identities, selected=0):
+        rows = []
+        for order, identity in enumerate(identities, 1):
+            source = {
+                "candidate_id": f"pexels:{identity}",
+                "provider": "pexels",
+                "provider_video_id": identity,
+                "provider_page_url": None,
+                "video_url": f"https://example.invalid/{identity}.mp4",
+                "provider_rank": order,
+            }
+            rows.append(
+                {
+                    "candidate_id": source["candidate_id"],
+                    "provider_rank": order,
+                    "manifest_position": order - 1,
+                    "local_order": order,
+                    "preview_sha256": f"{index + order:064x}",
+                    "_source": source,
+                    "assessment": {},
+                    "score_basis_points": 9000,
+                    "safety_excluded": False,
+                }
+            )
+        source = rows[selected]["_source"]
+        return {
+            "scene_index": index,
+            "status": "vlm_selected",
+            "warnings": [],
+            "visual_safety_evaluated": True,
+            "fallback_reason": None,
+            "selected_candidate_id": source["candidate_id"],
+            "selected_candidate": dict(source),
+            "selected_preview_sha256": rows[selected]["preview_sha256"],
+            "candidates": rows,
+        }
+
+    scenes = [
+        ranked(1, ["shared"]),
+        ranked(2, ["middle"]),
+        ranked(3, ["shared", "alternate"]),
+    ]
+    scene_selection._suppress_nonconsecutive_duplicates(scenes)
+    assert scenes[2]["selected_candidate_id"] == "pexels:alternate"
+
+    adjacent = [ranked(1, ["shared"]), ranked(2, ["shared"])]
+    scene_selection._suppress_nonconsecutive_duplicates(adjacent)
+    assert adjacent[1]["selected_candidate_id"] == "pexels:shared"
+
+
 def test_missing_key_cache_miss_falls_back_without_request(artifacts):
     candidates, previews, objects, _, _ = artifacts
     with (
@@ -668,7 +898,8 @@ def test_missing_key_cache_miss_falls_back_without_request(artifacts):
             str(candidates), str(previews), ranking_config=_ranking_config("")
         )
     data = json.loads(Path(target).read_text(encoding="utf-8"))
-    assert data["scenes"][0]["status"] == "provider_rank_fallback"
+    assert data["scenes"][0]["status"] == "ranking_unavailable"
+    assert data["scenes"][0]["selected_candidate_id"] is None
     assert data["scenes"][0]["fallback_reason"] == "ranking_not_configured"
     assert data["usage"]["vlm_requests_started"] == 0
     request.assert_not_called()

@@ -162,12 +162,24 @@ class TestConfigPersistence:
             )
         assert settings.enabled is False
         assert settings.api_key == "unit-test-key"
-        assert settings.max_remote_scene_requests_per_task == 12
+        assert settings.max_remote_scene_requests_per_task == 20
+        assert settings.max_concurrent_scene_rankings == 4
+        assert settings.max_remote_attempts_per_minute == 30
+        assert settings.model == "nvidia/nemotron-nano-12b-v2-vl"
 
     def test_scene_ranking_example_has_only_empty_secret(self):
         section = self._load_example_config()["scene_ranking"]
         assert section["enabled"] is False
         assert section["api_key"] == ""
+
+    def test_scene_ranking_accepts_bounded_nvidia_model_names(self):
+        with patch.object(
+            config, "scene_ranking", {"model": "nvidia/llama-3.2-nv-vision-safe"}
+        ):
+            assert (
+                config.get_scene_ranking_config({}).model
+                == "nvidia/llama-3.2-nv-vision-safe"
+            )
 
     def test_scene_ranking_strict_types_and_bounds(self):
         bounds = {
@@ -176,6 +188,8 @@ class TestConfigPersistence:
             "read_timeout_seconds": (1, 120),
             "total_deadline_seconds": (1, 900),
             "max_attempts_per_scene": (1, 2),
+            "max_concurrent_scene_rankings": (1, 6),
+            "max_remote_attempts_per_minute": (1, 60),
         }
         for name, (lower, upper) in bounds.items():
             for valid in (lower, upper):
@@ -208,3 +222,27 @@ class TestConfigPersistence:
             pytest.raises(ValueError),
         ):
             config.get_scene_ranking_config({"NVIDIA_API_KEY": api_key})
+
+    @pytest.mark.parametrize("api_key", ["line\nbreak", "tab\tbreak", "nul\x00break"])
+    def test_malformed_configured_key_is_not_masked_by_valid_environment_key(
+        self, api_key
+    ):
+        with (
+            patch.object(
+                config,
+                "scene_ranking",
+                {"enabled": True, "api_key": api_key},
+            ),
+            pytest.raises(ValueError),
+        ):
+            config.get_scene_ranking_config({"NVIDIA_API_KEY": "valid-env-key"})
+
+    def test_empty_configured_api_key_is_valid_and_environment_can_override_it(self):
+        with patch.object(config, "scene_ranking", {"enabled": True, "api_key": ""}):
+            assert config.get_scene_ranking_config({}).api_key == ""
+            assert (
+                config.get_scene_ranking_config(
+                    {"NVIDIA_API_KEY": "valid-environment-key"}
+                ).api_key
+                == "valid-environment-key"
+            )

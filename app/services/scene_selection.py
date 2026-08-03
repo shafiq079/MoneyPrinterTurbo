@@ -9,6 +9,8 @@ import os
 import re
 import tempfile
 import warnings
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
@@ -16,12 +18,20 @@ from pathlib import Path
 from PIL import Image, UnidentifiedImageError
 
 from app.config import config
-from app.services import scene_preview_cache, scene_ranking, scene_ranking_cache
+from app.models.schema import ProviderVideoCandidate
+from app.services import (
+    scene_candidate,
+    scene_preview_cache,
+    scene_ranking,
+    scene_ranking_cache,
+)
 from app.utils import utils
 
 MANIFEST_VERSION = 1
 SELECTION_POLICY_VERSION = "provider-rank-v1"
 RANKING_SELECTION_POLICY_VERSION = "nvidia-poster-rank-v1"
+MINIMUM_RELEVANCE = 60
+MAXIMUM_MISMATCH = 40
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 MAX_NORMALIZED_PREVIEW_OBJECT_BYTES = 4 * 1024 * 1024
 MAX_CANDIDATES_PER_SCENE = 12
@@ -35,6 +45,7 @@ RETRIEVAL_STATUSES = {
     "budget_exhausted",
     "partial_budget_exhausted",
     "hold_no_search",
+    "no_semantic_candidates",
 }
 QUERY_SOURCES = {"llm", "fallback", "none"}
 PREVIEW_STATUSES = {
@@ -71,9 +82,27 @@ WARNING_CODES = {
     "ranking_cache_corrupt",
     "vlm_request_failed",
     "vlm_response_invalid",
+    "vlm_response_too_large",
+    "vlm_envelope_invalid",
+    "vlm_finish_reason_invalid",
+    "vlm_content_invalid",
+    "vlm_schema_invalid",
+    "vlm_rate_limited",
+    "vlm_http_client_rejected",
+    "vlm_http_server_failed",
+    "vlm_connect_timeout",
+    "vlm_read_timeout",
+    "vlm_connection_failed",
+    "vlm_tls_failed",
+    "vlm_proxy_failed",
+    "vlm_transport_failed",
+    "ranking_start_deadline_exhausted",
+    "ranking_attempt_deadline_exhausted",
     "ranking_not_configured",
     "ranking_budget_exhausted",
     "ranking_deadline_exhausted",
+    "no_acceptable_candidate",
+    "duplicate_candidate_unavailable",
     "additional_warnings_omitted",
 }
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -85,6 +114,8 @@ class SceneSelectionStatus(str, Enum):
     provider_rank_fallback = "provider_rank_fallback"
     vlm_selected = "vlm_selected"
     no_safe_candidate = "no_safe_candidate"
+    no_acceptable_candidate = "no_acceptable_candidate"
+    ranking_unavailable = "ranking_unavailable"
     hold_no_search = "hold_no_search"
     no_candidates = "no_candidates"
 
@@ -197,6 +228,8 @@ def _validate_candidate(candidate: dict, group: dict, provider: str) -> None:
             "duration",
             "width",
             "height",
+            "semantic_labels",
+            "semantic_source",
         },
     )
     item_provider = _string(
@@ -224,6 +257,23 @@ def _validate_candidate(candidate: dict, group: dict, provider: str) -> None:
     _number(candidate["duration"], "candidate duration", positive=True)
     _strict_int(candidate["width"], "candidate width", 1, 100_000)
     _strict_int(candidate["height"], "candidate height", 1, 100_000)
+    labels = _array(candidate["semantic_labels"], "semantic_labels")
+    if len(labels) > 16:
+        _fail("too many semantic labels")
+    total = 0
+    for label in labels:
+        value = _string(label, "semantic label", minimum=1, maximum=80, trimmed=True)
+        total += len(value.encode("utf-8"))
+    if total > 512 or len(set(labels)) != len(labels):
+        _fail("semantic labels are invalid")
+    if candidate["semantic_source"] not in {
+        "none",
+        "provider_page_slug",
+        "provider_tags",
+    }:
+        _fail("semantic source is invalid")
+    if bool(labels) != (candidate["semantic_source"] != "none"):
+        _fail("semantic source and labels are inconsistent")
 
 
 def _validate_candidate_manifest(payload: dict) -> dict:
@@ -241,7 +291,7 @@ def _validate_candidate_manifest(payload: dict) -> dict:
             "scenes",
         },
     )
-    if _strict_int(payload["version"], "candidate manifest version", 1, 1) != 1:
+    if _strict_int(payload["version"], "candidate manifest version", 2, 2) != 2:
         _fail("unsupported candidate manifest version")
     provider = _string(payload["provider"], "provider", minimum=1, maximum=32)
     if provider not in SUPPORTED_PROVIDERS:
@@ -287,6 +337,8 @@ def _validate_candidate_manifest(payload: dict) -> dict:
                 "warning",
                 "reuse_scene_index",
                 "candidates",
+                "requirements_status",
+                "semantic_requirements",
             },
         )
         index = _strict_int(group["scene_index"], "scene_index", 1)
@@ -317,6 +369,23 @@ def _validate_candidate_manifest(payload: dict) -> dict:
             _fail("scene retrieval status is invalid")
         warning = _optional_string(group["warning"], "scene warning", 500)
         candidates = _array(group["candidates"], "candidates")
+        requirements_status = _string(
+            group["requirements_status"], "requirements_status", minimum=9, maximum=11
+        )
+        if requirements_status not in {"generated", "unavailable"}:
+            _fail("requirements status is invalid")
+        try:
+            requirements = (
+                scene_candidate.SemanticRequirements.model_validate(
+                    group["semantic_requirements"]
+                )
+                if requirements_status == "generated"
+                else None
+            )
+        except Exception as exc:
+            raise ValueError("semantic requirements are invalid") from exc
+        if (requirements is None) != (group["semantic_requirements"] is None):
+            _fail("semantic requirements status is inconsistent")
         if len(candidates) > limit:
             _fail("source candidate count exceeds its declared limit")
         if status == "hold_no_search":
@@ -341,7 +410,11 @@ def _validate_candidate_manifest(payload: dict) -> dict:
                 _fail("non-hold scene cannot reuse another scene")
             if status == "complete" and (not candidates or warning is not None):
                 _fail("complete scene is inconsistent")
-            if status in {"no_results_or_error", "budget_exhausted"} and candidates:
+            if (
+                status
+                in {"no_results_or_error", "budget_exhausted", "no_semantic_candidates"}
+                and candidates
+            ):
                 _fail("empty retrieval status contains candidates")
             if (
                 status
@@ -349,6 +422,7 @@ def _validate_candidate_manifest(payload: dict) -> dict:
                     "no_results_or_error",
                     "budget_exhausted",
                     "partial_budget_exhausted",
+                    "no_semantic_candidates",
                 }
                 and warning is None
             ):
@@ -378,6 +452,26 @@ def _validate_candidate_manifest(payload: dict) -> dict:
         ):
             _fail("hold reuse_scene_index does not reference a meaningful scene")
     return payload
+
+
+def _enforce_semantic_support(candidate_manifest: dict) -> None:
+    for group in candidate_manifest["scenes"]:
+        if not group["text"].strip() or not group["candidates"]:
+            continue
+        if group["requirements_status"] != "generated":
+            _fail("ranking-enabled scene lacks semantic requirements")
+        requirements = scene_candidate.SemanticRequirements.model_validate(
+            group["semantic_requirements"]
+        )
+        for candidate in group["candidates"]:
+            item = ProviderVideoCandidate(
+                provider=candidate["provider"],
+                provider_video_id=candidate["provider_video_id"],
+                semantic_labels=tuple(candidate["semantic_labels"]),
+                semantic_source=candidate["semantic_source"],
+            )
+            if not scene_candidate.semantic_support(item, requirements):
+                _fail("candidate lacks required semantic evidence")
 
 
 def _validate_limits_usage(preview: dict) -> None:
@@ -464,7 +558,7 @@ def _validate_preview_manifest(preview: dict, source: dict, source_digest: str) 
         "source candidate binding",
         {"version", "sha256"},
     )
-    _strict_int(binding["version"], "source candidate version", 1, 1)
+    _strict_int(binding["version"], "source candidate version", 2, 2)
     digest = _string(
         binding["sha256"], "source candidate sha256", minimum=64, maximum=64
     )
@@ -680,10 +774,148 @@ def _centered_allocation(count: int, budget: int) -> list[int]:
     return [math.floor((index + 0.5) * count / selected) for index in range(selected)]
 
 
+class _AttemptRateGate:
+    def __init__(self, attempts_per_minute, monotonic, sleep):
+        self.interval = 60.0 / attempts_per_minute
+        self.monotonic = monotonic
+        self.sleep = sleep
+        self.condition = threading.Condition()
+        self.next_sequence = 0
+        self.last_start = None
+
+    def start(self, sequence: int, deadline: float) -> bool:
+        with self.condition:
+            while sequence != self.next_sequence:
+                self.condition.wait(timeout=0.05)
+            now = self.monotonic()
+            target = (
+                now
+                if self.last_start is None
+                else max(now, self.last_start + self.interval)
+            )
+            if target >= deadline:
+                self.next_sequence += 1
+                self.condition.notify_all()
+                return False
+            delay = target - now
+        if delay > 0:
+            self.sleep(delay)
+        with self.condition:
+            self.last_start = self.monotonic()
+            self.next_sequence += 1
+            self.condition.notify_all()
+        return True
+
+
+def _rank_remote_misses(
+    prepared_misses, ranking_config, api_key, *, session, clock, sleeper, deadline
+):
+    """Run all first attempts before a deterministic second-attempt phase."""
+    concurrency = (
+        1
+        if session is not None
+        else getattr(ranking_config, "max_concurrent_scene_rankings", 4)
+    )
+    rate = getattr(ranking_config, "max_remote_attempts_per_minute", 30)
+    gate = _AttemptRateGate(rate, clock, sleeper)
+    sequence = 0
+    counters = {
+        "eligible_remote_scenes": len(prepared_misses),
+        "first_attempts_started": 0,
+        "first_attempts_not_started": 0,
+        "corrective_attempts_started": 0,
+        "transport_retry_attempts_started": 0,
+        "vlm_attempts_started": 0,
+    }
+
+    def run(work, seq, corrective):
+        scene, prepared = work
+        if not gate.start(seq, deadline):
+            return (
+                scene,
+                None,
+                scene_ranking.RankingError("ranking_start_deadline_exhausted"),
+                False,
+            )
+        attempt_deadline = min(
+            deadline,
+            clock()
+            + ranking_config.connect_timeout_seconds
+            + ranking_config.read_timeout_seconds,
+        )
+        try:
+            response = scene_ranking.request_remote_attempt(
+                prepared,
+                scene["scene_index"],
+                api_key,
+                ranking_config,
+                corrective=corrective,
+                session=session,
+                monotonic=clock,
+                deadline=attempt_deadline,
+            )
+            return scene, response, None, True
+        except scene_ranking.RankingError as exc:
+            return scene, None, exc, True
+        except Exception:
+            return scene, None, scene_ranking.RankingError("vlm_transport_failed"), True
+
+    def phase(works):
+        nonlocal sequence
+        results = []
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = []
+            for work, corrective in works:
+                futures.append(executor.submit(run, work, sequence, corrective))
+                sequence += 1
+            for future in as_completed(futures):
+                results.append(future.result())
+        return sorted(results, key=lambda item: item[0]["scene_index"])
+
+    first = phase([(work, False) for work in prepared_misses])
+    retries = []
+    final = {}
+    for scene, response, error, started in first:
+        counters[
+            "first_attempts_started" if started else "first_attempts_not_started"
+        ] += 1
+        counters["vlm_attempts_started"] += int(started)
+        if response is not None:
+            final[scene["scene_index"]] = (scene, response, None, int(started))
+        elif error is not None and started and (error.retryable or error.corrective):
+            retries.append(
+                (
+                    (scene, next(p for s, p in prepared_misses if s is scene)),
+                    error.corrective,
+                )
+            )
+        else:
+            final[scene["scene_index"]] = (scene, None, error, int(started))
+    if retries:
+        second = phase(retries)
+        retry_kind = {
+            work[0]["scene_index"]: corrective for work, corrective in retries
+        }
+        for scene, response, error, started in second:
+            if started:
+                key = (
+                    "corrective_attempts_started"
+                    if retry_kind[scene["scene_index"]]
+                    else "transport_retry_attempts_started"
+                )
+                counters[key] += 1
+                counters["vlm_attempts_started"] += 1
+            final[scene["scene_index"]] = (scene, response, error, 1 + int(started))
+    return [final[scene["scene_index"]] for scene, _ in prepared_misses], counters
+
+
 def _fallback(scene: dict, reason: str) -> None:
-    scene["status"] = "provider_rank_fallback"
+    scene["status"] = "ranking_unavailable"
     scene["fallback_reason"] = reason[:64]
     scene["visual_safety_evaluated"] = False
+    scene["selected_candidate_id"] = None
+    scene["selected_candidate"] = None
+    scene["selected_preview_sha256"] = None
     scene["warnings"] = _warnings([*scene["warnings"], reason])
     for row in scene["candidates"]:
         row["assessment"] = None
@@ -694,6 +926,7 @@ def _fallback(scene: dict, reason: str) -> None:
 def _apply_ranking(scene: dict, response: dict) -> None:
     by_label = {item["label"]: item for item in response["assessments"]}
     safe_positions = []
+    acceptable_positions = []
     for position, row in enumerate(scene["candidates"]):
         item = by_label[f"C{position + 1:02d}"]
         assessment = {
@@ -712,6 +945,11 @@ def _apply_ranking(scene: dict, response: dict) -> None:
         row["local_order"] = None
         if not item["unsafe"]:
             safe_positions.append(position)
+            if (
+                item["relevance"] >= MINIMUM_RELEVANCE
+                and item["mismatch"] <= MAXIMUM_MISMATCH
+            ):
+                acceptable_positions.append(position)
     scene["visual_safety_evaluated"] = True
     scene["fallback_reason"] = None
     if not safe_positions:
@@ -720,8 +958,18 @@ def _apply_ranking(scene: dict, response: dict) -> None:
         scene["selected_candidate"] = None
         scene["selected_preview_sha256"] = None
         return
+    if not acceptable_positions:
+        scene["status"] = "no_acceptable_candidate"
+        scene["fallback_reason"] = "no_acceptable_candidate"
+        scene["selected_candidate_id"] = None
+        scene["selected_candidate"] = None
+        scene["selected_preview_sha256"] = None
+        scene["warnings"] = _warnings(
+            [*scene.get("warnings", []), "no_acceptable_candidate"]
+        )
+        return
     order = sorted(
-        safe_positions,
+        acceptable_positions,
         key=lambda position: (
             -scene["candidates"][position]["score_basis_points"],
             scene["candidates"][position]["provider_rank"],
@@ -751,6 +999,55 @@ def _apply_ranking(scene: dict, response: dict) -> None:
     scene["status"] = "vlm_selected"
     scene["selected_candidate_id"] = winner["candidate_id"]
     scene["selected_preview_sha256"] = winner["preview_sha256"]
+
+
+def _suppress_nonconsecutive_duplicates(scenes: list[dict]) -> None:
+    """Avoid repeating provider footage across nonadjacent meaningful scenes."""
+    last_selected_position: dict[tuple[str, str], int] = {}
+    meaningful_position = -1
+    for scene in scenes:
+        if scene["status"] == "hold_no_search":
+            continue
+        meaningful_position += 1
+        if scene["status"] != "vlm_selected":
+            continue
+        selected = scene["selected_candidate"]
+        identity = (selected["provider"], selected["provider_video_id"])
+        prior = last_selected_position.get(identity)
+        if prior is not None and prior != meaningful_position - 1:
+            alternatives = sorted(
+                (
+                    row
+                    for row in scene["candidates"]
+                    if row["local_order"] is not None
+                    and (
+                        row["_source"]["provider"],
+                        row["_source"]["provider_video_id"],
+                    )
+                    not in last_selected_position
+                ),
+                key=lambda row: row["local_order"],
+            )
+            if not alternatives:
+                _fallback(scene, "duplicate_candidate_unavailable")
+                continue
+            winner = alternatives[0]
+            source = winner["_source"]
+            scene["selected_candidate"] = {
+                key: source[key]
+                for key in (
+                    "candidate_id",
+                    "provider",
+                    "provider_video_id",
+                    "provider_page_url",
+                    "video_url",
+                    "provider_rank",
+                )
+            }
+            scene["selected_candidate_id"] = winner["candidate_id"]
+            scene["selected_preview_sha256"] = winner["preview_sha256"]
+            identity = (source["provider"], source["provider_video_id"])
+        last_selected_position[identity] = meaningful_position
 
 
 def create_scene_selections(
@@ -787,6 +1084,8 @@ def create_scene_selections(
             config_invalid = ranking_enabled
     else:
         ranking_enabled = ranking_config.enabled
+    if ranking_enabled and not config_invalid:
+        _enforce_semantic_support(candidate_manifest)
     scenes = []
     valid_objects = 0
     unavailable_objects = 0
@@ -910,6 +1209,11 @@ def create_scene_selections(
         "vlm_attempts_started": 0,
         "ranking_cache_hits": 0,
         "ranking_cache_misses": 0,
+        "eligible_remote_scenes": 0,
+        "first_attempts_started": 0,
+        "first_attempts_not_started": 0,
+        "corrective_attempts_started": 0,
+        "transport_retry_attempts_started": 0,
     }
     prepared_misses = []
     ranking_deadline = None
@@ -949,7 +1253,7 @@ def create_scene_selections(
                     ranking_scene,
                     [row["_preview_bytes"] for row in scene["candidates"]],
                     scene_ranking.PROVIDER,
-                    scene_ranking.MODEL,
+                    getattr(ranking_config, "model", scene_ranking.MODEL),
                     candidate_manifest["video_aspect"],
                 )
             except scene_ranking.RankingError as exc:
@@ -981,6 +1285,7 @@ def create_scene_selections(
             if ranking_config is not None and ranking_config.api_key
             else set()
         )
+        remote_misses = []
         for position, (scene, prepared) in enumerate(prepared_misses):
             if position not in selected_positions:
                 _fallback(
@@ -990,33 +1295,34 @@ def create_scene_selections(
                     else "ranking_not_configured",
                 )
                 continue
-            if clock() >= ranking_deadline:
-                _fallback(scene, "ranking_deadline_exhausted")
-                continue
-            try:
-                response, attempts = scene_ranking.request_remote(
-                    prepared,
-                    scene["scene_index"],
-                    ranking_config.api_key,
-                    ranking_config,
-                    session=ranking_session,
-                    monotonic=clock,
-                    sleep=sleeper,
-                    deadline=ranking_deadline,
-                )
-                ranking_usage["vlm_requests_started"] += int(attempts > 0)
-                ranking_usage["vlm_attempts_started"] += attempts
+            remote_misses.append((scene, prepared))
+        if remote_misses:
+            outcomes, scheduler_usage = _rank_remote_misses(
+                remote_misses,
+                ranking_config,
+                ranking_config.api_key,
+                session=ranking_session,
+                clock=clock,
+                sleeper=sleeper,
+                deadline=ranking_deadline,
+            )
+            ranking_usage.update(scheduler_usage)
+            ranking_usage["vlm_requests_started"] += sum(
+                attempts > 0 for _scene, _response, _error, attempts in outcomes
+            )
+            for scene, response, error, _attempts in outcomes:
+                if response is None:
+                    _fallback(scene, error.reason)
+                    continue
                 _apply_ranking(scene, response)
                 try:
+                    prepared = next(p for s, p in remote_misses if s is scene)
                     scene_ranking_cache.store(prepared.cache_key, response)
                 except (OSError, ValueError):
                     # A validated live result remains usable when optional cache
                     # persistence fails; no secret or provider body is logged.
                     pass
-            except scene_ranking.RankingError as exc:
-                ranking_usage["vlm_requests_started"] += int(exc.attempts > 0)
-                ranking_usage["vlm_attempts_started"] += exc.attempts
-                _fallback(scene, exc.reason)
+        _suppress_nonconsecutive_duplicates(scenes)
 
     for scene in scenes:
         for row in scene["candidates"]:
@@ -1025,7 +1331,7 @@ def create_scene_selections(
 
     payload = {
         "version": MANIFEST_VERSION,
-        "source_candidate_manifest": {"version": 1, "sha256": candidate_digest},
+        "source_candidate_manifest": {"version": 2, "sha256": candidate_digest},
         "source_preview_manifest": {"version": 1, "sha256": preview_digest},
         "provider": candidate_manifest["provider"],
         "video_aspect": candidate_manifest["video_aspect"],
@@ -1036,7 +1342,9 @@ def create_scene_selections(
         ),
         "ranking": {
             "provider": scene_ranking.PROVIDER if ranking_enabled else None,
-            "model": scene_ranking.MODEL if ranking_enabled else None,
+            "model": getattr(ranking_config, "model", scene_ranking.MODEL)
+            if ranking_enabled and ranking_config is not None
+            else (scene_ranking.MODEL if ranking_enabled else None),
             "prompt_version": scene_ranking.PROMPT_VERSION if ranking_enabled else None,
             "response_schema_version": scene_ranking.RESPONSE_SCHEMA_VERSION
             if ranking_enabled
@@ -1057,11 +1365,17 @@ def create_scene_selections(
             "provider_rank_fallback_scenes": sum(
                 scene["status"] == "provider_rank_fallback" for scene in scenes
             ),
+            "ranking_unavailable_scenes": sum(
+                scene["status"] == "ranking_unavailable" for scene in scenes
+            ),
             "vlm_selected_scenes": sum(
                 scene["status"] == "vlm_selected" for scene in scenes
             ),
             "no_safe_candidate_scenes": sum(
                 scene["status"] == "no_safe_candidate" for scene in scenes
+            ),
+            "no_acceptable_candidate_scenes": sum(
+                scene["status"] == "no_acceptable_candidate" for scene in scenes
             ),
             "hold_scenes": hold_count,
             "no_candidate_scenes": empty_count,
@@ -1077,6 +1391,23 @@ def create_scene_selections(
             if ranking_enabled
             else None,
             "ranking_cache_misses": ranking_usage["ranking_cache_misses"]
+            if ranking_enabled
+            else None,
+            "eligible_remote_scenes": ranking_usage["eligible_remote_scenes"]
+            if ranking_enabled
+            else None,
+            "first_attempts_started": ranking_usage["first_attempts_started"]
+            if ranking_enabled
+            else None,
+            "first_attempts_not_started": ranking_usage["first_attempts_not_started"]
+            if ranking_enabled
+            else None,
+            "corrective_attempts_started": ranking_usage["corrective_attempts_started"]
+            if ranking_enabled
+            else None,
+            "transport_retry_attempts_started": ranking_usage[
+                "transport_retry_attempts_started"
+            ]
             if ranking_enabled
             else None,
         },

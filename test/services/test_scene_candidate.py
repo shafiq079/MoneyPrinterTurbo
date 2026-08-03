@@ -58,18 +58,69 @@ def test_query_generation_uses_one_batched_call_and_ignores_holds():
     response = json.dumps(
         {
             "scenes": [
-                {"scene_index": 1, "queries": ["busy station", "busy station"]},
-                {"scene_index": 3, "queries": ["contactless card payment"]},
+                {
+                    "scene_index": 1,
+                    "queries": ["busy station", "busy station"],
+                    "requirements": {
+                        "primary_entities": [
+                            {"canonical": "station", "aliases": ["train station"]}
+                        ],
+                        "actions": [],
+                        "contexts": [],
+                    },
+                },
+                {
+                    "scene_index": 3,
+                    "queries": ["contactless card payment"],
+                    "requirements": {
+                        "primary_entities": [
+                            {"canonical": "payment card", "aliases": ["credit card"]}
+                        ],
+                        "actions": [],
+                        "contexts": [],
+                    },
+                },
             ]
         }
     )
     with patch.object(llm, "_generate_response", return_value=response) as generate:
         queries, warning = llm.generate_scene_queries("City life", scenes)
 
-    assert queries == {1: ["busy station"], 3: ["contactless card payment"]}
+    assert list(queries[1].queries) == ["busy station"]
+    assert queries[1].requirements.primary_entities[0].canonical == "station"
+    assert list(queries[3].queries) == ["contactless card payment"]
     assert warning is None
     assert generate.call_count == 1
     assert '"scene_index": 2' not in generate.call_args.args[0]
+
+
+@pytest.mark.parametrize(
+    "generic", ["hands", "beans", "farm", "factory", "machine", "liquid", "person"]
+)
+def test_query_plan_rejects_generic_only_primary_entities(generic):
+    scene = _scene(1, "A concrete narration scene")
+    response = json.dumps(
+        {
+            "scenes": [
+                {
+                    "scene_index": 1,
+                    "queries": ["concrete footage"],
+                    "requirements": {
+                        "primary_entities": [{"canonical": generic, "aliases": []}],
+                        "actions": [],
+                        "contexts": [],
+                    },
+                }
+            ]
+        }
+    )
+    with (
+        patch.object(llm, "_max_retries", 1),
+        patch.object(llm, "_generate_response", return_value=response),
+    ):
+        plans, warning = llm.generate_scene_queries("Subject", [scene])
+    assert plans == {}
+    assert warning is not None
 
 
 @pytest.mark.parametrize("response", ["not json", "Error: unavailable"])
@@ -118,8 +169,7 @@ def test_partial_duplicate_and_unknown_llm_scenes_fall_back_safely(tmp_path):
         )
 
     groups = json.loads(Path(target).read_text(encoding="utf-8"))["scenes"]
-    assert groups[0]["queries"] == ["valid first footage"]
-    assert groups[0]["query_source"] == "llm"
+    assert groups[0]["query_source"] == "fallback"
     assert groups[1]["query_source"] == "fallback"
     assert groups[2]["query_source"] == "fallback"
 
@@ -210,7 +260,11 @@ def test_default_six_limit_is_applied_after_dedup_and_preserves_utf8(tmp_path):
     assert manifest["scenes"][0]["text"] == "城市街道上的行人"
     assert [
         item["provider_video_id"] for item in manifest["scenes"][0]["candidates"]
-    ] == ["1", "2", "3", "4", "5", "6"]
+    ] == ["1", "2", "7", "3", "8", "4"]
+    assert {item["matched_query"] for item in manifest["scenes"][0]["candidates"]} == {
+        "city street",
+        "walking people",
+    }
 
 
 @pytest.mark.parametrize("limit", [0, -1, scene_candidate.MAX_CANDIDATES_PER_SCENE + 1])
@@ -296,6 +350,233 @@ def test_rich_cache_hit_uses_no_budget_and_shared_query_resolves_once(tmp_path):
     assert cache_load.call_count == 1
     remote.assert_not_called()
     assert [group["status"] for group in manifest["scenes"]] == ["complete", "complete"]
+
+
+def test_default_budget_covers_two_queries_for_seventeen_scenes(tmp_path):
+    scenes = [_scene(index, f"Meaningful scene {index}") for index in range(1, 18)]
+    generated = {
+        scene.index: [f"scene {scene.index} primary", f"scene {scene.index} secondary"]
+        for scene in scenes
+    }
+
+    def search(**kwargs):
+        query = kwargs["search_term"]
+        scene_number = query.split()[1]
+        kind = query.split()[2]
+        # The shared identity proves stable cross-query deduplication; each
+        # query also has enough unique results to exercise the scene cap.
+        return (
+            [
+                _item(f"{scene_number}-shared", 1),
+                _item(f"{scene_number}-{kind}-1", 2),
+                _item(f"{scene_number}-{kind}-2", 3),
+                _item(f"{scene_number}-{kind}-3", 4),
+            ],
+            True,
+        )
+
+    with (
+        patch.object(
+            scene_candidate.llm,
+            "generate_scene_queries",
+            return_value=(generated, None),
+        ),
+        patch.object(
+            scene_candidate.material_cache,
+            "load_material_candidate_search_cache",
+            return_value=None,
+        ),
+        patch.object(
+            scene_candidate.material,
+            "search_video_candidates_with_cache",
+            side_effect=search,
+        ) as provider_search,
+    ):
+        target = scene_candidate.retrieve_scene_candidates(
+            str(tmp_path), "Subject", scenes, "pexels", VideoAspect.portrait, 5
+        )
+
+    manifest = json.loads(Path(target).read_text(encoding="utf-8"))
+    assert manifest["provider_search_budget"] == 40
+    assert manifest["remote_searches_used"] == 34
+    assert provider_search.call_count == 34
+    for group in manifest["scenes"]:
+        assert group["status"] == "complete"
+        assert group["warning"] is None
+        assert len(group["candidates"]) == scene_candidate.DEFAULT_CANDIDATES_PER_SCENE
+        assert {item["matched_query"] for item in group["candidates"]} == set(
+            group["queries"]
+        )
+        identities = [item["provider_video_id"] for item in group["candidates"]]
+        assert len(identities) == len(set(identities))
+
+
+def test_hard_search_max_deterministically_bounds_larger_tasks(tmp_path):
+    scenes = [_scene(index, f"Scene {index}") for index in range(1, 32)]
+    generated = {
+        scene.index: [f"primary {scene.index}", f"secondary {scene.index}"]
+        for scene in scenes
+    }
+    with (
+        patch.object(
+            scene_candidate.llm,
+            "generate_scene_queries",
+            return_value=(generated, None),
+        ),
+        patch.object(
+            scene_candidate.material_cache,
+            "load_material_candidate_search_cache",
+            return_value=None,
+        ),
+        patch.object(
+            scene_candidate.material,
+            "search_video_candidates_with_cache",
+            return_value=([], True),
+        ) as provider_search,
+    ):
+        target = scene_candidate.retrieve_scene_candidates(
+            str(tmp_path),
+            "Subject",
+            scenes,
+            "pexels",
+            VideoAspect.portrait,
+            5,
+            provider_search_budget=scene_candidate.MAX_PROVIDER_SEARCH_BUDGET,
+        )
+    groups = json.loads(Path(target).read_text(encoding="utf-8"))["scenes"]
+    assert provider_search.call_count == scene_candidate.MAX_PROVIDER_SEARCH_BUDGET
+    assert [group["status"] for group in groups[-2:]] == [
+        "partial_budget_exhausted",
+        "partial_budget_exhausted",
+    ]
+
+
+def test_semantic_filter_checks_full_results_before_diverse_cap(tmp_path):
+    scene = _scene(1, "Chocolate begins as a bitter cacao seed")
+    requirements = llm.SceneSemanticRequirements(
+        primary_entities=(llm.SemanticTermGroup("cacao", ("cocoa",)),),
+        actions=(),
+        contexts=(),
+    )
+    plan = llm.SceneQueryPlan(("cacao seed", "cocoa pod"), requirements)
+
+    def evidence(identifier, rank, label):
+        item = _item(identifier, rank)
+        item.semantic_labels = (label,)
+        item.semantic_source = "provider_page_slug"
+        return item
+
+    results = {
+        "cacao seed": [
+            *[evidence(f"coffee-{rank}", rank, "coffee beans") for rank in range(1, 8)],
+            evidence("late-cacao", 8, "cacao seeds drying"),
+        ],
+        "cocoa pod": [
+            evidence("late-cacao", 1, "cocoa seeds drying"),
+            evidence("pod", 2, "cocoa pod harvest"),
+        ],
+    }
+    with (
+        patch.object(
+            scene_candidate.llm,
+            "generate_scene_query_plan",
+            return_value=llm.SemanticPlanResult(
+                llm.SemanticPlanState.complete,
+                ((1, plan),),
+                llm.SemanticPlanDiagnostic.complete,
+                1,
+                1,
+                1,
+                0,
+            ),
+        ),
+        patch.object(
+            scene_candidate.material_cache,
+            "load_material_candidate_search_cache",
+            return_value=None,
+        ),
+        patch.object(
+            scene_candidate.material,
+            "search_video_candidates_with_cache",
+            side_effect=lambda **kwargs: (results[kwargs["search_term"]], True),
+        ),
+    ):
+        target = scene_candidate.retrieve_scene_candidates(
+            str(tmp_path),
+            "Chocolate",
+            [scene],
+            "pexels",
+            VideoAspect.portrait,
+            5,
+            semantic_filter_enabled=True,
+        )
+    group = json.loads(Path(target).read_text(encoding="utf-8"))["scenes"][0]
+    assert group["status"] == "complete"
+    assert [item["provider_video_id"] for item in group["candidates"]] == [
+        "late-cacao",
+        "pod",
+    ]
+    assert [item["matched_query"] for item in group["candidates"]] == [
+        "cocoa pod",
+        "cocoa pod",
+    ]
+    assert all(
+        "coffee" not in item["provider_video_id"] for item in group["candidates"]
+    )
+
+
+def test_unavailable_semantic_plan_prohibits_scene_provider_work(tmp_path):
+    scene = _scene(1, "A meaningful scene")
+    unavailable = llm.SemanticPlanResult(
+        llm.SemanticPlanState.unavailable,
+        (),
+        llm.SemanticPlanDiagnostic.provider_failed,
+        1,
+        1,
+        2,
+        1,
+    )
+    with (
+        patch.object(
+            scene_candidate.llm,
+            "generate_scene_query_plan",
+            return_value=unavailable,
+        ),
+        patch.object(
+            scene_candidate.material_cache,
+            "load_material_candidate_search_cache",
+        ) as cache,
+        patch.object(
+            scene_candidate.material, "search_video_candidates_with_cache"
+        ) as search,
+    ):
+        result = scene_candidate.retrieve_scene_candidates_result(
+            str(tmp_path),
+            "Subject",
+            [scene],
+            "pexels",
+            VideoAspect.portrait,
+            5,
+            semantic_filter_enabled=True,
+        )
+    assert (
+        result.planning_state
+        is scene_candidate.SceneCandidatePlanningState.semantic_plan_unavailable
+    )
+    assert result.scene_query_remote_searches_used == 0
+    cache.assert_not_called()
+    search.assert_not_called()
+
+
+def test_actions_cannot_replace_missing_primary_entity():
+    requirements = scene_candidate.SemanticRequirements(
+        primary_entities=[{"canonical": "cacao", "aliases": ["cocoa"]}],
+        actions=[{"canonical": "drying", "aliases": []}],
+        contexts=[{"canonical": "farm", "aliases": []}],
+    )
+    coffee = _item("coffee")
+    coffee.semantic_labels = ("coffee beans drying on farm",)
+    assert not scene_candidate.semantic_support(coffee, requirements)
 
 
 def test_empty_search_uses_truthful_combined_status(tmp_path):

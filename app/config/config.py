@@ -347,6 +347,8 @@ class SceneRankingConfig:
     read_timeout_seconds: int
     total_deadline_seconds: int
     max_attempts_per_scene: int
+    max_concurrent_scene_rankings: int
+    max_remote_attempts_per_minute: int
 
 
 _SCENE_RANKING_DEFAULTS = {
@@ -354,11 +356,15 @@ _SCENE_RANKING_DEFAULTS = {
     "provider": "nvidia_hosted",
     "api_key": "",
     "model": "nvidia/nemotron-nano-12b-v2-vl",
-    "max_remote_scene_requests_per_task": 12,
+    # A normal short-form task can contain 17 meaningful scenes.  This is a
+    # task-level cap, not the provider's requests-per-minute setting.
+    "max_remote_scene_requests_per_task": 20,
     "connect_timeout_seconds": 10,
     "read_timeout_seconds": 45,
     "total_deadline_seconds": 300,
     "max_attempts_per_scene": 2,
+    "max_concurrent_scene_rankings": 4,
+    "max_remote_attempts_per_minute": 30,
 }
 _SCENE_RANKING_INTEGER_BOUNDS = {
     "max_remote_scene_requests_per_task": (0, 60),
@@ -366,9 +372,23 @@ _SCENE_RANKING_INTEGER_BOUNDS = {
     "read_timeout_seconds": (1, 120),
     "total_deadline_seconds": (1, 900),
     "max_attempts_per_scene": (1, 2),
+    "max_concurrent_scene_rankings": (1, 6),
+    "max_remote_attempts_per_minute": (1, 60),
 }
 _SCENE_RANKING_API_KEY_MAX_BYTES = 4096
 _SCENE_RANKING_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_SCENE_RANKING_MODEL = re.compile(r"^nvidia/[a-z0-9][a-z0-9._-]{0,127}$")
+
+
+def _validate_scene_ranking_api_key(value) -> str:
+    if (
+        type(value) is not str
+        or value != value.strip()
+        or len(value.encode("utf-8")) > _SCENE_RANKING_API_KEY_MAX_BYTES
+        or _SCENE_RANKING_CONTROL.search(value)
+    ):
+        raise ValueError("scene ranking API key is invalid")
+    return value
 
 
 def get_scene_ranking_config(environ=None) -> SceneRankingConfig:
@@ -383,19 +403,17 @@ def get_scene_ranking_config(environ=None) -> SceneRankingConfig:
             raise ValueError(f"scene_ranking.{name} must be a string")
     if values["provider"] != "nvidia_hosted":
         raise ValueError("unsupported scene ranking provider")
-    if values["model"] != "nvidia/nemotron-nano-12b-v2-vl":
+    if not _SCENE_RANKING_MODEL.fullmatch(values["model"]):
         raise ValueError("unsupported scene ranking model")
     for name, (minimum, maximum) in _SCENE_RANKING_INTEGER_BOUNDS.items():
         value = values[name]
         if type(value) is not int or not minimum <= value <= maximum:
             raise ValueError(f"scene_ranking.{name} is outside the supported range")
+    # Validate the persisted value even when an environment override is
+    # present. A valid machine secret must not mask malformed configuration.
+    configured_api_key = _validate_scene_ranking_api_key(values["api_key"])
     environment = os.environ if environ is None else environ
-    api_key = environment.get("NVIDIA_API_KEY", values["api_key"])
-    if (
-        type(api_key) is not str
-        or api_key != api_key.strip()
-        or len(api_key.encode("utf-8")) > _SCENE_RANKING_API_KEY_MAX_BYTES
-        or _SCENE_RANKING_CONTROL.search(api_key)
-    ):
-        raise ValueError("scene ranking API key is invalid")
+    api_key = _validate_scene_ranking_api_key(
+        environment.get("NVIDIA_API_KEY", configured_api_key)
+    )
     return SceneRankingConfig(**{**values, "api_key": api_key})

@@ -307,11 +307,13 @@ enabled = false
 provider = "nvidia_hosted"
 api_key = ""
 model = "nvidia/nemotron-nano-12b-v2-vl"
-max_remote_scene_requests_per_task = 12
+max_remote_scene_requests_per_task = 20
 connect_timeout_seconds = 10
 read_timeout_seconds = 45
 total_deadline_seconds = 300
 max_attempts_per_scene = 2
+max_concurrent_scene_rankings = 4
+max_remote_attempts_per_minute = 30
 
 # =============================================================================
 # TTS Providers / 语音合成服务

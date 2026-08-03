@@ -168,6 +168,7 @@ def test_exact_request_and_scoring_example():
         "seed",
         "max_tokens",
         "stream",
+        "response_format",
     }
     assert prepared.request | {"messages": None} == {
         "model": scene_ranking.MODEL,
@@ -176,6 +177,7 @@ def test_exact_request_and_scoring_example():
         "seed": 0,
         "max_tokens": 2048,
         "stream": False,
+        "response_format": {"type": "json_object"},
     }
     item = scene_ranking.Assessment("C01", 83, 91, 12, False)
     assert item.score == 8600
@@ -184,14 +186,18 @@ def test_exact_request_and_scoring_example():
 @pytest.mark.parametrize(
     "content",
     [
-        "```json\n{}\n```",
         '{"scene_index":1,"scene_index":1,"assessments":[]}',
         '{"scene_index":1,"assessments":[{"label":"C01","relevance":NaN,"visual_quality":1,"mismatch":1,"unsafe":false}]}',
     ],
 )
-def test_strict_content_rejects_fences_duplicates_and_nan(content):
+def test_strict_content_rejects_duplicates_and_nan(content):
     with pytest.raises(ValueError):
         scene_ranking.parse_content(content, 1, ("C01",))
+
+
+def test_harmless_json_fence_is_unwrapped_before_strict_validation():
+    content = "```json\n" + json.dumps(_valid(("C01",))) + "\n```"
+    assert scene_ranking.parse_content(content, 1, ("C01",)) == _valid(("C01",))
 
 
 def test_boolean_integer_and_label_errors_rejected():
@@ -269,6 +275,72 @@ def test_mocked_request_retry_and_envelope_without_secret_in_body():
     assert all(call[1]["stream"] is True for call in session.calls)
 
 
+def test_invalid_content_gets_one_bounded_corrective_retry():
+    prepared = scene_ranking.prepare(
+        _scene(1), [_jpeg()], "nvidia_hosted", scene_ranking.MODEL, "16:9"
+    )
+    valid = json.dumps(_valid(prepared.labels))
+    session = Session(
+        [
+            Response(
+                200,
+                {
+                    "choices": [
+                        {"finish_reason": "stop", "message": {"content": "not-json"}}
+                    ]
+                },
+            ),
+            Response(
+                200,
+                {"choices": [{"finish_reason": "stop", "message": {"content": valid}}]},
+            ),
+        ]
+    )
+    cfg = SimpleNamespace(
+        max_attempts_per_scene=2, connect_timeout_seconds=10, read_timeout_seconds=45
+    )
+    result, attempts = scene_ranking.request_remote(
+        prepared,
+        1,
+        "secret",
+        cfg,
+        session=session,
+        monotonic=lambda: 1,
+        sleep=lambda _: None,
+        deadline=100,
+    )
+    assert result == _valid(prepared.labels)
+    assert attempts == 2
+    assert b"secret" not in session.calls[1][1]["data"]
+    corrective = json.loads(session.calls[1][1]["data"])
+    assert corrective["messages"][-1]["role"] == "user"
+
+
+def test_permanently_invalid_content_has_bounded_reason_code():
+    prepared = scene_ranking.prepare(
+        _scene(1), [_jpeg()], "nvidia_hosted", scene_ranking.MODEL, "16:9"
+    )
+    invalid = Response(
+        200, {"choices": [{"finish_reason": "stop", "message": {"content": "bad"}}]}
+    )
+    cfg = SimpleNamespace(
+        max_attempts_per_scene=2, connect_timeout_seconds=10, read_timeout_seconds=45
+    )
+    with pytest.raises(scene_ranking.RankingError) as error:
+        scene_ranking.request_remote(
+            prepared,
+            1,
+            "x",
+            cfg,
+            session=Session([invalid, invalid]),
+            monotonic=lambda: 1,
+            sleep=lambda _: None,
+            deadline=100,
+        )
+    assert error.value.reason == "vlm_content_invalid"
+    assert error.value.attempts == 2
+
+
 def test_finish_reason_and_oversized_response_rejected():
     prepared = scene_ranking.prepare(
         _scene(1), [_jpeg()], "nvidia_hosted", scene_ranking.MODEL, "16:9"
@@ -315,6 +387,59 @@ def test_non_retryable_statuses_make_one_attempt_and_close(status):
     assert error.value.attempts == 1
     assert len(session.calls) == 1
     assert response.closed
+
+
+def test_http_429_remains_separately_classified_and_bounded():
+    prepared = scene_ranking.prepare(
+        _scene(1), [_jpeg()], "nvidia_hosted", scene_ranking.MODEL, "16:9"
+    )
+    cfg = SimpleNamespace(
+        max_attempts_per_scene=2, connect_timeout_seconds=10, read_timeout_seconds=45
+    )
+    with pytest.raises(scene_ranking.RankingError) as error:
+        scene_ranking.request_remote(
+            prepared,
+            1,
+            "x",
+            cfg,
+            session=Session([Response(429, {}), Response(429, {})]),
+            monotonic=lambda: 1,
+            sleep=lambda _: None,
+            deadline=100,
+        )
+    assert error.value.reason == "vlm_rate_limited"
+    assert error.value.attempts == 2
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (requests.ConnectTimeout("secret detail"), "vlm_connect_timeout"),
+        (requests.ReadTimeout("secret detail"), "vlm_read_timeout"),
+        (requests.exceptions.SSLError("secret detail"), "vlm_tls_failed"),
+        (requests.exceptions.ProxyError("secret detail"), "vlm_proxy_failed"),
+        (requests.ConnectionError("secret detail"), "vlm_connection_failed"),
+    ],
+)
+def test_transport_failures_use_bounded_reason_codes(failure, reason):
+    prepared = scene_ranking.prepare(
+        _scene(1), [_jpeg()], "nvidia_hosted", scene_ranking.MODEL, "16:9"
+    )
+    cfg = SimpleNamespace(
+        max_attempts_per_scene=1, connect_timeout_seconds=10, read_timeout_seconds=45
+    )
+    with pytest.raises(scene_ranking.RankingError) as error:
+        scene_ranking.request_remote(
+            prepared,
+            1,
+            "x",
+            cfg,
+            session=Session([failure]),
+            monotonic=lambda: 1,
+            deadline=100,
+        )
+    assert error.value.reason == reason
+    assert "secret detail" not in error.value.reason
 
 
 def test_transport_retry_retry_after_and_deadline_attempt_counts():

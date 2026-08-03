@@ -261,6 +261,64 @@ class TestSceneRenderPlan(unittest.TestCase):
             result = json.loads(Path(target).read_text(encoding="utf-8"))["scenes"][0]
         self.assertEqual(result["fallback_reason"], "no_candidates")
 
+    def test_ranking_unresolved_statuses_become_bounded_fallbacks(self):
+        timeline = self._timeline()
+        timeline[1]["text"] = "Middle scene"
+        selection = self._selection(
+            [
+                {
+                    "scene_index": 1,
+                    "status": "ranking_unavailable",
+                    "fallback_reason": "vlm_schema_invalid",
+                    "reuse_scene_index": None,
+                },
+                {
+                    "scene_index": 2,
+                    "status": "no_acceptable_candidate",
+                    "fallback_reason": "no_acceptable_candidate",
+                    "reuse_scene_index": None,
+                },
+                {
+                    "scene_index": 3,
+                    "status": "ranking_unavailable",
+                    "fallback_reason": "duplicate_candidate_unavailable",
+                    "reuse_scene_index": None,
+                },
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._write(tmp, timeline, selection)
+            target = scene_render_plan.create_scene_render_plan(
+                *(str(path) for path in paths)
+            )
+            rows = json.loads(Path(target).read_text(encoding="utf-8"))["scenes"]
+        self.assertEqual(
+            [row["fallback_reason"] for row in rows],
+            [
+                "ranking_unavailable",
+                "no_acceptable_candidate",
+                "duplicate_candidate_unavailable",
+            ],
+        )
+        self.assertTrue(all(row["binding"] == "fallback_required" for row in rows))
+
+    def test_unknown_status_and_unbounded_ranking_reason_fail_closed(self):
+        for row in (
+            {"scene_index": 1, "status": "future_status", "reuse_scene_index": None},
+            {
+                "scene_index": 1,
+                "status": "ranking_unavailable",
+                "fallback_reason": "raw provider response must not pass",
+                "reuse_scene_index": None,
+            },
+        ):
+            with self.subTest(row=row), tempfile.TemporaryDirectory() as tmp:
+                paths = self._write(tmp, [self._timeline()[0]], self._selection([row]))
+                with self.assertRaises(ValueError):
+                    scene_render_plan.create_scene_render_plan(
+                        *(str(path) for path in paths)
+                    )
+
     def test_structural_ambiguity_is_rejected(self):
         cases = []
         duplicate = self._selected(1)
@@ -348,7 +406,6 @@ class TestSceneRenderPlan(unittest.TestCase):
                     )
             self.assertFalse((Path(tmp) / "scene_render_plan.json").exists())
             self.assertEqual(list(Path(tmp).glob("*.tmp")), [])
-
 
     def test_strict_loader_verifies_source_bytes_and_existing_schema(self):
         with tempfile.TemporaryDirectory() as tmp:

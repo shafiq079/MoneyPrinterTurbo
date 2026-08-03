@@ -58,6 +58,10 @@ class NoSelectedSceneCoverageError(ValueError):
     """Selected downloads cannot cover every scene without a legacy fallback."""
 
 
+class IncompleteMeaningfulSceneCoverageError(ValueError):
+    """A meaningful narration scene lacks its own validated selected material."""
+
+
 class AcquisitionError(ValueError):
     def __init__(self, code: str):
         super().__init__(code)
@@ -337,6 +341,13 @@ def create_scene_render_materials(
     plan = scene_render_plan.load_scene_render_plan(
         render_plan_path, scene_manifest_path, selection_manifest_path
     )
+    if any(
+        scene["text"].strip() and scene["binding"] != "selected"
+        for scene in plan["scenes"]
+    ):
+        raise IncompleteMeaningfulSceneCoverageError(
+            "meaningful scene coverage is incomplete"
+        )
     plan_path = _contained_file(render_plan_path, task_root, "render plan")
     plan_bytes = _regular_bytes(plan_path, MAX_MANIFEST_BYTES, "render plan")
     selected_root = _real_root(
@@ -390,6 +401,11 @@ def create_scene_render_materials(
             selected_errors[url_hash] = exc.code
         except Exception:
             selected_errors[url_hash] = "invalid_media"
+
+    if selected_errors:
+        raise IncompleteMeaningfulSceneCoverageError(
+            "selected meaningful material acquisition failed"
+        )
 
     legacy_rows = []
     seen_legacy_paths = set()

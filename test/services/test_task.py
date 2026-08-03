@@ -100,8 +100,12 @@ class TestTaskService(unittest.TestCase):
             retrieve = stack.enter_context(
                 patch.object(
                     tm.scene_candidate,
-                    "retrieve_scene_candidates",
-                    return_value=candidate_path,
+                    "retrieve_scene_candidates_result",
+                    return_value=tm.scene_candidate.SceneCandidateRetrievalResult(
+                        candidate_path,
+                        tm.scene_candidate.SceneCandidatePlanningState.complete,
+                        0,
+                    ),
                 )
             )
             preview = stack.enter_context(
@@ -2298,7 +2302,7 @@ class TestLazyLegacyMaterials(unittest.TestCase):
                     tmp, stop_at="video", preview_result=str(preview),
                     selection_result=str(selection), render_plan_result=str(plan),
                 )
-            self.assertEqual(create.call_count, 2)
+            self.assertEqual(create.call_count, 1)
             get_materials = result[5]
             get_materials.assert_called_once_with(
                 "preview-pipeline", unittest.mock.ANY, ["term"], 5,
@@ -2448,7 +2452,15 @@ class TestLazyLegacyMaterials(unittest.TestCase):
             patch.object(tm.scene_timeline, "create_scene_timeline", return_value="scenes"),
             patch("builtins.open", MagicMock()),
             patch.object(tm.json, "load", return_value=[]),
-            patch.object(tm.scene_candidate, "retrieve_scene_candidates", return_value="candidates"),
+            patch.object(
+                tm.scene_candidate,
+                "retrieve_scene_candidates_result",
+                return_value=tm.scene_candidate.SceneCandidateRetrievalResult(
+                    "candidates",
+                    tm.scene_candidate.SceneCandidatePlanningState.complete,
+                    0,
+                ),
+            ),
             patch.object(tm.os.path, "isfile", return_value=True),
             patch.object(tm.scene_preview, "prepare_scene_previews", return_value="previews"),
             patch.object(tm.scene_selection, "create_scene_selections", return_value="selections"),
