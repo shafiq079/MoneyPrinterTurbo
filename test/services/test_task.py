@@ -55,6 +55,7 @@ class TestTaskService(unittest.TestCase):
         probe_error=None,
         render_side_effect=None,
         materials=None,
+        planning_state=None,
     ):
         timeline_path = Path(tmp_path) / "scenes.json"
         timeline_path.write_text("[]", encoding="utf-8")
@@ -103,7 +104,8 @@ class TestTaskService(unittest.TestCase):
                     "retrieve_scene_candidates_result",
                     return_value=tm.scene_candidate.SceneCandidateRetrievalResult(
                         candidate_path,
-                        tm.scene_candidate.SceneCandidatePlanningState.complete,
+                        planning_state
+                        or tm.scene_candidate.SceneCandidatePlanningState.complete,
                         0,
                     ),
                 )
@@ -218,6 +220,34 @@ class TestTaskService(unittest.TestCase):
             preview.assert_not_called()
             selection.assert_not_called()
             self.assertNotIn("scene_previews_path", result)
+
+    def test_partial_semantic_planning_keeps_phase_one_legacy_routing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_path = Path(tmp) / "scene_candidates.json"
+            candidate_path.write_text(
+                '{"version":3,"semantic_planning":{"status":"partial"}}',
+                encoding="utf-8",
+            )
+            result, _, retrieve, preview, selection, get_materials, render, materials = (
+                self._run_preview_pipeline(
+                    tmp,
+                    candidate_path=str(candidate_path),
+                    planning_state=(
+                        tm.scene_candidate.SceneCandidatePlanningState.semantic_plan_unavailable
+                    ),
+                    stop_at="video",
+                )
+            )
+        retrieve.assert_called_once()
+        preview.assert_not_called()
+        selection.assert_not_called()
+        self.last_render_plan.assert_not_called()
+        get_materials.assert_called_once()
+        render.assert_called_once()
+        self.assertIs(render.call_args.args[2], materials)
+        self.assertIs(result["materials"], materials)
+        self.assertNotIn("scene_previews_path", result)
+        self.assertNotIn("scene_render_materials_path", result)
 
     def test_preview_failure_is_nonfatal_and_preserves_renderer_arguments(self):
         with tempfile.TemporaryDirectory() as tmp:

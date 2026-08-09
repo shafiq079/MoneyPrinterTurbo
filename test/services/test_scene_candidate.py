@@ -530,14 +530,14 @@ def test_unavailable_semantic_plan_prohibits_scene_provider_work(tmp_path):
     unavailable = llm.SemanticPlanResult(
         llm.SemanticPlanState.unavailable,
         (),
-        llm.SemanticPlanDiagnostic.provider_failed,
+        llm.SemanticPlanDiagnostic.provider_rate_limited,
         1,
         1,
         2,
         1,
         (
             llm.SemanticPlanIssue(
-                0, None, llm.SemanticPlanDiagnostic.provider_failed, 2
+                0, None, llm.SemanticPlanDiagnostic.provider_rate_limited, 2
             ),
         ),
     )
@@ -579,7 +579,7 @@ def test_unavailable_semantic_plan_prohibits_scene_provider_work(tmp_path):
             {
                 "batch_index": 0,
                 "scene_index": None,
-                "reason": "provider_failed",
+                "reason": "provider_rate_limited",
                 "attempt": 2,
             }
         ],

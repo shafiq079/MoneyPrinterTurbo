@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from typing import List
 
 from loguru import logger
+import openai
 from openai import AzureOpenAI, OpenAI
 from openai.types.chat import ChatCompletion
 
@@ -84,6 +85,18 @@ class SemanticPlanDiagnostic(str, Enum):
     scene_limit_exceeded = "scene_limit_exceeded"
     task_deadline_exhausted = "task_deadline_exhausted"
     provider_failed = "provider_failed"
+    provider_timeout = "provider_timeout"
+    provider_rate_limited = "provider_rate_limited"
+    provider_connection_failed = "provider_connection_failed"
+    provider_http_client_error = "provider_http_client_error"
+    provider_http_server_error = "provider_http_server_error"
+    provider_authentication_failed = "provider_authentication_failed"
+    provider_permission_denied = "provider_permission_denied"
+    provider_configuration_invalid = "provider_configuration_invalid"
+    provider_invalid_envelope = "provider_invalid_envelope"
+    provider_empty_content = "provider_empty_content"
+    provider_content_filtered = "provider_content_filtered"
+    provider_output_truncated = "provider_output_truncated"
     invalid_json = "invalid_json"
     root_not_object = "root_not_object"
     root_fields_invalid = "root_fields_invalid"
@@ -1132,7 +1145,7 @@ def _semantic_provider_snapshot():
     provider = get_llm_provider(provider_id)
     if provider is None:
         raise SemanticRequestFailure(
-            SemanticPlanDiagnostic.provider_failed, retryable=False
+            SemanticPlanDiagnostic.provider_configuration_invalid, retryable=False
         )
     model = provider.resolve_model_name(
         config.app.get(provider.config_key("model_name"), "")
@@ -1156,11 +1169,11 @@ def _semantic_provider_snapshot():
         for value in values
     ):
         raise SemanticRequestFailure(
-            SemanticPlanDiagnostic.invalid_input, retryable=False
+            SemanticPlanDiagnostic.provider_configuration_invalid, retryable=False
         )
     if provider.requires_api_key and not api_key:
         raise SemanticRequestFailure(
-            SemanticPlanDiagnostic.provider_failed, retryable=False
+            SemanticPlanDiagnostic.provider_configuration_invalid, retryable=False
         )
     return {
         "provider_id": provider_id,
@@ -1175,6 +1188,104 @@ def _semantic_provider_snapshot():
     }
 
 
+def _classify_semantic_provider_exception(exc: Exception) -> SemanticRequestFailure:
+    if isinstance(exc, openai.APITimeoutError):
+        return SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_timeout, retryable=True
+        )
+    if isinstance(exc, openai.RateLimitError):
+        return SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_rate_limited, retryable=True
+        )
+    if isinstance(exc, openai.AuthenticationError):
+        return SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_authentication_failed, retryable=False
+        )
+    if isinstance(exc, openai.PermissionDeniedError):
+        return SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_permission_denied, retryable=False
+        )
+    if isinstance(exc, openai.InternalServerError):
+        return SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_http_server_error, retryable=True
+        )
+    if isinstance(exc, openai.APIStatusError):
+        status = getattr(exc, "status_code", 0)
+        if status == 408:
+            return SemanticRequestFailure(
+                SemanticPlanDiagnostic.provider_timeout, retryable=True
+            )
+        if status == 429:
+            return SemanticRequestFailure(
+                SemanticPlanDiagnostic.provider_rate_limited, retryable=True
+            )
+        if status == 401:
+            return SemanticRequestFailure(
+                SemanticPlanDiagnostic.provider_authentication_failed,
+                retryable=False,
+            )
+        if status == 403:
+            return SemanticRequestFailure(
+                SemanticPlanDiagnostic.provider_permission_denied, retryable=False
+            )
+        if isinstance(status, int) and 500 <= status <= 599:
+            return SemanticRequestFailure(
+                SemanticPlanDiagnostic.provider_http_server_error, retryable=True
+            )
+        return SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_http_client_error, retryable=False
+        )
+    if isinstance(exc, openai.APIConnectionError):
+        return SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_connection_failed, retryable=True
+        )
+    return SemanticRequestFailure(
+        SemanticPlanDiagnostic.provider_failed, retryable=False
+    )
+
+
+def _semantic_extract_chat_completion_text(response, provider_id: str) -> str:
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_invalid_envelope, retryable=True
+        )
+    choice = choices[0]
+    finish_reason = getattr(choice, "finish_reason", None)
+    if finish_reason == "content_filter":
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_content_filtered, retryable=False
+        )
+    if finish_reason == "length":
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_output_truncated, retryable=True
+        )
+    if finish_reason != "stop":
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_invalid_envelope, retryable=True
+        )
+    message = getattr(choice, "message", None)
+    if message is None:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_invalid_envelope, retryable=True
+        )
+    if getattr(message, "refusal", None):
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_content_filtered, retryable=False
+        )
+    content = getattr(message, "content", None)
+    if not isinstance(content, str):
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_empty_content, retryable=True
+        )
+    try:
+        return _normalize_text_response(content, provider_id)
+    except ValueError:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_empty_content, retryable=True
+        ) from None
+
+
 def _semantic_generate_from_snapshot(snapshot, prompt):
     """One semantic-only request using only the validated private snapshot."""
     if not isinstance(snapshot, dict) or set(snapshot) != {
@@ -1187,7 +1298,7 @@ def _semantic_generate_from_snapshot(snapshot, prompt):
         "extras",
     }:
         raise SemanticRequestFailure(
-            SemanticPlanDiagnostic.invalid_input, retryable=False
+            SemanticPlanDiagnostic.provider_configuration_invalid, retryable=False
         )
     adapter = snapshot["adapter"]
     if adapter not in {
@@ -1197,7 +1308,7 @@ def _semantic_generate_from_snapshot(snapshot, prompt):
         "modelscope",
     }:
         raise SemanticRequestFailure(
-            SemanticPlanDiagnostic.provider_failed, retryable=False
+            SemanticPlanDiagnostic.provider_configuration_invalid, retryable=False
         )
     client = None
     try:
@@ -1233,13 +1344,13 @@ def _semantic_generate_from_snapshot(snapshot, prompt):
         if adapter == "modelscope":
             kwargs["extra_body"] = {"enable_thinking": False}
         response = client.chat.completions.create(**kwargs)
-        return _extract_chat_completion_text(response, snapshot["provider_id"])
+        return _semantic_extract_chat_completion_text(
+            response, snapshot["provider_id"]
+        )
     except SemanticRequestFailure:
         raise
     except Exception as exc:
-        raise SemanticRequestFailure(
-            SemanticPlanDiagnostic.provider_failed, retryable=True
-        ) from exc
+        raise _classify_semantic_provider_exception(exc) from None
     finally:
         if client is not None:
             client.close()

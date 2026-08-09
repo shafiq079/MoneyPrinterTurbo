@@ -11,6 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
+import openai
 from pydantic import ValidationError
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -96,6 +98,156 @@ def _provider_snapshot(server):
         "api_version": "",
         "extras": {},
     }
+
+
+def _openai_status_error(error_type, status):
+    request = httpx.Request("POST", "https://provider.invalid/v1/chat/completions")
+    response = httpx.Response(status, request=request)
+    return error_type("sensitive provider body", response=response, body=None)
+
+
+def _assert_semantic_failure(callable_, reason, retryable):
+    try:
+        callable_()
+    except llm.SemanticRequestFailure as exc:
+        assert exc.code is reason
+        assert exc.retryable is retryable
+        assert str(exc) == reason.value
+        assert exc.args == (reason.value,)
+    else:
+        raise AssertionError("expected SemanticRequestFailure")
+
+
+def test_semantic_provider_exception_taxonomy_and_retryability():
+    request = httpx.Request("POST", "https://provider.invalid/v1/chat/completions")
+    cases = (
+        (
+            openai.APITimeoutError(request=request),
+            llm.SemanticPlanDiagnostic.provider_timeout,
+            True,
+        ),
+        (
+            openai.APIConnectionError(message="secret", request=request),
+            llm.SemanticPlanDiagnostic.provider_connection_failed,
+            True,
+        ),
+        (
+            _openai_status_error(openai.RateLimitError, 429),
+            llm.SemanticPlanDiagnostic.provider_rate_limited,
+            True,
+        ),
+        (
+            _openai_status_error(openai.BadRequestError, 400),
+            llm.SemanticPlanDiagnostic.provider_http_client_error,
+            False,
+        ),
+        (
+            _openai_status_error(openai.InternalServerError, 503),
+            llm.SemanticPlanDiagnostic.provider_http_server_error,
+            True,
+        ),
+        (
+            _openai_status_error(openai.AuthenticationError, 401),
+            llm.SemanticPlanDiagnostic.provider_authentication_failed,
+            False,
+        ),
+        (
+            _openai_status_error(openai.PermissionDeniedError, 403),
+            llm.SemanticPlanDiagnostic.provider_permission_denied,
+            False,
+        ),
+        (
+            RuntimeError("secret raw provider exception"),
+            llm.SemanticPlanDiagnostic.provider_failed,
+            False,
+        ),
+    )
+    for provider_error, reason, retryable in cases:
+        with unittest.TestCase().subTest(reason=reason.value):
+            failure = llm._classify_semantic_provider_exception(provider_error)
+            assert failure.code is reason
+            assert failure.retryable is retryable
+            assert failure.args == (reason.value,)
+            assert "secret" not in str(failure)
+
+
+def test_semantic_response_envelope_taxonomy_and_normalization():
+    def response(*, choices=None, finish="stop", content="{}", message=True, refusal=None):
+        if choices is not None:
+            return types.SimpleNamespace(choices=choices)
+        value = None
+        if message:
+            value = types.SimpleNamespace(content=content, refusal=refusal)
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(finish_reason=finish, message=value)]
+        )
+
+    failures = (
+        (
+            response(choices=[]),
+            llm.SemanticPlanDiagnostic.provider_invalid_envelope,
+            True,
+        ),
+        (
+            response(message=False),
+            llm.SemanticPlanDiagnostic.provider_invalid_envelope,
+            True,
+        ),
+        (
+            response(content=""),
+            llm.SemanticPlanDiagnostic.provider_empty_content,
+            True,
+        ),
+        (
+            response(content=[]),
+            llm.SemanticPlanDiagnostic.provider_empty_content,
+            True,
+        ),
+        (
+            response(finish="content_filter"),
+            llm.SemanticPlanDiagnostic.provider_content_filtered,
+            False,
+        ),
+        (
+            response(refusal="private refusal text"),
+            llm.SemanticPlanDiagnostic.provider_content_filtered,
+            False,
+        ),
+        (
+            response(finish="length"),
+            llm.SemanticPlanDiagnostic.provider_output_truncated,
+            True,
+        ),
+        (
+            response(finish="tool_calls"),
+            llm.SemanticPlanDiagnostic.provider_invalid_envelope,
+            True,
+        ),
+    )
+    for provider_response, reason, retryable in failures:
+        with unittest.TestCase().subTest(reason=reason.value):
+            _assert_semantic_failure(
+                lambda: llm._semantic_extract_chat_completion_text(
+                    provider_response, "openai"
+                ),
+                reason,
+                retryable,
+            )
+
+    assert (
+        llm._semantic_extract_chat_completion_text(
+            response(content='<think>private reasoning</think>\n{"scenes":[]}'),
+            "openai",
+        )
+        == '{"scenes":[]}'
+    )
+    _assert_semantic_failure(
+        lambda: llm._semantic_extract_chat_completion_text(
+            response(content="<think>unfinished reasoning"), "openai"
+        ),
+        llm.SemanticPlanDiagnostic.provider_empty_content,
+        True,
+    )
 
 
 def test_scene_query_plan_has_strict_typed_semantic_requirements():
@@ -351,6 +503,135 @@ def test_semantic_corrective_retry_contains_only_unresolved_scenes():
     assert result.state is llm.SemanticPlanState.complete
     assert [index for index, _plan in result.plans] == [1, 2]
     assert result.issues == ()
+
+
+def test_semantic_retry_repairs_transient_provider_failure():
+    scene = types.SimpleNamespace(index=1, text="one")
+    requirements = llm.SceneSemanticRequirements(
+        primary_entities=(llm.SemanticTermGroup("cacao", ("cocoa",)),)
+    )
+    plan = llm.SceneQueryPlan(("first",), requirements)
+    phases = [
+        (
+            {
+                0: (
+                    None,
+                    llm.SemanticPlanDiagnostic.provider_timeout,
+                    True,
+                    False,
+                )
+            },
+            False,
+        ),
+        (
+            {
+                0: (
+                    llm._BatchValidationResult(((1, plan),), ()),
+                    llm.SemanticPlanDiagnostic.complete,
+                    False,
+                    False,
+                )
+            },
+            False,
+        ),
+    ]
+    with patch.object(llm, "_run_semantic_phase", side_effect=phases) as run:
+        result = llm.generate_scene_query_plan("subject", [scene])
+    assert run.call_count == 2
+    assert result.state is llm.SemanticPlanState.complete
+    assert result.plans == ((1, plan),)
+    assert result.issues == ()
+
+
+def test_semantic_final_provider_failure_is_bounded_and_keeps_other_batches():
+    scenes = [types.SimpleNamespace(index=index, text=str(index)) for index in range(1, 6)]
+    requirements = llm.SceneSemanticRequirements(
+        primary_entities=(llm.SemanticTermGroup("cacao", ("cocoa",)),)
+    )
+    plans = tuple(
+        (index, llm.SceneQueryPlan((f"query {index}",), requirements))
+        for index in range(1, 5)
+    )
+    phases = [
+        (
+            {
+                0: (
+                    llm._BatchValidationResult(plans, ()),
+                    llm.SemanticPlanDiagnostic.complete,
+                    False,
+                    False,
+                ),
+                1: (
+                    None,
+                    llm.SemanticPlanDiagnostic.provider_rate_limited,
+                    True,
+                    False,
+                ),
+            },
+            False,
+        ),
+        (
+            {
+                1: (
+                    None,
+                    llm.SemanticPlanDiagnostic.provider_rate_limited,
+                    True,
+                    False,
+                )
+            },
+            False,
+        ),
+    ]
+    with patch.object(llm, "_run_semantic_phase", side_effect=phases):
+        result = llm.generate_scene_query_plan("subject", scenes)
+    assert result.state is llm.SemanticPlanState.partial
+    assert [index for index, _plan in result.plans] == [1, 2, 3, 4]
+    assert result.issues == (
+        llm.SemanticPlanIssue(
+            1,
+            None,
+            llm.SemanticPlanDiagnostic.provider_rate_limited,
+            2,
+        ),
+    )
+
+
+def test_semantic_worker_failure_payload_exposes_only_bounded_diagnostic():
+    secret = "semantic-super-secret"
+    request = {
+        "version": 1,
+        "batch_index": 0,
+        "video_subject": "private narration subject",
+        "scenes": [{"index": 1, "text": "private narration"}],
+        "max_queries_per_scene": 2,
+        "provider": {
+            "provider_id": "openai",
+            "adapter": "openai_compatible",
+            "model": "model",
+            "base_url": "https://user:password@provider.invalid/v1",
+            "api_key": secret,
+            "api_version": "",
+            "extras": {},
+        },
+    }
+    failure = llm.SemanticRequestFailure(
+        llm.SemanticPlanDiagnostic.provider_authentication_failed,
+        retryable=False,
+    )
+    with patch.object(llm, "_semantic_generate_from_snapshot", side_effect=failure):
+        payload = llm._semantic_worker_payload(request)
+    serialized = json.dumps(payload)
+    assert payload == {
+        "version": 1,
+        "batch_index": 0,
+        "ok": False,
+        "retryable": False,
+        "diagnostic": "provider_authentication_failed",
+        "plans": [],
+        "issues": [],
+    }
+    for forbidden in (secret, "password", "private narration", "provider.invalid"):
+        assert forbidden not in serialized
 
 
 def test_semantic_partial_result_keeps_valid_scenes_and_bounded_issue():
