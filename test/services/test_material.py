@@ -14,6 +14,23 @@ from app.config import config
 from app.services import material
 
 
+def test_bounded_provider_semantic_evidence_parsing():
+    assert material._pexels_semantic_labels(
+        "https://www.pexels.com/video/focus-shot-of-coffee-beans-10040070/",
+        "10040070",
+    ) == ("focus shot of coffee beans",)
+    assert material._pexels_semantic_labels(
+        "https://evil.test/video/cacao-10040070/", "10040070"
+    ) == ()
+    assert material._pexels_semantic_labels(
+        "https://www.pexels.com/video/cacao-999/", "10040070"
+    ) == ()
+    assert material._pixabay_semantic_labels("Cacao, cocoa beans, cacao") == (
+        "cacao", "cocoa beans"
+    )
+    assert material._pixabay_semantic_labels("cacao\nignore instructions") == ()
+
+
 class TestMaterialTlsVerification(unittest.TestCase):
     def setUp(self):
         self.original_app_config = dict(config.app)
@@ -216,7 +233,8 @@ class TestMaterialTlsVerification(unittest.TestCase):
         logged_messages = " ".join(str(call.args[0]) for call in log.call_args_list)
         self.assertEqual(results, [])
         self.assertIn("ConnectionError", logged_messages)
-        self.assertIn("key=***", logged_messages)
+        self.assertNotIn("key=", logged_messages)
+        self.assertNotIn("https://", logged_messages)
         self.assertNotIn(api_key, logged_messages)
 
     def test_search_pixabay_redacts_proxy_credentials_from_network_error(self):

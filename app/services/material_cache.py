@@ -20,7 +20,7 @@ from app.utils import utils
 
 MATERIAL_SEARCH_CACHE_TTL_SECONDS = 24 * 60 * 60
 _CACHE_FORMAT_VERSION = 1
-_RICH_CACHE_FORMAT_VERSION = 2
+_RICH_CACHE_FORMAT_VERSION = 3
 _CACHE_CLEANUP_INTERVAL_SECONDS = 60 * 60
 _CACHE_FILE_PATTERN = re.compile(r"^[0-9a-f]{64}\.json$")
 
@@ -30,6 +30,30 @@ _CACHE_FILE_PATTERN = re.compile(r"^[0-9a-f]{64}\.json$")
 _CACHE_LOCKS = tuple(threading.Lock() for _ in range(256))
 _cleanup_state_lock = threading.Lock()
 _last_cleanup_monotonic: float | None = None
+
+
+def _rich_candidate(payload) -> ProviderVideoCandidate:
+    if not isinstance(payload, dict):
+        raise ValueError("invalid rich candidate")
+    labels = payload.get("semantic_labels", [])
+    source = payload.get("semantic_source", "none")
+    if (
+        not isinstance(labels, list)
+        or len(labels) > 16
+        or source not in {"none", "provider_page_slug", "provider_tags"}
+        or any(
+            not isinstance(label, str)
+            or not 1 <= len(label) <= 80
+            or re.search(r"[\x00-\x1f\x7f]", label)
+            for label in labels
+        )
+        or sum(len(label.encode("utf-8")) for label in labels) > 512
+        or bool(labels) != (source != "none")
+    ):
+        raise ValueError("invalid rich candidate semantic evidence")
+    return ProviderVideoCandidate(
+        **{**payload, "semantic_labels": tuple(labels), "semantic_source": source}
+    )
 
 
 def _cache_dir() -> Path:
@@ -238,7 +262,7 @@ def load_material_candidate_search_cache(
             "items"
         ):
             raise ValueError("invalid rich cache payload")
-        return [ProviderVideoCandidate(**item) for item in payload["items"]]
+        return [_rich_candidate(item) for item in payload["items"]]
     except (OSError, ValueError, TypeError) as exc:
         logger.warning(f"failed to load rich material search cache: {exc}")
         _remove_invalid_cache(cache_path)
@@ -264,6 +288,8 @@ def save_material_candidate_search_cache(
             "width": item.width,
             "height": item.height,
             "provider_rank": item.provider_rank,
+            "semantic_labels": list(item.semantic_labels),
+            "semantic_source": item.semantic_source,
         }
         for item in items
         if item.url and item.duration > 0

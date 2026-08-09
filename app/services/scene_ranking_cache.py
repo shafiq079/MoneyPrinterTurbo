@@ -11,9 +11,9 @@ from pathlib import Path
 
 from app.utils import utils
 
-CACHE_VERSION = "scene-ranking-cache-v1"
+CACHE_VERSION = "scene-ranking-cache-v2"
 MAX_CACHE_BYTES = 64_000
-_NAME = re.compile(r"^ranking-v1-[0-9a-f]{64}\.json$")
+_NAME = re.compile(r"^ranking-v2-[0-9a-f]{64}\.json$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -35,7 +35,7 @@ def identity(payload: dict) -> str:
 def object_name(digest: str) -> str:
     if type(digest) is not str or not _DIGEST.fullmatch(digest):
         raise ValueError("invalid ranking cache digest")
-    return f"ranking-v1-{digest}.json"
+    return f"ranking-v2-{digest}.json"
 
 
 def _no_duplicates(pairs):

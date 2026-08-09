@@ -1,10 +1,24 @@
 import json
 import logging
+import os
 import re
+import selectors
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+import unicodedata
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
 from time import perf_counter
+from types import SimpleNamespace
 from typing import List
 
 from loguru import logger
+import openai
 from openai import AzureOpenAI, OpenAI
 from openai.types.chat import ChatCompletion
 
@@ -12,6 +26,19 @@ from app.config import config
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
 
 _max_retries = 5
+SEMANTIC_BATCH_SIZE = 4
+MAX_SEMANTIC_SCENES = 40
+MAX_SEMANTIC_RESPONSE_BYTES = 256 * 1024
+MAX_SEMANTIC_IPC_BYTES = 12 * 1024
+MAX_SEMANTIC_REQUEST_BYTES = 64 * 1024
+SEMANTIC_ATTEMPT_SECONDS = 45
+SEMANTIC_TASK_SECONDS = 240
+SEMANTIC_CONCURRENCY = 2
+SEMANTIC_OUTPUT_BASE_TOKENS = 1024
+SEMANTIC_OUTPUT_TOKENS_PER_SCENE = 1024
+SEMANTIC_OUTPUT_HARD_MAX = 4096
+SEMANTIC_WORKER_PROTOCOL_VERSION = 2
+_SEMANTIC_IPC_HEADER = struct.Struct("!I")
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 10
 MAX_SCRIPT_PROMPT_LENGTH = 2000
@@ -25,6 +52,209 @@ _SENSITIVE_QUERY_RE = re.compile(
     r"([?&](?:api[_-]?key|access[_-]?token|token|key|secret|password)=)([^&#\s]+)",
     re.IGNORECASE,
 )
+
+_GENERIC_PRIMARY_TERMS = frozenset(
+    "person people man woman child hand hands object item thing food bean beans seed seeds farm factory machine machinery liquid material process production worker footage video close up".split()
+)
+
+
+@dataclass(frozen=True)
+class SemanticTermGroup:
+    canonical: str
+    aliases: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SceneSemanticRequirements:
+    primary_entities: tuple[SemanticTermGroup, ...]
+    actions: tuple[SemanticTermGroup, ...] = ()
+    contexts: tuple[SemanticTermGroup, ...] = ()
+
+
+@dataclass(frozen=True)
+class SceneQueryPlan:
+    queries: tuple[str, ...]
+    requirements: SceneSemanticRequirements
+
+
+@dataclass(frozen=True, slots=True)
+class _SemanticAdapterCapability:
+    output_token_parameter: str
+    suppress_reasoning: bool = False
+
+
+@dataclass(slots=True)
+class _SemanticRateGate:
+    next_start_at: float
+
+
+_SEMANTIC_ADAPTER_CAPABILITIES = {
+    "openai_compatible": _SemanticAdapterCapability("max_tokens"),
+    "azure": _SemanticAdapterCapability("max_tokens"),
+    "cloudflare_ai_gateway": _SemanticAdapterCapability("max_tokens"),
+    "modelscope": _SemanticAdapterCapability("max_tokens", suppress_reasoning=True),
+}
+
+
+class SemanticPlanState(str, Enum):
+    complete = "complete"
+    partial = "partial"
+    unavailable = "unavailable"
+
+
+class SemanticPlanDiagnostic(str, Enum):
+    complete = "complete"
+    invalid_input = "invalid_input"
+    scene_limit_exceeded = "scene_limit_exceeded"
+    task_deadline_exhausted = "task_deadline_exhausted"
+    provider_failed = "provider_failed"
+    provider_timeout = "provider_timeout"
+    provider_rate_limited = "provider_rate_limited"
+    provider_connection_failed = "provider_connection_failed"
+    provider_http_client_error = "provider_http_client_error"
+    provider_http_server_error = "provider_http_server_error"
+    provider_authentication_failed = "provider_authentication_failed"
+    provider_permission_denied = "provider_permission_denied"
+    provider_configuration_invalid = "provider_configuration_invalid"
+    provider_invalid_envelope = "provider_invalid_envelope"
+    provider_empty_content = "provider_empty_content"
+    provider_content_filtered = "provider_content_filtered"
+    provider_output_truncated = "provider_output_truncated"
+    invalid_json = "invalid_json"
+    root_not_object = "root_not_object"
+    root_fields_invalid = "root_fields_invalid"
+    scenes_not_array = "scenes_not_array"
+    scene_entry_not_object = "scene_entry_not_object"
+    scene_index_missing = "scene_index_missing"
+    scene_index_invalid = "scene_index_invalid"
+    scene_index_unexpected = "scene_index_unexpected"
+    scene_index_duplicate = "scene_index_duplicate"
+    scene_order_invalid = "scene_order_invalid"
+    entry_fields_invalid = "entry_fields_invalid"
+    queries_not_array = "queries_not_array"
+    query_count_invalid = "query_count_invalid"
+    query_not_string = "query_not_string"
+    query_control_character = "query_control_character"
+    query_empty = "query_empty"
+    query_too_long = "query_too_long"
+    requirements_not_object = "requirements_not_object"
+    requirements_fields_invalid = "requirements_fields_invalid"
+    primary_entity_count_invalid = "primary_entity_count_invalid"
+    action_count_invalid = "action_count_invalid"
+    context_count_invalid = "context_count_invalid"
+    term_group_not_object = "term_group_not_object"
+    term_group_fields_invalid = "term_group_fields_invalid"
+    canonical_invalid = "canonical_invalid"
+    aliases_not_array = "aliases_not_array"
+    alias_count_invalid = "alias_count_invalid"
+    alias_invalid = "alias_invalid"
+    primary_entity_too_generic = "primary_entity_too_generic"
+    requirements_too_large = "requirements_too_large"
+    coverage_invalid = "coverage_invalid"
+    response_too_large = "response_too_large"
+    ipc_invalid = "ipc_invalid"
+    ipc_too_large = "ipc_too_large"
+    worker_terminated = "worker_terminated"
+    worker_unreaped = "worker_unreaped"
+    worker_start_failed = "worker_start_failed"
+
+
+@dataclass(frozen=True)
+class SemanticPlanResult:
+    state: SemanticPlanState
+    plans: tuple[tuple[int, SceneQueryPlan], ...]
+    diagnostic: SemanticPlanDiagnostic
+    meaningful_scene_count: int
+    batch_count: int
+    attempts_started: int
+    attempts_timed_out: int
+    issues: tuple["SemanticPlanIssue", ...] = ()
+
+
+@dataclass(frozen=True)
+class SemanticPlanIssue:
+    batch_index: int
+    scene_index: int | None
+    reason: SemanticPlanDiagnostic
+    attempt: int
+
+
+class SemanticRequestFailure(Exception):
+    def __init__(self, code: SemanticPlanDiagnostic, *, retryable: bool):
+        super().__init__(code.value)
+        self.code = code
+        self.retryable = retryable
+
+
+def _query_no_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate scene query key")
+        result[key] = value
+    return result
+
+
+def _semantic_phrase(value, maximum=48) -> str:
+    if not isinstance(value, str) or re.search(r"[\x00-\x1f\x7f]", value):
+        raise ValueError("invalid semantic phrase")
+    result = " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+    if not 2 <= len(result) <= maximum:
+        raise ValueError("semantic phrase is outside the supported range")
+    return result
+
+
+def _term_group(payload, *, primary=False) -> SemanticTermGroup:
+    if not isinstance(payload, dict) or set(payload) != {"canonical", "aliases"}:
+        raise ValueError("invalid semantic term group")
+    canonical = _semantic_phrase(payload["canonical"])
+    aliases = payload["aliases"]
+    if not isinstance(aliases, list) or len(aliases) > 4:
+        raise ValueError("invalid semantic aliases")
+    normalized = []
+    seen = {canonical}
+    for alias in aliases:
+        alias = _semantic_phrase(alias)
+        if alias not in seen:
+            seen.add(alias)
+            normalized.append(alias)
+    if primary and all(
+        all(token in _GENERIC_PRIMARY_TERMS for token in phrase.split())
+        for phrase in (canonical, *normalized)
+    ):
+        raise ValueError("primary entity group is overly generic")
+    return SemanticTermGroup(canonical, tuple(normalized))
+
+
+def _requirements(payload) -> SceneSemanticRequirements:
+    if not isinstance(payload, dict) or set(payload) != {
+        "primary_entities",
+        "actions",
+        "contexts",
+    }:
+        raise ValueError("invalid semantic requirements")
+    bounds = {"primary_entities": (1, 4), "actions": (0, 3), "contexts": (0, 3)}
+    parsed = {}
+    total = 0
+    for field, (minimum, maximum) in bounds.items():
+        values = payload[field]
+        if not isinstance(values, list) or not minimum <= len(values) <= maximum:
+            raise ValueError(
+                "semantic requirement count is outside the supported range"
+            )
+        groups = tuple(
+            _term_group(value, primary=field == "primary_entities") for value in values
+        )
+        total += sum(
+            len(text.encode("utf-8"))
+            for group in groups
+            for text in (group.canonical, *group.aliases)
+        )
+        parsed[field] = groups
+    if total > 512:
+        raise ValueError("semantic requirements are too large")
+    return SceneSemanticRequirements(**parsed)
+
 
 DEFAULT_SCRIPT_SYSTEM_PROMPT = """
 # Role: Video Script Generator
@@ -137,7 +367,7 @@ def _extract_qwen_generation_text(response) -> str:
     return _normalize_text_response(text, "qwen")
 
 
-def _generate_response(prompt: str) -> str:
+def _generate_response(prompt: str, *, _raise_typed: bool = False) -> str:
     try:
         llm_provider = str(
             config.app.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)
@@ -396,6 +626,10 @@ def _generate_response(prompt: str) -> str:
             )
 
     except Exception as e:
+        if _raise_typed:
+            raise SemanticRequestFailure(
+                SemanticPlanDiagnostic.provider_failed, retryable=True
+            ) from e
         return f"Error: {_sanitize_error_message(e)}"
 
 
@@ -686,77 +920,1194 @@ Please note that you must use English for generating video search terms; Chinese
     return search_terms
 
 
-def generate_scene_queries(
-    video_subject: str, scenes: list, max_queries_per_scene: int = 3
-) -> tuple[dict[int, list[str]], str | None]:
-    """Generate queries for all meaningful scenes in one batched LLM request."""
+def _scene_query_prompt(video_subject, batch, max_queries_per_scene):
+    payload = [{"scene_index": scene.index, "text": scene.text} for scene in batch]
+    return f"""
+# Role: Scene Stock-Footage Query Generator
+Generate 1-{max_queries_per_scene} concrete English stock-footage search queries and
+typed English visual requirements for every narration scene. primary_entities are
+specific visible identities; every group is required and aliases within a group are
+alternatives. Never use generic identities such as person, hands, beans, farm,
+factory, machine, liquid, or footage. Actions and contexts are optional evidence.
+Use short noun phrases, the fewest sufficient groups, and aliases only for genuine
+equivalents. Return compact JSON without whitespace, prose, Markdown, or explanations.
+Every scene object must contain exactly scene_index, queries, and requirements.
+Every requirements object must contain exactly primary_entities, actions, and
+contexts. Every term group must contain exactly canonical and aliases. Include all
+keys even when an optional array is empty; never use null and never add fields.
+Return JSON only in this exact shape and with no additional fields:
+{{"scenes":[{{"scene_index":1,"queries":["cacao pod harvest"],"requirements":{{"primary_entities":[{{"canonical":"cacao","aliases":["cocoa"]}}],"actions":[{{"canonical":"harvest","aliases":["picking"]}}],"contexts":[]}}}}]}}
+
+Video subject: {video_subject}
+Scenes: {json.dumps(payload, ensure_ascii=False)}
+""".strip()
+
+
+def _semantic_output_token_allowance(scene_count, configured_max=4096):
+    if (
+        type(scene_count) is not int
+        or not 1 <= scene_count <= SEMANTIC_BATCH_SIZE
+        or type(configured_max) is not int
+        or not 512 <= configured_max <= SEMANTIC_OUTPUT_HARD_MAX
+    ):
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_configuration_invalid, retryable=False
+        )
+    calculated = (
+        SEMANTIC_OUTPUT_BASE_TOKENS
+        + SEMANTIC_OUTPUT_TOKENS_PER_SCENE * scene_count
+    )
+    return min(calculated, configured_max, SEMANTIC_OUTPUT_HARD_MAX)
+
+
+def _semantic_rate_start_delay(rate_gate, now, deadline, requests_per_minute):
+    if (
+        not isinstance(rate_gate, _SemanticRateGate)
+        or type(now) not in (int, float)
+        or type(deadline) not in (int, float)
+        or type(requests_per_minute) is not int
+        or not 1 <= requests_per_minute <= 60
+        or rate_gate.next_start_at >= deadline
+    ):
+        return None
+    return max(0.0, rate_gate.next_start_at - now)
+
+
+def _semantic_record_request_start(rate_gate, now, requests_per_minute):
+    interval = 60.0 / requests_per_minute
+    started_at = max(rate_gate.next_start_at, now)
+    rate_gate.next_start_at = started_at + interval
+    return started_at
+
+
+@dataclass(frozen=True)
+class _BatchValidationResult:
+    plans: tuple[tuple[int, SceneQueryPlan], ...]
+    issues: tuple[tuple[int | None, SemanticPlanDiagnostic], ...]
+
+
+def _validation_issue(scene_index, reason):
+    return (scene_index, reason)
+
+
+def _detailed_term_group(payload, *, primary):
+    if not isinstance(payload, dict):
+        return None, SemanticPlanDiagnostic.term_group_not_object
+    if set(payload) != {"canonical", "aliases"}:
+        return None, SemanticPlanDiagnostic.term_group_fields_invalid
+    try:
+        canonical = _semantic_phrase(payload["canonical"])
+    except Exception:
+        return None, SemanticPlanDiagnostic.canonical_invalid
+    aliases = payload["aliases"]
+    if not isinstance(aliases, list):
+        return None, SemanticPlanDiagnostic.aliases_not_array
+    if len(aliases) > 4:
+        return None, SemanticPlanDiagnostic.alias_count_invalid
+    normalized, seen = [], {canonical}
+    for value in aliases:
+        try:
+            alias = _semantic_phrase(value)
+        except Exception:
+            return None, SemanticPlanDiagnostic.alias_invalid
+        if alias not in seen:
+            seen.add(alias)
+            normalized.append(alias)
+    if primary and all(
+        all(token in _GENERIC_PRIMARY_TERMS for token in phrase.split())
+        for phrase in (canonical, *normalized)
+    ):
+        return None, SemanticPlanDiagnostic.primary_entity_too_generic
+    return SemanticTermGroup(canonical, tuple(normalized)), None
+
+
+def _detailed_requirements(payload):
+    if not isinstance(payload, dict):
+        return None, SemanticPlanDiagnostic.requirements_not_object
+    if set(payload) != {"primary_entities", "actions", "contexts"}:
+        return None, SemanticPlanDiagnostic.requirements_fields_invalid
+    bounds = {
+        "primary_entities": (1, 4, SemanticPlanDiagnostic.primary_entity_count_invalid),
+        "actions": (0, 3, SemanticPlanDiagnostic.action_count_invalid),
+        "contexts": (0, 3, SemanticPlanDiagnostic.context_count_invalid),
+    }
+    parsed, total = {}, 0
+    for field, (minimum, maximum, reason) in bounds.items():
+        values = payload[field]
+        if not isinstance(values, list) or not minimum <= len(values) <= maximum:
+            return None, reason
+        groups = []
+        for value in values:
+            group, error = _detailed_term_group(
+                value, primary=field == "primary_entities"
+            )
+            if error is not None:
+                return None, error
+            groups.append(group)
+            total += sum(
+                len(text.encode("utf-8")) for text in (group.canonical, *group.aliases)
+            )
+        parsed[field] = tuple(groups)
+    if total > 512:
+        return None, SemanticPlanDiagnostic.requirements_too_large
+    return SceneSemanticRequirements(**parsed), None
+
+
+def _validate_scene_query_batch(response, batch, max_queries_per_scene):
+    if (
+        not isinstance(response, str)
+        or len(response.encode("utf-8")) > MAX_SEMANTIC_RESPONSE_BYTES
+    ):
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.response_too_large, retryable=False
+        )
+    try:
+        payload = json.loads(
+            _strip_code_fence(response),
+            object_pairs_hook=_query_no_duplicates,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+        )
+    except Exception as exc:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.invalid_json, retryable=True
+        ) from exc
+    if not isinstance(payload, dict):
+        return _BatchValidationResult(
+            (), (_validation_issue(None, SemanticPlanDiagnostic.root_not_object),)
+        )
+    if set(payload) != {"scenes"}:
+        return _BatchValidationResult(
+            (), (_validation_issue(None, SemanticPlanDiagnostic.root_fields_invalid),)
+        )
+    entries = payload["scenes"]
+    if not isinstance(entries, list):
+        return _BatchValidationResult(
+            (), (_validation_issue(None, SemanticPlanDiagnostic.scenes_not_array),)
+        )
+    expected = [scene.index for scene in batch]
+    expected_set = set(expected)
+    seen, valid, issues, observed = set(), {}, [], []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            issues.append(
+                _validation_issue(None, SemanticPlanDiagnostic.scene_entry_not_object)
+            )
+            continue
+        if "scene_index" not in entry:
+            issues.append(
+                _validation_issue(None, SemanticPlanDiagnostic.scene_index_missing)
+            )
+            continue
+        index = entry["scene_index"]
+        if type(index) is not int:
+            issues.append(
+                _validation_issue(None, SemanticPlanDiagnostic.scene_index_invalid)
+            )
+            continue
+        observed.append(index)
+        if index not in expected_set:
+            issues.append(
+                _validation_issue(None, SemanticPlanDiagnostic.scene_index_unexpected)
+            )
+            continue
+        if index in seen:
+            issues.append(
+                _validation_issue(index, SemanticPlanDiagnostic.scene_index_duplicate)
+            )
+            valid.pop(index, None)
+            continue
+        seen.add(index)
+        if set(entry) != {"scene_index", "queries", "requirements"}:
+            issues.append(
+                _validation_issue(index, SemanticPlanDiagnostic.entry_fields_invalid)
+            )
+            continue
+        queries = entry["queries"]
+        if not isinstance(queries, list):
+            issues.append(
+                _validation_issue(index, SemanticPlanDiagnostic.queries_not_array)
+            )
+            continue
+        if not 1 <= len(queries) <= max_queries_per_scene:
+            issues.append(
+                _validation_issue(index, SemanticPlanDiagnostic.query_count_invalid)
+            )
+            continue
+        normalized, query_seen, query_error = [], set(), None
+        for query in queries:
+            if not isinstance(query, str):
+                query_error = SemanticPlanDiagnostic.query_not_string
+                break
+            if re.search(r"[\x00-\x1f\x7f]", query):
+                query_error = SemanticPlanDiagnostic.query_control_character
+                break
+            query = " ".join(query.split()).strip(" ,.;:!?")
+            if not query:
+                query_error = SemanticPlanDiagnostic.query_empty
+                break
+            if len(query) > 80:
+                query_error = SemanticPlanDiagnostic.query_too_long
+                break
+            key = query.casefold()
+            if key not in query_seen:
+                normalized.append(query)
+                query_seen.add(key)
+        if query_error is not None:
+            issues.append(_validation_issue(index, query_error))
+            continue
+        requirements, requirement_error = _detailed_requirements(entry["requirements"])
+        if requirement_error is not None:
+            issues.append(_validation_issue(index, requirement_error))
+            continue
+        valid[index] = SceneQueryPlan(tuple(normalized), requirements)
+    known_observed = [index for index in observed if index in expected_set]
+    if known_observed != [index for index in expected if index in known_observed]:
+        for index in known_observed:
+            valid.pop(index, None)
+        issues.append(
+            _validation_issue(None, SemanticPlanDiagnostic.scene_order_invalid)
+        )
+    issue_indexes = {index for index, _reason in issues if index is not None}
+    for index in expected:
+        if index not in seen and index not in issue_indexes:
+            issues.append(
+                _validation_issue(index, SemanticPlanDiagnostic.coverage_invalid)
+            )
+    plans = tuple((index, valid[index]) for index in expected if index in valid)
+    return _BatchValidationResult(plans, tuple(issues[: len(batch) + 4]))
+
+
+def _parse_scene_query_batch(response, batch, max_queries_per_scene):
+    result = _validate_scene_query_batch(response, batch, max_queries_per_scene)
+    if result.issues:
+        raise SemanticRequestFailure(result.issues[0][1], retryable=True)
+    return result.plans
+
+
+def _plan_to_payload(index, plan):
+    def groups(values):
+        return [
+            {"canonical": value.canonical, "aliases": list(value.aliases)}
+            for value in values
+        ]
+
+    return {
+        "scene_index": index,
+        "queries": list(plan.queries),
+        "requirements": {
+            "primary_entities": groups(plan.requirements.primary_entities),
+            "actions": groups(plan.requirements.actions),
+            "contexts": groups(plan.requirements.contexts),
+        },
+    }
+
+
+def _semantic_provider_snapshot():
+    provider_id = str(config.app.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)).lower()
+    provider = get_llm_provider(provider_id)
+    if provider is None:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_configuration_invalid, retryable=False
+        )
+    model = provider.resolve_model_name(
+        config.app.get(provider.config_key("model_name"), "")
+    )
+    base_url = provider.resolve_base_url(
+        config.app.get(provider.config_key("base_url"), "")
+    )
+    api_key = config.app.get(provider.config_key("api_key"), "")
+    extras = {
+        field.config_suffix: config.app.get(
+            provider.config_key(field.config_suffix), ""
+        )
+        or field.default_value
+        for field in provider.extra_fields
+    }
+    values = [provider_id, provider.adapter, model, base_url, api_key, *extras.values()]
+    if any(
+        not isinstance(value, str)
+        or len(value) > 4096
+        or re.search(r"[\x00-\x1f\x7f]", value)
+        for value in values
+    ):
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_configuration_invalid, retryable=False
+        )
+    if provider.requires_api_key and not api_key:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_configuration_invalid, retryable=False
+        )
+    return {
+        "provider_id": provider_id,
+        "adapter": provider.adapter,
+        "model": model,
+        "base_url": base_url,
+        "api_key": api_key,
+        "api_version": str(
+            config.app.get(provider.config_key("api_version"), "2024-02-15-preview")
+        ),
+        "extras": extras,
+    }
+
+
+def _classify_semantic_provider_exception(exc: Exception) -> SemanticRequestFailure:
+    if isinstance(exc, openai.APITimeoutError):
+        return SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_timeout, retryable=True
+        )
+    if isinstance(exc, openai.RateLimitError):
+        return SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_rate_limited, retryable=True
+        )
+    if isinstance(exc, openai.AuthenticationError):
+        return SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_authentication_failed, retryable=False
+        )
+    if isinstance(exc, openai.PermissionDeniedError):
+        return SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_permission_denied, retryable=False
+        )
+    if isinstance(exc, openai.InternalServerError):
+        return SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_http_server_error, retryable=True
+        )
+    if isinstance(exc, openai.APIStatusError):
+        status = getattr(exc, "status_code", 0)
+        if status == 408:
+            return SemanticRequestFailure(
+                SemanticPlanDiagnostic.provider_timeout, retryable=True
+            )
+        if status == 429:
+            return SemanticRequestFailure(
+                SemanticPlanDiagnostic.provider_rate_limited, retryable=True
+            )
+        if status == 401:
+            return SemanticRequestFailure(
+                SemanticPlanDiagnostic.provider_authentication_failed,
+                retryable=False,
+            )
+        if status == 403:
+            return SemanticRequestFailure(
+                SemanticPlanDiagnostic.provider_permission_denied, retryable=False
+            )
+        if isinstance(status, int) and 500 <= status <= 599:
+            return SemanticRequestFailure(
+                SemanticPlanDiagnostic.provider_http_server_error, retryable=True
+            )
+        return SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_http_client_error, retryable=False
+        )
+    if isinstance(exc, openai.APIConnectionError):
+        return SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_connection_failed, retryable=True
+        )
+    return SemanticRequestFailure(
+        SemanticPlanDiagnostic.provider_failed, retryable=False
+    )
+
+
+def _semantic_extract_chat_completion_text(response, provider_id: str) -> str:
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_invalid_envelope, retryable=True
+        )
+    choice = choices[0]
+    finish_reason = getattr(choice, "finish_reason", None)
+    if finish_reason == "content_filter":
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_content_filtered, retryable=False
+        )
+    if finish_reason == "length":
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_output_truncated, retryable=True
+        )
+    if finish_reason != "stop":
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_invalid_envelope, retryable=True
+        )
+    message = getattr(choice, "message", None)
+    if message is None:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_invalid_envelope, retryable=True
+        )
+    if getattr(message, "refusal", None):
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_content_filtered, retryable=False
+        )
+    content = getattr(message, "content", None)
+    if not isinstance(content, str):
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_empty_content, retryable=True
+        )
+    try:
+        return _normalize_text_response(content, provider_id)
+    except ValueError:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_empty_content, retryable=True
+        ) from None
+
+
+def _semantic_generate_from_snapshot(snapshot, prompt, max_output_tokens):
+    """One semantic-only request using only the validated private snapshot."""
+    if not isinstance(snapshot, dict) or set(snapshot) != {
+        "provider_id",
+        "adapter",
+        "model",
+        "base_url",
+        "api_key",
+        "api_version",
+        "extras",
+    }:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_configuration_invalid, retryable=False
+        )
+    adapter = snapshot["adapter"]
+    capability = _SEMANTIC_ADAPTER_CAPABILITIES.get(adapter)
+    if capability is None or (
+        type(max_output_tokens) is not int
+        or not 512 <= max_output_tokens <= SEMANTIC_OUTPUT_HARD_MAX
+    ):
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_configuration_invalid, retryable=False
+        )
+    client = None
+    try:
+        if adapter == "azure":
+            client = AzureOpenAI(
+                api_key=snapshot["api_key"],
+                api_version=snapshot["api_version"],
+                azure_endpoint=snapshot["base_url"],
+                timeout=40,
+                max_retries=0,
+            )
+        else:
+            base_url = snapshot["base_url"]
+            headers = None
+            if adapter == "cloudflare_ai_gateway":
+                account = snapshot["extras"].get("account_id", "")
+                gateway = snapshot["extras"].get("gateway_id", "")
+                base_url = (
+                    f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1"
+                )
+                headers = {"cf-aig-gateway-id": gateway}
+            client = OpenAI(
+                api_key=snapshot["api_key"],
+                base_url=base_url,
+                default_headers=headers,
+                timeout=40,
+                max_retries=0,
+            )
+        kwargs = {
+            "model": snapshot["model"],
+            "messages": [{"role": "user", "content": prompt}],
+            capability.output_token_parameter: max_output_tokens,
+        }
+        if capability.suppress_reasoning:
+            kwargs["extra_body"] = {"enable_thinking": False}
+        response = client.chat.completions.create(**kwargs)
+        return _semantic_extract_chat_completion_text(
+            response, snapshot["provider_id"]
+        )
+    except SemanticRequestFailure:
+        raise
+    except Exception as exc:
+        raise _classify_semantic_provider_exception(exc) from None
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _semantic_worker_payload(request):
+    try:
+        if (
+            not isinstance(request, dict)
+            or set(request)
+            != {
+                "version",
+                "work_id",
+                "video_subject",
+                "scenes",
+                "max_queries_per_scene",
+                "max_output_tokens",
+                "provider",
+            }
+            or request["version"] != SEMANTIC_WORKER_PROTOCOL_VERSION
+        ):
+            raise SemanticRequestFailure(
+                SemanticPlanDiagnostic.invalid_input, retryable=False
+            )
+        work_id = request["work_id"]
+        scenes = request["scenes"]
+        if (
+            type(work_id) is not int
+            or work_id < 0
+            or not isinstance(scenes, list)
+            or not 1 <= len(scenes) <= SEMANTIC_BATCH_SIZE
+        ):
+            raise SemanticRequestFailure(
+                SemanticPlanDiagnostic.invalid_input, retryable=False
+            )
+        batch = tuple(
+            SimpleNamespace(index=item["index"], text=item["text"]) for item in scenes
+        )
+        response = _semantic_generate_from_snapshot(
+            request["provider"],
+            _scene_query_prompt(
+                request["video_subject"], batch, request["max_queries_per_scene"]
+            ),
+            request["max_output_tokens"],
+        )
+        validation = _validate_scene_query_batch(
+            response, batch, request["max_queries_per_scene"]
+        )
+        return {
+            "version": SEMANTIC_WORKER_PROTOCOL_VERSION,
+            "work_id": work_id,
+            "ok": True,
+            "retryable": bool(validation.issues),
+            "diagnostic": (
+                validation.issues[0][1].value
+                if validation.issues
+                else SemanticPlanDiagnostic.complete.value
+            ),
+            "plans": [
+                _plan_to_payload(index, plan) for index, plan in validation.plans
+            ],
+            "issues": [
+                {"scene_index": index, "reason": reason.value}
+                for index, reason in validation.issues
+            ],
+        }
+    except SemanticRequestFailure as exc:
+        return {
+            "version": SEMANTIC_WORKER_PROTOCOL_VERSION,
+            "work_id": request.get("work_id", -1)
+            if isinstance(request, dict)
+            else -1,
+            "ok": False,
+            "retryable": exc.retryable,
+            "diagnostic": exc.code.value,
+            "plans": [],
+            "issues": [],
+        }
+    except Exception:
+        return {
+            "version": SEMANTIC_WORKER_PROTOCOL_VERSION,
+            "work_id": request.get("work_id", -1)
+            if isinstance(request, dict)
+            else -1,
+            "ok": False,
+            "retryable": False,
+            "diagnostic": SemanticPlanDiagnostic.invalid_input.value,
+            "plans": [],
+            "issues": [],
+        }
+
+
+def _recv_worker_request(sock):
+    header = bytearray()
+    while len(header) < 4:
+        chunk = sock.recv(4 - len(header))
+        if not chunk:
+            raise ValueError("truncated request header")
+        header.extend(chunk)
+    length = _SEMANTIC_IPC_HEADER.unpack(header)[0]
+    if length > MAX_SEMANTIC_REQUEST_BYTES:
+        raise ValueError("request too large")
+    body = bytearray()
+    while len(body) < length:
+        chunk = sock.recv(min(4096, length - len(body)))
+        if not chunk:
+            raise ValueError("truncated request body")
+        body.extend(chunk)
+    return json.loads(body, object_pairs_hook=_query_no_duplicates)
+
+
+def run_scene_query_worker(sock):
+    """Import-safe worker entry used only by ``python -m``."""
+    try:
+        request = _recv_worker_request(sock)
+        payload = _semantic_worker_payload(request)
+        data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+        if len(data) > MAX_SEMANTIC_IPC_BYTES:
+            data = json.dumps(
+                {
+                    "version": SEMANTIC_WORKER_PROTOCOL_VERSION,
+                    "work_id": request.get("work_id", -1),
+                    "ok": False,
+                    "retryable": False,
+                    "diagnostic": SemanticPlanDiagnostic.ipc_too_large.value,
+                    "plans": [],
+                    "issues": [],
+                },
+                separators=(",", ":"),
+            ).encode()
+        sock.sendall(_SEMANTIC_IPC_HEADER.pack(len(data)) + data)
+    except Exception:
+        pass
+    finally:
+        sock.close()
+
+
+def _decode_semantic_ipc(data, work_id, batch, max_queries_per_scene):
+    try:
+        payload = json.loads(data, object_pairs_hook=_query_no_duplicates)
+        if (
+            not isinstance(payload, dict)
+            or set(payload)
+            != {
+                "version",
+                "work_id",
+                "ok",
+                "retryable",
+                "diagnostic",
+                "plans",
+                "issues",
+            }
+            or payload["version"] != SEMANTIC_WORKER_PROTOCOL_VERSION
+            or payload["work_id"] != work_id
+        ):
+            raise ValueError
+        diagnostic = SemanticPlanDiagnostic(payload["diagnostic"])
+        if type(payload["ok"]) is not bool or type(payload["retryable"]) is not bool:
+            raise ValueError
+        if not payload["ok"]:
+            if payload["plans"] != [] or payload["issues"] != []:
+                raise ValueError
+            return None, diagnostic, payload["retryable"]
+        if (
+            not isinstance(payload["issues"], list)
+            or len(payload["issues"]) > len(batch) + 4
+        ):
+            raise ValueError
+        response = json.dumps(
+            {"scenes": payload["plans"]}, separators=(",", ":"), ensure_ascii=False
+        )
+        plan_indexes = [
+            item.get("scene_index") if isinstance(item, dict) else None
+            for item in payload["plans"]
+        ]
+        scene_by_index = {scene.index: scene for scene in batch}
+        if len(plan_indexes) != len(set(plan_indexes)) or any(
+            index not in scene_by_index for index in plan_indexes
+        ):
+            raise ValueError
+        plan_batch = tuple(scene_by_index[index] for index in plan_indexes)
+        plans = (
+            _parse_scene_query_batch(response, plan_batch, max_queries_per_scene)
+            if plan_batch
+            else ()
+        )
+        reported = []
+        for issue in payload["issues"]:
+            if not isinstance(issue, dict) or set(issue) != {"scene_index", "reason"}:
+                raise ValueError
+            index = issue["scene_index"]
+            if index is not None and index not in {scene.index for scene in batch}:
+                raise ValueError
+            reported.append((index, SemanticPlanDiagnostic(issue["reason"])))
+        return (
+            _BatchValidationResult(plans, tuple(reported)),
+            diagnostic,
+            payload["retryable"],
+        )
+    except Exception:
+        return None, SemanticPlanDiagnostic.ipc_invalid, False
+
+
+def _minimal_worker_environment():
+    allowed = (
+        "PATH",
+        "PYTHONPATH",
+        "LD_LIBRARY_PATH",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+    )
+    result = {key: os.environ[key] for key in allowed if key in os.environ}
+    result.update({"PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"})
+    return result
+
+
+def _worker_request(
+    work_id,
+    video_subject,
+    batch,
+    max_queries_per_scene,
+    max_output_tokens,
+    provider,
+):
+    payload = {
+        "version": SEMANTIC_WORKER_PROTOCOL_VERSION,
+        "work_id": work_id,
+        "video_subject": video_subject,
+        "scenes": [{"index": scene.index, "text": scene.text} for scene in batch],
+        "max_queries_per_scene": max_queries_per_scene,
+        "max_output_tokens": max_output_tokens,
+        "provider": provider,
+    }
+    data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+    if len(data) > MAX_SEMANTIC_REQUEST_BYTES:
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.invalid_input, retryable=False
+        )
+    return _SEMANTIC_IPC_HEADER.pack(len(data)) + data
+
+
+def _run_semantic_phase(
+    works,
+    video_subject,
+    max_queries_per_scene,
+    deadline,
+    *,
+    provider_snapshot=None,
+    planning_config=None,
+    rate_gate=None,
+    popen=subprocess.Popen,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+):
+    pending = list(works)
+    work_map = dict(works)
+    active, results = {}, {}
+    selector = selectors.DefaultSelector()
+    unreaped = False
+    provider_snapshot = provider_snapshot or _semantic_provider_snapshot()
+    planning_config = planning_config or config.get_semantic_planning_config()
+    rate_gate = rate_gate or _SemanticRateGate(monotonic())
+    root = str(Path(__file__).resolve().parents[2])
+
+    def cleanup(record, timed_out=False):
+        nonlocal unreaped
+        sock, process = record["sock"], record["process"]
+        try:
+            selector.unregister(sock)
+        except Exception:
+            pass
+        sock.close()
+        if timed_out and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                unreaped = True
+                return SemanticPlanDiagnostic.worker_unreaped
+        return SemanticPlanDiagnostic.worker_terminated if timed_out else None
+
+    try:
+        while pending or active:
+            while (
+                pending
+                and len(active) < SEMANTIC_CONCURRENCY
+                and monotonic() < deadline
+                and _semantic_rate_start_delay(
+                    rate_gate,
+                    monotonic(),
+                    deadline,
+                    planning_config.max_requests_per_minute,
+                )
+                == 0
+            ):
+                index, batch = pending.pop(0)
+                parent, child = socket.socketpair()
+                parent.setblocking(False)
+                child.set_inheritable(True)
+                try:
+                    process = popen(
+                        [
+                            sys.executable,
+                            "-m",
+                            "app.services.scene_query_worker",
+                            str(child.fileno()),
+                        ],
+                        cwd=root,
+                        env=_minimal_worker_environment(),
+                        pass_fds=(child.fileno(),),
+                        close_fds=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    outbound = _worker_request(
+                        index,
+                        video_subject,
+                        batch,
+                        max_queries_per_scene,
+                        _semantic_output_token_allowance(
+                            len(batch), planning_config.max_output_tokens
+                        ),
+                        provider_snapshot,
+                    )
+                except Exception:
+                    parent.close()
+                    child.close()
+                    results[index] = (
+                        None,
+                        SemanticPlanDiagnostic.worker_start_failed,
+                        False,
+                        False,
+                    )
+                    continue
+                child.close()
+                record = {
+                    "sock": parent,
+                    "process": process,
+                    "outbound": outbound,
+                    "sent": 0,
+                    "buffer": bytearray(),
+                    "length": None,
+                    "deadline": min(
+                        deadline, monotonic() + SEMANTIC_ATTEMPT_SECONDS
+                    ),
+                }
+                active[index] = record
+                _semantic_record_request_start(
+                    rate_gate,
+                    monotonic(),
+                    planning_config.max_requests_per_minute,
+                )
+                selector.register(
+                    parent, selectors.EVENT_READ | selectors.EVENT_WRITE, index
+                )
+            if not active:
+                now = monotonic()
+                if pending and rate_gate.next_start_at < deadline:
+                    sleep(max(0, min(0.05, rate_gate.next_start_at - now)))
+                    continue
+                break
+            nearest = min(record["deadline"] for record in active.values())
+            wake_at = min(nearest, rate_gate.next_start_at) if pending else nearest
+            events = selector.select(max(0, min(0.05, wake_at - monotonic())))
+            for key, mask in events:
+                index = key.data
+                record = active.get(index)
+                if record is None:
+                    continue
+                sock = record["sock"]
+                if mask & selectors.EVENT_WRITE and record["sent"] < len(
+                    record["outbound"]
+                ):
+                    try:
+                        count = sock.send(record["outbound"][record["sent"] :])
+                        record["sent"] += count
+                        if record["sent"] == len(record["outbound"]):
+                            sock.shutdown(socket.SHUT_WR)
+                            selector.modify(sock, selectors.EVENT_READ, index)
+                    except (BlockingIOError, InterruptedError):
+                        pass
+                    except OSError:
+                        cleanup(record)
+                        active.pop(index)
+                        results[index] = (
+                            None,
+                            SemanticPlanDiagnostic.ipc_invalid,
+                            False,
+                            False,
+                        )
+                        continue
+                if mask & selectors.EVENT_READ and index in active:
+                    try:
+                        chunk = sock.recv(4096)
+                    except (BlockingIOError, InterruptedError):
+                        continue
+                    except OSError:
+                        chunk = b""
+                    if chunk:
+                        record["buffer"].extend(chunk)
+                        if record["length"] is None and len(record["buffer"]) >= 4:
+                            record["length"] = _SEMANTIC_IPC_HEADER.unpack(
+                                record["buffer"][:4]
+                            )[0]
+                            if record["length"] > MAX_SEMANTIC_IPC_BYTES:
+                                record["length"] = -1
+                        length = record["length"]
+                        if length == -1 or (
+                            length is not None and len(record["buffer"]) >= 4 + length
+                        ):
+                            valid = length != -1 and len(record["buffer"]) == 4 + length
+                            value = (
+                                (
+                                    *_decode_semantic_ipc(
+                                        bytes(record["buffer"][4:]),
+                                        index,
+                                        work_map[index],
+                                        max_queries_per_scene,
+                                    ),
+                                    False,
+                                )
+                                if valid
+                                else (
+                                    None,
+                                    SemanticPlanDiagnostic.ipc_too_large
+                                    if length == -1
+                                    else SemanticPlanDiagnostic.ipc_invalid,
+                                    False,
+                                    False,
+                                )
+                            )
+                            cleanup(record)
+                            active.pop(index)
+                            results[index] = value
+                    else:
+                        cleanup(record)
+                        active.pop(index)
+                        results[index] = (
+                            None,
+                            SemanticPlanDiagnostic.ipc_invalid,
+                            False,
+                            False,
+                        )
+            now = monotonic()
+            for index, record in list(active.items()):
+                if now >= record["deadline"]:
+                    diagnostic = cleanup(record, timed_out=True)
+                    active.pop(index)
+                    results[index] = (
+                        None,
+                        diagnostic,
+                        diagnostic == SemanticPlanDiagnostic.worker_terminated,
+                        True,
+                    )
+            if unreaped:
+                pending.clear()
+                break
+        for index, _batch in pending:
+            results[index] = (
+                None,
+                SemanticPlanDiagnostic.task_deadline_exhausted,
+                False,
+                False,
+            )
+    finally:
+        for index, record in list(active.items()):
+            results[index] = (None, cleanup(record, timed_out=True), False, True)
+        selector.close()
+    return results, unreaped
+
+
+def generate_scene_query_plan(
+    video_subject, scenes, max_queries_per_scene=3, *, provider_snapshot=None
+):
+    meaningful = [scene for scene in scenes if scene.text.strip()]
+    if not meaningful:
+        return SemanticPlanResult(
+            SemanticPlanState.complete, (), SemanticPlanDiagnostic.complete, 0, 0, 0, 0
+        )
+    if len(meaningful) > MAX_SEMANTIC_SCENES or len(
+        {s.index for s in meaningful}
+    ) != len(meaningful):
+        diagnostic = (
+            SemanticPlanDiagnostic.scene_limit_exceeded
+            if len(meaningful) > MAX_SEMANTIC_SCENES
+            else SemanticPlanDiagnostic.invalid_input
+        )
+        return SemanticPlanResult(
+            SemanticPlanState.unavailable,
+            (),
+            diagnostic,
+            len(meaningful),
+            0,
+            0,
+            0,
+            (SemanticPlanIssue(0, None, diagnostic, 1),),
+        )
+    batches = [
+        (i, tuple(meaningful[p : p + SEMANTIC_BATCH_SIZE]))
+        for i, p in enumerate(range(0, len(meaningful), SEMANTIC_BATCH_SIZE))
+    ]
+    try:
+        planning_config = config.get_semantic_planning_config()
+    except Exception:
+        diagnostic = SemanticPlanDiagnostic.provider_configuration_invalid
+        return SemanticPlanResult(
+            SemanticPlanState.unavailable,
+            (),
+            diagnostic,
+            len(meaningful),
+            len(batches),
+            0,
+            0,
+            (SemanticPlanIssue(0, None, diagnostic, 1),),
+        )
+    deadline = time.monotonic() + SEMANTIC_TASK_SECONDS
+    rate_gate = _SemanticRateGate(time.monotonic())
+    first, unreaped = _run_semantic_phase(
+        batches,
+        video_subject,
+        max_queries_per_scene,
+        deadline,
+        provider_snapshot=provider_snapshot,
+        planning_config=planning_config,
+        rate_gate=rate_gate,
+    )
+    attempts = len(first)
+    timed_out = sum(int(value[3]) for value in first.values())
+    plans_by_index = {}
+    retry, final_issues = [], []
+    next_work_id = len(batches)
+
+    def queue_retry(batch_index, unresolved, diagnostic):
+        nonlocal next_work_id
+        size = 2 if diagnostic is SemanticPlanDiagnostic.provider_output_truncated else 4
+        for offset in range(0, len(unresolved), size):
+            retry_batch = tuple(unresolved[offset : offset + size])
+            retry.append((next_work_id, batch_index, retry_batch))
+            next_work_id += 1
+
+    for batch_index, batch in batches:
+        value = first.get(batch_index)
+        result = value[0] if value else None
+        if result is not None:
+            plans_by_index.update(result.plans)
+            valid_indexes = {index for index, _plan in result.plans}
+            unresolved = tuple(
+                scene for scene in batch if scene.index not in valid_indexes
+            )
+            if unresolved and value[2]:
+                queue_retry(batch_index, unresolved, value[1])
+            elif unresolved:
+                final_issues.extend(
+                    SemanticPlanIssue(batch_index, index, reason, 1)
+                    for index, reason in result.issues
+                )
+        else:
+            if value and value[2]:
+                queue_retry(batch_index, batch, value[1])
+            else:
+                final_issues.append(
+                    SemanticPlanIssue(
+                        batch_index,
+                        None,
+                        value[1]
+                        if value
+                        else SemanticPlanDiagnostic.task_deadline_exhausted,
+                        1,
+                    )
+                )
+    second = {}
+    if retry and not unreaped and time.monotonic() < deadline:
+        second, unreaped = _run_semantic_phase(
+            [(work_id, batch) for work_id, _batch_index, batch in retry],
+            video_subject,
+            max_queries_per_scene,
+            deadline,
+            provider_snapshot=provider_snapshot,
+            planning_config=planning_config,
+            rate_gate=rate_gate,
+        )
+        attempts += len(second)
+        timed_out += sum(int(value[3]) for value in second.values())
+    for work_id, batch_index, retry_batch in retry:
+        value = second.get(work_id)
+        result = value[0] if value else None
+        if result is not None:
+            plans_by_index.update(result.plans)
+            valid_indexes = {index for index, _plan in result.plans}
+            unresolved = {scene.index for scene in retry_batch} - valid_indexes
+            final_issues.extend(
+                SemanticPlanIssue(batch_index, index, reason, 2)
+                for index, reason in result.issues
+                if index is None or index in unresolved
+            )
+            issue_indexes = {
+                issue.scene_index
+                for issue in final_issues
+                if issue.batch_index == batch_index
+            }
+            for index in sorted(
+                unresolved - {value for value in issue_indexes if value is not None}
+            ):
+                final_issues.append(
+                    SemanticPlanIssue(
+                        batch_index, index, SemanticPlanDiagnostic.coverage_invalid, 2
+                    )
+                )
+        else:
+            reason = (
+                SemanticPlanDiagnostic.worker_unreaped
+                if unreaped
+                else (
+                    value[1]
+                    if value
+                    else SemanticPlanDiagnostic.task_deadline_exhausted
+                )
+            )
+            indexes = (
+                [scene.index for scene in retry_batch]
+                if reason is SemanticPlanDiagnostic.provider_output_truncated
+                else [None]
+            )
+            final_issues.extend(
+                SemanticPlanIssue(batch_index, index, reason, 2)
+                for index in indexes
+            )
+    ordered_plans = tuple(
+        (scene.index, plans_by_index[scene.index])
+        for scene in meaningful
+        if scene.index in plans_by_index
+    )
+    if len(ordered_plans) == len(meaningful):
+        state, diagnostic, issues = (
+            SemanticPlanState.complete,
+            SemanticPlanDiagnostic.complete,
+            (),
+        )
+    elif ordered_plans:
+        state = SemanticPlanState.partial
+        issues = tuple(final_issues[: MAX_SEMANTIC_SCENES + len(batches)])
+        diagnostic = (
+            issues[0].reason if issues else SemanticPlanDiagnostic.coverage_invalid
+        )
+    else:
+        state = SemanticPlanState.unavailable
+        issues = tuple(final_issues[: MAX_SEMANTIC_SCENES + len(batches)])
+        diagnostic = (
+            issues[0].reason if issues else SemanticPlanDiagnostic.coverage_invalid
+        )
+    return SemanticPlanResult(
+        state,
+        ordered_plans,
+        diagnostic,
+        len(meaningful),
+        len(batches),
+        attempts,
+        timed_out,
+        issues,
+    )
+
+
+def generate_scene_queries(video_subject, scenes, max_queries_per_scene=3):
+    """Legacy synchronous compatibility wrapper for existing callers/tests."""
     meaningful = [scene for scene in scenes if scene.text.strip()]
     if not meaningful:
         return {}, None
-    scene_payload = [
-        {"scene_index": scene.index, "text": scene.text} for scene in meaningful
-    ]
-    prompt = f"""
-# Role: Scene Stock-Footage Query Generator
-Generate 1-{max_queries_per_scene} concrete English stock-footage search queries for
-every narration scene. Describe visible subjects, actions, settings, or shots; do
-not summarize abstract ideas. Return JSON only in this exact shape:
-{{"scenes":[{{"scene_index":1,"queries":["concrete visible footage"]}}]}}
-
-Video subject: {video_subject}
-Scenes: {json.dumps(scene_payload, ensure_ascii=False)}
-""".strip()
-    response = ""
+    prompt = _scene_query_prompt(video_subject, meaningful, max_queries_per_scene)
     for attempt in range(_max_retries):
         try:
             response = _generate_response(prompt)
             if response.startswith("Error: "):
-                raise ValueError(response)
-            payload = json.loads(_strip_code_fence(response))
-            entries = payload.get("scenes") if isinstance(payload, dict) else None
-            if not isinstance(entries, list):
-                raise ValueError("scene query response has no scenes list")
-            valid_indices = {scene.index for scene in meaningful}
-            result: dict[int, list[str]] = {}
-            duplicate_indices = set()
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                index = entry.get("scene_index")
-                queries = entry.get("queries")
-                if index not in valid_indices or not isinstance(queries, list):
-                    continue
-                if index in result:
-                    duplicate_indices.add(index)
-                    continue
-                normalized = []
-                seen = set()
-                for query in queries:
-                    if not isinstance(query, str):
-                        continue
-                    query = " ".join(query.split()).strip(" ,.;:!?\n\t")
-                    key = query.casefold()
-                    if query and key not in seen:
-                        normalized.append(query)
-                        seen.add(key)
-                result[index] = normalized[:max_queries_per_scene]
-            for index in duplicate_indices:
-                result.pop(index, None)
-            warning = None
-            if set(result) != valid_indices or any(
-                not value for value in result.values()
-            ):
-                warning = (
-                    "LLM output was incomplete; deterministic fallbacks were used."
-                )
-            return result, warning
+                raise ValueError("scene query provider error")
+            return dict(
+                _parse_scene_query_batch(response, meaningful, max_queries_per_scene)
+            ), None
         except Exception as exc:
-            logger.warning(f"failed to generate batched scene queries: {exc}")
+            logger.warning(
+                f"failed to generate batched scene queries: error={type(exc).__name__}"
+            )
             if attempt + 1 == _max_retries:
-                return (
-                    {},
-                    "Batched scene-query generation failed; deterministic fallbacks were used.",
-                )
+                break
     return (
         {},
         "Batched scene-query generation failed; deterministic fallbacks were used.",

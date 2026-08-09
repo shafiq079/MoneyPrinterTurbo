@@ -495,6 +495,16 @@ def _run_material_pipeline(
     from app.models.schema import VideoParams
     from app.services import task
 
+    candidate_mock = candidate_mock or Mock(return_value="")
+
+    def retrieve_result(**kwargs):
+        artifact = candidate_mock(**kwargs)
+        return task.scene_candidate.SceneCandidateRetrievalResult(
+            artifact,
+            task.scene_candidate.SceneCandidatePlanningState.not_required,
+            0,
+        )
+
     params = VideoParams(
         video_subject="Scenes",
         match_materials_to_script=match_enabled,
@@ -512,8 +522,8 @@ def _run_material_pipeline(
         patch.object(task.scene_timeline, "create_scene_timeline", timeline_mock),
         patch.object(
             task.scene_candidate,
-            "retrieve_scene_candidates",
-            candidate_mock or Mock(return_value=""),
+            "retrieve_scene_candidates_result",
+            side_effect=retrieve_result,
         ),
         patch.object(task.sm.state, "update_task"),
     ):

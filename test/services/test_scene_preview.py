@@ -50,13 +50,14 @@ def manifest(path, counts, hold=False):
             }
         )
     payload = {
-        "version": 1,
+        "version": 3,
         "provider": "pexels",
         "video_aspect": "9:16",
         "candidates_per_scene": 6,
         "provider_search_budget": 20,
         "remote_searches_used": 1,
         "query_generation_warning": None,
+        "semantic_planning": {"status": "not_required", "issues": []},
         "scenes": scenes,
     }
     path.write_text(json.dumps(payload), encoding="utf-8")

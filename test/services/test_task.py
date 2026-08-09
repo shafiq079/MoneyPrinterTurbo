@@ -55,6 +55,7 @@ class TestTaskService(unittest.TestCase):
         probe_error=None,
         render_side_effect=None,
         materials=None,
+        planning_state=None,
     ):
         timeline_path = Path(tmp_path) / "scenes.json"
         timeline_path.write_text("[]", encoding="utf-8")
@@ -100,8 +101,13 @@ class TestTaskService(unittest.TestCase):
             retrieve = stack.enter_context(
                 patch.object(
                     tm.scene_candidate,
-                    "retrieve_scene_candidates",
-                    return_value=candidate_path,
+                    "retrieve_scene_candidates_result",
+                    return_value=tm.scene_candidate.SceneCandidateRetrievalResult(
+                        candidate_path,
+                        planning_state
+                        or tm.scene_candidate.SceneCandidatePlanningState.complete,
+                        0,
+                    ),
                 )
             )
             preview = stack.enter_context(
@@ -214,6 +220,34 @@ class TestTaskService(unittest.TestCase):
             preview.assert_not_called()
             selection.assert_not_called()
             self.assertNotIn("scene_previews_path", result)
+
+    def test_partial_semantic_planning_keeps_phase_one_legacy_routing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_path = Path(tmp) / "scene_candidates.json"
+            candidate_path.write_text(
+                '{"version":3,"semantic_planning":{"status":"partial"}}',
+                encoding="utf-8",
+            )
+            result, _, retrieve, preview, selection, get_materials, render, materials = (
+                self._run_preview_pipeline(
+                    tmp,
+                    candidate_path=str(candidate_path),
+                    planning_state=(
+                        tm.scene_candidate.SceneCandidatePlanningState.semantic_plan_unavailable
+                    ),
+                    stop_at="video",
+                )
+            )
+        retrieve.assert_called_once()
+        preview.assert_not_called()
+        selection.assert_not_called()
+        self.last_render_plan.assert_not_called()
+        get_materials.assert_called_once()
+        render.assert_called_once()
+        self.assertIs(render.call_args.args[2], materials)
+        self.assertIs(result["materials"], materials)
+        self.assertNotIn("scene_previews_path", result)
+        self.assertNotIn("scene_render_materials_path", result)
 
     def test_preview_failure_is_nonfatal_and_preserves_renderer_arguments(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2298,7 +2332,7 @@ class TestLazyLegacyMaterials(unittest.TestCase):
                     tmp, stop_at="video", preview_result=str(preview),
                     selection_result=str(selection), render_plan_result=str(plan),
                 )
-            self.assertEqual(create.call_count, 2)
+            self.assertEqual(create.call_count, 1)
             get_materials = result[5]
             get_materials.assert_called_once_with(
                 "preview-pipeline", unittest.mock.ANY, ["term"], 5,
@@ -2448,7 +2482,15 @@ class TestLazyLegacyMaterials(unittest.TestCase):
             patch.object(tm.scene_timeline, "create_scene_timeline", return_value="scenes"),
             patch("builtins.open", MagicMock()),
             patch.object(tm.json, "load", return_value=[]),
-            patch.object(tm.scene_candidate, "retrieve_scene_candidates", return_value="candidates"),
+            patch.object(
+                tm.scene_candidate,
+                "retrieve_scene_candidates_result",
+                return_value=tm.scene_candidate.SceneCandidateRetrievalResult(
+                    "candidates",
+                    tm.scene_candidate.SceneCandidatePlanningState.complete,
+                    0,
+                ),
+            ),
             patch.object(tm.os.path, "isfile", return_value=True),
             patch.object(tm.scene_preview, "prepare_scene_previews", return_value="previews"),
             patch.object(tm.scene_selection, "create_scene_selections", return_value="selections"),
