@@ -261,6 +261,7 @@ def save_config():
         config_to_save["chatterbox"] = dict(chatterbox)
         config_to_save["ui"] = dict(ui)
         config_to_save["scene_ranking"] = dict(scene_ranking)
+        config_to_save["semantic_planning"] = dict(semantic_planning)
         serialized_config = toml.dumps(config_to_save)
 
         # WebUI 完整 rerun 结束时会调用保存。内容没有变化时直接返回，避免每次
@@ -302,6 +303,7 @@ siliconflow = _SynchronizedConfig(_cfg.get("siliconflow", {}))
 elevenlabs = _SynchronizedConfig(_cfg.get("elevenlabs", {}))
 chatterbox = _SynchronizedConfig(_cfg.get("chatterbox", {}))
 scene_ranking = _SynchronizedConfig(_cfg.get("scene_ranking", {}))
+semantic_planning = _SynchronizedConfig(_cfg.get("semantic_planning", {}))
 ui = _SynchronizedConfig(
     _cfg.get(
         "ui",
@@ -417,3 +419,33 @@ def get_scene_ranking_config(environ=None) -> SceneRankingConfig:
         environment.get("NVIDIA_API_KEY", configured_api_key)
     )
     return SceneRankingConfig(**{**values, "api_key": api_key})
+
+
+@dataclass(frozen=True)
+class SemanticPlanningConfig:
+    max_output_tokens: int
+    max_requests_per_minute: int
+
+
+_SEMANTIC_PLANNING_DEFAULTS = {
+    "max_output_tokens": 4096,
+    "max_requests_per_minute": 20,
+}
+_SEMANTIC_PLANNING_INTEGER_BOUNDS = {
+    "max_output_tokens": (512, 4096),
+    "max_requests_per_minute": (1, 60),
+}
+
+
+def get_semantic_planning_config() -> SemanticPlanningConfig:
+    """Return the strict, provider-neutral semantic request limits."""
+    values = {**_SEMANTIC_PLANNING_DEFAULTS, **dict(semantic_planning)}
+    if set(values) != set(_SEMANTIC_PLANNING_DEFAULTS):
+        raise ValueError("semantic_planning contains unsupported settings")
+    for name, (minimum, maximum) in _SEMANTIC_PLANNING_INTEGER_BOUNDS.items():
+        value = values[name]
+        if type(value) is not int or not minimum <= value <= maximum:
+            raise ValueError(
+                f"semantic_planning.{name} is outside the supported range"
+            )
+    return SemanticPlanningConfig(**values)

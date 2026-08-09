@@ -34,6 +34,10 @@ MAX_SEMANTIC_REQUEST_BYTES = 64 * 1024
 SEMANTIC_ATTEMPT_SECONDS = 45
 SEMANTIC_TASK_SECONDS = 240
 SEMANTIC_CONCURRENCY = 2
+SEMANTIC_OUTPUT_BASE_TOKENS = 1024
+SEMANTIC_OUTPUT_TOKENS_PER_SCENE = 1024
+SEMANTIC_OUTPUT_HARD_MAX = 4096
+SEMANTIC_WORKER_PROTOCOL_VERSION = 2
 _SEMANTIC_IPC_HEADER = struct.Struct("!I")
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 10
@@ -71,6 +75,25 @@ class SceneSemanticRequirements:
 class SceneQueryPlan:
     queries: tuple[str, ...]
     requirements: SceneSemanticRequirements
+
+
+@dataclass(frozen=True, slots=True)
+class _SemanticAdapterCapability:
+    output_token_parameter: str
+    suppress_reasoning: bool = False
+
+
+@dataclass(slots=True)
+class _SemanticRateGate:
+    next_start_at: float
+
+
+_SEMANTIC_ADAPTER_CAPABILITIES = {
+    "openai_compatible": _SemanticAdapterCapability("max_tokens"),
+    "azure": _SemanticAdapterCapability("max_tokens"),
+    "cloudflare_ai_gateway": _SemanticAdapterCapability("max_tokens"),
+    "modelscope": _SemanticAdapterCapability("max_tokens", suppress_reasoning=True),
+}
 
 
 class SemanticPlanState(str, Enum):
@@ -906,6 +929,8 @@ typed English visual requirements for every narration scene. primary_entities ar
 specific visible identities; every group is required and aliases within a group are
 alternatives. Never use generic identities such as person, hands, beans, farm,
 factory, machine, liquid, or footage. Actions and contexts are optional evidence.
+Use short noun phrases, the fewest sufficient groups, and aliases only for genuine
+equivalents. Return compact JSON without whitespace, prose, Markdown, or explanations.
 Every scene object must contain exactly scene_index, queries, and requirements.
 Every requirements object must contain exactly primary_entities, actions, and
 contexts. Every term group must contain exactly canonical and aliases. Include all
@@ -916,6 +941,43 @@ Return JSON only in this exact shape and with no additional fields:
 Video subject: {video_subject}
 Scenes: {json.dumps(payload, ensure_ascii=False)}
 """.strip()
+
+
+def _semantic_output_token_allowance(scene_count, configured_max=4096):
+    if (
+        type(scene_count) is not int
+        or not 1 <= scene_count <= SEMANTIC_BATCH_SIZE
+        or type(configured_max) is not int
+        or not 512 <= configured_max <= SEMANTIC_OUTPUT_HARD_MAX
+    ):
+        raise SemanticRequestFailure(
+            SemanticPlanDiagnostic.provider_configuration_invalid, retryable=False
+        )
+    calculated = (
+        SEMANTIC_OUTPUT_BASE_TOKENS
+        + SEMANTIC_OUTPUT_TOKENS_PER_SCENE * scene_count
+    )
+    return min(calculated, configured_max, SEMANTIC_OUTPUT_HARD_MAX)
+
+
+def _semantic_rate_start_delay(rate_gate, now, deadline, requests_per_minute):
+    if (
+        not isinstance(rate_gate, _SemanticRateGate)
+        or type(now) not in (int, float)
+        or type(deadline) not in (int, float)
+        or type(requests_per_minute) is not int
+        or not 1 <= requests_per_minute <= 60
+        or rate_gate.next_start_at >= deadline
+    ):
+        return None
+    return max(0.0, rate_gate.next_start_at - now)
+
+
+def _semantic_record_request_start(rate_gate, now, requests_per_minute):
+    interval = 60.0 / requests_per_minute
+    started_at = max(rate_gate.next_start_at, now)
+    rate_gate.next_start_at = started_at + interval
+    return started_at
 
 
 @dataclass(frozen=True)
@@ -1286,7 +1348,7 @@ def _semantic_extract_chat_completion_text(response, provider_id: str) -> str:
         ) from None
 
 
-def _semantic_generate_from_snapshot(snapshot, prompt):
+def _semantic_generate_from_snapshot(snapshot, prompt, max_output_tokens):
     """One semantic-only request using only the validated private snapshot."""
     if not isinstance(snapshot, dict) or set(snapshot) != {
         "provider_id",
@@ -1301,12 +1363,11 @@ def _semantic_generate_from_snapshot(snapshot, prompt):
             SemanticPlanDiagnostic.provider_configuration_invalid, retryable=False
         )
     adapter = snapshot["adapter"]
-    if adapter not in {
-        "openai_compatible",
-        "cloudflare_ai_gateway",
-        "azure",
-        "modelscope",
-    }:
+    capability = _SEMANTIC_ADAPTER_CAPABILITIES.get(adapter)
+    if capability is None or (
+        type(max_output_tokens) is not int
+        or not 512 <= max_output_tokens <= SEMANTIC_OUTPUT_HARD_MAX
+    ):
         raise SemanticRequestFailure(
             SemanticPlanDiagnostic.provider_configuration_invalid, retryable=False
         )
@@ -1340,8 +1401,9 @@ def _semantic_generate_from_snapshot(snapshot, prompt):
         kwargs = {
             "model": snapshot["model"],
             "messages": [{"role": "user", "content": prompt}],
+            capability.output_token_parameter: max_output_tokens,
         }
-        if adapter == "modelscope":
+        if capability.suppress_reasoning:
             kwargs["extra_body"] = {"enable_thinking": False}
         response = client.chat.completions.create(**kwargs)
         return _semantic_extract_chat_completion_text(
@@ -1363,21 +1425,23 @@ def _semantic_worker_payload(request):
             or set(request)
             != {
                 "version",
-                "batch_index",
+                "work_id",
                 "video_subject",
                 "scenes",
                 "max_queries_per_scene",
+                "max_output_tokens",
                 "provider",
             }
-            or request["version"] != 1
+            or request["version"] != SEMANTIC_WORKER_PROTOCOL_VERSION
         ):
             raise SemanticRequestFailure(
                 SemanticPlanDiagnostic.invalid_input, retryable=False
             )
-        batch_index = request["batch_index"]
+        work_id = request["work_id"]
         scenes = request["scenes"]
         if (
-            type(batch_index) is not int
+            type(work_id) is not int
+            or work_id < 0
             or not isinstance(scenes, list)
             or not 1 <= len(scenes) <= SEMANTIC_BATCH_SIZE
         ):
@@ -1392,13 +1456,14 @@ def _semantic_worker_payload(request):
             _scene_query_prompt(
                 request["video_subject"], batch, request["max_queries_per_scene"]
             ),
+            request["max_output_tokens"],
         )
         validation = _validate_scene_query_batch(
             response, batch, request["max_queries_per_scene"]
         )
         return {
-            "version": 1,
-            "batch_index": batch_index,
+            "version": SEMANTIC_WORKER_PROTOCOL_VERSION,
+            "work_id": work_id,
             "ok": True,
             "retryable": bool(validation.issues),
             "diagnostic": (
@@ -1416,8 +1481,8 @@ def _semantic_worker_payload(request):
         }
     except SemanticRequestFailure as exc:
         return {
-            "version": 1,
-            "batch_index": request.get("batch_index", -1)
+            "version": SEMANTIC_WORKER_PROTOCOL_VERSION,
+            "work_id": request.get("work_id", -1)
             if isinstance(request, dict)
             else -1,
             "ok": False,
@@ -1428,8 +1493,8 @@ def _semantic_worker_payload(request):
         }
     except Exception:
         return {
-            "version": 1,
-            "batch_index": request.get("batch_index", -1)
+            "version": SEMANTIC_WORKER_PROTOCOL_VERSION,
+            "work_id": request.get("work_id", -1)
             if isinstance(request, dict)
             else -1,
             "ok": False,
@@ -1468,8 +1533,8 @@ def run_scene_query_worker(sock):
         if len(data) > MAX_SEMANTIC_IPC_BYTES:
             data = json.dumps(
                 {
-                    "version": 1,
-                    "batch_index": request.get("batch_index", -1),
+                    "version": SEMANTIC_WORKER_PROTOCOL_VERSION,
+                    "work_id": request.get("work_id", -1),
                     "ok": False,
                     "retryable": False,
                     "diagnostic": SemanticPlanDiagnostic.ipc_too_large.value,
@@ -1485,7 +1550,7 @@ def run_scene_query_worker(sock):
         sock.close()
 
 
-def _decode_semantic_ipc(data, batch_index, batch, max_queries_per_scene):
+def _decode_semantic_ipc(data, work_id, batch, max_queries_per_scene):
     try:
         payload = json.loads(data, object_pairs_hook=_query_no_duplicates)
         if (
@@ -1493,15 +1558,15 @@ def _decode_semantic_ipc(data, batch_index, batch, max_queries_per_scene):
             or set(payload)
             != {
                 "version",
-                "batch_index",
+                "work_id",
                 "ok",
                 "retryable",
                 "diagnostic",
                 "plans",
                 "issues",
             }
-            or payload["version"] != 1
-            or payload["batch_index"] != batch_index
+            or payload["version"] != SEMANTIC_WORKER_PROTOCOL_VERSION
+            or payload["work_id"] != work_id
         ):
             raise ValueError
         diagnostic = SemanticPlanDiagnostic(payload["diagnostic"])
@@ -1565,13 +1630,21 @@ def _minimal_worker_environment():
     return result
 
 
-def _worker_request(batch_index, video_subject, batch, max_queries_per_scene, provider):
+def _worker_request(
+    work_id,
+    video_subject,
+    batch,
+    max_queries_per_scene,
+    max_output_tokens,
+    provider,
+):
     payload = {
-        "version": 1,
-        "batch_index": batch_index,
+        "version": SEMANTIC_WORKER_PROTOCOL_VERSION,
+        "work_id": work_id,
         "video_subject": video_subject,
         "scenes": [{"index": scene.index, "text": scene.text} for scene in batch],
         "max_queries_per_scene": max_queries_per_scene,
+        "max_output_tokens": max_output_tokens,
         "provider": provider,
     }
     data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
@@ -1589,7 +1662,11 @@ def _run_semantic_phase(
     deadline,
     *,
     provider_snapshot=None,
+    planning_config=None,
+    rate_gate=None,
     popen=subprocess.Popen,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
 ):
     pending = list(works)
     work_map = dict(works)
@@ -1597,6 +1674,8 @@ def _run_semantic_phase(
     selector = selectors.DefaultSelector()
     unreaped = False
     provider_snapshot = provider_snapshot or _semantic_provider_snapshot()
+    planning_config = planning_config or config.get_semantic_planning_config()
+    rate_gate = rate_gate or _SemanticRateGate(monotonic())
     root = str(Path(__file__).resolve().parents[2])
 
     def cleanup(record, timed_out=False):
@@ -1631,7 +1710,14 @@ def _run_semantic_phase(
             while (
                 pending
                 and len(active) < SEMANTIC_CONCURRENCY
-                and time.monotonic() < deadline
+                and monotonic() < deadline
+                and _semantic_rate_start_delay(
+                    rate_gate,
+                    monotonic(),
+                    deadline,
+                    planning_config.max_requests_per_minute,
+                )
+                == 0
             ):
                 index, batch = pending.pop(0)
                 parent, child = socket.socketpair()
@@ -1659,6 +1745,9 @@ def _run_semantic_phase(
                         video_subject,
                         batch,
                         max_queries_per_scene,
+                        _semantic_output_token_allowance(
+                            len(batch), planning_config.max_output_tokens
+                        ),
                         provider_snapshot,
                     )
                 except Exception:
@@ -1680,17 +1769,27 @@ def _run_semantic_phase(
                     "buffer": bytearray(),
                     "length": None,
                     "deadline": min(
-                        deadline, time.monotonic() + SEMANTIC_ATTEMPT_SECONDS
+                        deadline, monotonic() + SEMANTIC_ATTEMPT_SECONDS
                     ),
                 }
                 active[index] = record
+                _semantic_record_request_start(
+                    rate_gate,
+                    monotonic(),
+                    planning_config.max_requests_per_minute,
+                )
                 selector.register(
                     parent, selectors.EVENT_READ | selectors.EVENT_WRITE, index
                 )
             if not active:
+                now = monotonic()
+                if pending and rate_gate.next_start_at < deadline:
+                    sleep(max(0, min(0.05, rate_gate.next_start_at - now)))
+                    continue
                 break
             nearest = min(record["deadline"] for record in active.values())
-            events = selector.select(max(0, min(0.05, nearest - time.monotonic())))
+            wake_at = min(nearest, rate_gate.next_start_at) if pending else nearest
+            events = selector.select(max(0, min(0.05, wake_at - monotonic())))
             for key, mask in events:
                 index = key.data
                 record = active.get(index)
@@ -1770,7 +1869,7 @@ def _run_semantic_phase(
                             False,
                             False,
                         )
-            now = time.monotonic()
+            now = monotonic()
             for index, record in list(active.items()):
                 if now >= record["deadline"]:
                     diagnostic = cleanup(record, timed_out=True)
@@ -1828,18 +1927,45 @@ def generate_scene_query_plan(
         (i, tuple(meaningful[p : p + SEMANTIC_BATCH_SIZE]))
         for i, p in enumerate(range(0, len(meaningful), SEMANTIC_BATCH_SIZE))
     ]
+    try:
+        planning_config = config.get_semantic_planning_config()
+    except Exception:
+        diagnostic = SemanticPlanDiagnostic.provider_configuration_invalid
+        return SemanticPlanResult(
+            SemanticPlanState.unavailable,
+            (),
+            diagnostic,
+            len(meaningful),
+            len(batches),
+            0,
+            0,
+            (SemanticPlanIssue(0, None, diagnostic, 1),),
+        )
     deadline = time.monotonic() + SEMANTIC_TASK_SECONDS
+    rate_gate = _SemanticRateGate(time.monotonic())
     first, unreaped = _run_semantic_phase(
         batches,
         video_subject,
         max_queries_per_scene,
         deadline,
         provider_snapshot=provider_snapshot,
+        planning_config=planning_config,
+        rate_gate=rate_gate,
     )
     attempts = len(first)
     timed_out = sum(int(value[3]) for value in first.values())
     plans_by_index = {}
     retry, final_issues = [], []
+    next_work_id = len(batches)
+
+    def queue_retry(batch_index, unresolved, diagnostic):
+        nonlocal next_work_id
+        size = 2 if diagnostic is SemanticPlanDiagnostic.provider_output_truncated else 4
+        for offset in range(0, len(unresolved), size):
+            retry_batch = tuple(unresolved[offset : offset + size])
+            retry.append((next_work_id, batch_index, retry_batch))
+            next_work_id += 1
+
     for batch_index, batch in batches:
         value = first.get(batch_index)
         result = value[0] if value else None
@@ -1850,7 +1976,7 @@ def generate_scene_query_plan(
                 scene for scene in batch if scene.index not in valid_indexes
             )
             if unresolved and value[2]:
-                retry.append((batch_index, unresolved))
+                queue_retry(batch_index, unresolved, value[1])
             elif unresolved:
                 final_issues.extend(
                     SemanticPlanIssue(batch_index, index, reason, 1)
@@ -1858,7 +1984,7 @@ def generate_scene_query_plan(
                 )
         else:
             if value and value[2]:
-                retry.append((batch_index, batch))
+                queue_retry(batch_index, batch, value[1])
             else:
                 final_issues.append(
                     SemanticPlanIssue(
@@ -1873,16 +1999,18 @@ def generate_scene_query_plan(
     second = {}
     if retry and not unreaped and time.monotonic() < deadline:
         second, unreaped = _run_semantic_phase(
-            retry,
+            [(work_id, batch) for work_id, _batch_index, batch in retry],
             video_subject,
             max_queries_per_scene,
             deadline,
             provider_snapshot=provider_snapshot,
+            planning_config=planning_config,
+            rate_gate=rate_gate,
         )
         attempts += len(second)
         timed_out += sum(int(value[3]) for value in second.values())
-    for batch_index, retry_batch in retry:
-        value = second.get(batch_index)
+    for work_id, batch_index, retry_batch in retry:
+        value = second.get(work_id)
         result = value[0] if value else None
         if result is not None:
             plans_by_index.update(result.plans)
@@ -1907,19 +2035,23 @@ def generate_scene_query_plan(
                     )
                 )
         else:
-            final_issues.append(
-                SemanticPlanIssue(
-                    batch_index,
-                    None,
-                    SemanticPlanDiagnostic.worker_unreaped
-                    if unreaped
-                    else (
-                        value[1]
-                        if value
-                        else SemanticPlanDiagnostic.task_deadline_exhausted
-                    ),
-                    2,
+            reason = (
+                SemanticPlanDiagnostic.worker_unreaped
+                if unreaped
+                else (
+                    value[1]
+                    if value
+                    else SemanticPlanDiagnostic.task_deadline_exhausted
                 )
+            )
+            indexes = (
+                [scene.index for scene in retry_batch]
+                if reason is SemanticPlanDiagnostic.provider_output_truncated
+                else [None]
+            )
+            final_issues.extend(
+                SemanticPlanIssue(batch_index, index, reason, 2)
+                for index in indexes
             )
     ordered_plans = tuple(
         (scene.index, plans_by_index[scene.index])

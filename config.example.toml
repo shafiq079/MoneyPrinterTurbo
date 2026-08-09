@@ -316,6 +316,16 @@ max_concurrent_scene_rankings = 4
 max_remote_attempts_per_minute = 30
 
 # =============================================================================
+# Semantic Scene Planning / 语义场景规划
+# =============================================================================
+
+# These task-local limits apply only to isolated scene-query planning. They do
+# not change ordinary script/keyword generation or NVIDIA poster ranking.
+[semantic_planning]
+max_output_tokens = 4096
+max_requests_per_minute = 20
+
+# =============================================================================
 # TTS Providers / 语音合成服务
 # =============================================================================
 

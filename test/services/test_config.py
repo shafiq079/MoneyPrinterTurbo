@@ -167,6 +167,39 @@ class TestConfigPersistence:
         assert settings.max_remote_attempts_per_minute == 30
         assert settings.model == "nvidia/nemotron-nano-12b-v2-vl"
 
+    def test_semantic_planning_defaults_and_example(self):
+        with patch.object(config, "semantic_planning", {}):
+            settings = config.get_semantic_planning_config()
+        assert settings.max_output_tokens == 4096
+        assert settings.max_requests_per_minute == 20
+        assert self._load_example_config()["semantic_planning"] == {
+            "max_output_tokens": 4096,
+            "max_requests_per_minute": 20,
+        }
+
+    def test_semantic_planning_strict_types_bounds_and_fields(self):
+        bounds = {
+            "max_output_tokens": (512, 4096),
+            "max_requests_per_minute": (1, 60),
+        }
+        for name, (lower, upper) in bounds.items():
+            for valid in (lower, upper):
+                with patch.object(config, "semantic_planning", {name: valid}):
+                    assert (
+                        getattr(config.get_semantic_planning_config(), name) == valid
+                    )
+            for invalid in (True, str(lower), lower - 1, upper + 1, 1.5):
+                with (
+                    patch.object(config, "semantic_planning", {name: invalid}),
+                    pytest.raises(ValueError),
+                ):
+                    config.get_semantic_planning_config()
+        with (
+            patch.object(config, "semantic_planning", {"unsupported": 1}),
+            pytest.raises(ValueError),
+        ):
+            config.get_semantic_planning_config()
+
     def test_scene_ranking_example_has_only_empty_secret(self):
         section = self._load_example_config()["scene_ranking"]
         assert section["enabled"] is False
