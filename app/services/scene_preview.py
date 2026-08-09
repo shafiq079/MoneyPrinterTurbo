@@ -100,6 +100,8 @@ def _scene_status(group, results: list[CandidatePreviewResult]) -> str:
 
 
 def _validate_source_manifest(source: SceneCandidateManifest) -> None:
+    if source.version != 3:
+        raise ValueError("unsupported candidate manifest version")
     if not 1 <= source.candidates_per_scene <= MAX_CANDIDATES_PER_SCENE:
         raise ValueError("source candidates_per_scene is outside the supported range")
     previous_index = None

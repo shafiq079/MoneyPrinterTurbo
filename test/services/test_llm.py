@@ -27,6 +27,18 @@ from app.models.schema import VideoScriptRequest, VideoSocialMetadataRequest
 from app.services import llm
 
 
+def _semantic_entry(index=1):
+    return {
+        "scene_index": index,
+        "queries": ["cacao harvest"],
+        "requirements": {
+            "primary_entities": [{"canonical": "cacao", "aliases": ["cocoa"]}],
+            "actions": [],
+            "contexts": [],
+        },
+    }
+
+
 class _SemanticProvider(BaseHTTPRequestHandler):
     reached = 0
 
@@ -110,6 +122,286 @@ def test_scene_query_plan_has_strict_typed_semantic_requirements():
     assert warning is None
     assert plans[1].queries == ("cacao beans drying in sun",)
     assert plans[1].requirements.primary_entities[0].aliases == ("cocoa",)
+
+
+def test_semantic_schema_reasons_are_specific_and_scene_bounded():
+    scene = types.SimpleNamespace(index=1, text="scene")
+
+    def reason_for(payload):
+        result = llm._validate_scene_query_batch(json.dumps(payload), [scene], 3)
+        assert not result.plans
+        return result.issues[0]
+
+    cases = []
+
+    def case(reason, mutate):
+        payload = {"scenes": [_semantic_entry()]}
+        value = mutate(payload)
+        cases.append(
+            (
+                reason,
+                value
+                if reason is llm.SemanticPlanDiagnostic.root_not_object
+                else payload,
+            )
+        )
+
+    case(llm.SemanticPlanDiagnostic.root_not_object, lambda _p: [])
+    case(llm.SemanticPlanDiagnostic.root_fields_invalid, lambda p: p.update(extra=[]))
+    case(llm.SemanticPlanDiagnostic.scenes_not_array, lambda p: p.update(scenes={}))
+    case(
+        llm.SemanticPlanDiagnostic.scene_entry_not_object,
+        lambda p: p.update(scenes=[1]),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.scene_index_missing,
+        lambda p: p["scenes"][0].pop("scene_index"),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.scene_index_invalid,
+        lambda p: p["scenes"][0].update(scene_index="1"),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.scene_index_unexpected,
+        lambda p: p["scenes"][0].update(scene_index=2),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.entry_fields_invalid,
+        lambda p: p["scenes"][0].update(extra=True),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.queries_not_array,
+        lambda p: p["scenes"][0].update(queries="query"),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.query_count_invalid,
+        lambda p: p["scenes"][0].update(queries=[]),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.query_not_string,
+        lambda p: p["scenes"][0].update(queries=[1]),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.query_control_character,
+        lambda p: p["scenes"][0].update(queries=["bad\nquery"]),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.query_empty,
+        lambda p: p["scenes"][0].update(queries=["  "]),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.query_too_long,
+        lambda p: p["scenes"][0].update(queries=["x" * 81]),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.requirements_not_object,
+        lambda p: p["scenes"][0].update(requirements=[]),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.requirements_fields_invalid,
+        lambda p: p["scenes"][0]["requirements"].pop("actions"),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.primary_entity_count_invalid,
+        lambda p: p["scenes"][0]["requirements"].update(primary_entities=[]),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.action_count_invalid,
+        lambda p: p["scenes"][0]["requirements"].update(actions=[{}] * 4),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.context_count_invalid,
+        lambda p: p["scenes"][0]["requirements"].update(contexts=[{}] * 4),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.term_group_not_object,
+        lambda p: p["scenes"][0]["requirements"].update(primary_entities=[1]),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.term_group_fields_invalid,
+        lambda p: p["scenes"][0]["requirements"]["primary_entities"][0].pop("aliases"),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.canonical_invalid,
+        lambda p: p["scenes"][0]["requirements"]["primary_entities"][0].update(
+            canonical=""
+        ),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.aliases_not_array,
+        lambda p: p["scenes"][0]["requirements"]["primary_entities"][0].update(
+            aliases="cocoa"
+        ),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.alias_count_invalid,
+        lambda p: p["scenes"][0]["requirements"]["primary_entities"][0].update(
+            aliases=["a1", "a2", "a3", "a4", "a5"]
+        ),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.alias_invalid,
+        lambda p: p["scenes"][0]["requirements"]["primary_entities"][0].update(
+            aliases=[""]
+        ),
+    )
+    case(
+        llm.SemanticPlanDiagnostic.primary_entity_too_generic,
+        lambda p: p["scenes"][0]["requirements"].update(
+            primary_entities=[{"canonical": "person", "aliases": []}]
+        ),
+    )
+
+    large_groups = [
+        {
+            "canonical": f"specific{i}" + "x" * 38,
+            "aliases": [f"alias{i}{j}" + "y" * 38 for j in range(4)],
+        }
+        for i in range(4)
+    ]
+    case(
+        llm.SemanticPlanDiagnostic.requirements_too_large,
+        lambda p: p["scenes"][0]["requirements"].update(primary_entities=large_groups),
+    )
+
+    for expected, payload in cases:
+        with unittest.TestCase().subTest(reason=expected.value):
+            index, actual = reason_for(payload)
+            assert actual is expected
+            assert index in {None, 1, 2}
+
+
+def test_semantic_batch_preserves_valid_entry_next_to_invalid_entry():
+    scenes = [
+        types.SimpleNamespace(index=1, text="one"),
+        types.SimpleNamespace(index=2, text="two"),
+    ]
+    invalid = _semantic_entry(2)
+    invalid["requirements"]["primary_entities"][0]["aliases"] = "cocoa"
+    result = llm._validate_scene_query_batch(
+        json.dumps({"scenes": [_semantic_entry(1), invalid]}), scenes, 3
+    )
+    assert [index for index, _plan in result.plans] == [1]
+    assert result.issues == ((2, llm.SemanticPlanDiagnostic.aliases_not_array),)
+
+
+def test_semantic_coverage_reasons_are_distinct():
+    scenes = [
+        types.SimpleNamespace(index=1, text="one"),
+        types.SimpleNamespace(index=2, text="two"),
+    ]
+    duplicate = llm._validate_scene_query_batch(
+        json.dumps({"scenes": [_semantic_entry(1), _semantic_entry(1)]}), scenes, 3
+    )
+    assert (1, llm.SemanticPlanDiagnostic.scene_index_duplicate) in duplicate.issues
+    missing = llm._validate_scene_query_batch(
+        json.dumps({"scenes": [_semantic_entry(1)]}), scenes, 3
+    )
+    assert (2, llm.SemanticPlanDiagnostic.coverage_invalid) in missing.issues
+    reordered = llm._validate_scene_query_batch(
+        json.dumps({"scenes": [_semantic_entry(2), _semantic_entry(1)]}), scenes, 3
+    )
+    assert (
+        None,
+        llm.SemanticPlanDiagnostic.scene_order_invalid,
+    ) in reordered.issues
+
+
+def test_semantic_corrective_retry_contains_only_unresolved_scenes():
+    scenes = [
+        types.SimpleNamespace(index=1, text="one"),
+        types.SimpleNamespace(index=2, text="two"),
+    ]
+    requirements = llm.SceneSemanticRequirements(
+        primary_entities=(llm.SemanticTermGroup("cacao", ("cocoa",)),)
+    )
+    plan1 = llm.SceneQueryPlan(("first",), requirements)
+    plan2 = llm.SceneQueryPlan(("second",), requirements)
+    phases = [
+        (
+            {
+                0: (
+                    llm._BatchValidationResult(
+                        ((1, plan1),),
+                        ((2, llm.SemanticPlanDiagnostic.aliases_not_array),),
+                    ),
+                    llm.SemanticPlanDiagnostic.aliases_not_array,
+                    True,
+                    False,
+                )
+            },
+            False,
+        ),
+        (
+            {
+                0: (
+                    llm._BatchValidationResult(((2, plan2),), ()),
+                    llm.SemanticPlanDiagnostic.complete,
+                    False,
+                    False,
+                )
+            },
+            False,
+        ),
+    ]
+    with patch.object(llm, "_run_semantic_phase", side_effect=phases) as run:
+        result = llm.generate_scene_query_plan("subject", scenes)
+    retry_works = run.call_args_list[1].args[0]
+    assert [scene.index for scene in retry_works[0][1]] == [2]
+    assert result.state is llm.SemanticPlanState.complete
+    assert [index for index, _plan in result.plans] == [1, 2]
+    assert result.issues == ()
+
+
+def test_semantic_partial_result_keeps_valid_scenes_and_bounded_issue():
+    scenes = [
+        types.SimpleNamespace(index=1, text="one"),
+        types.SimpleNamespace(index=2, text="two"),
+    ]
+    requirements = llm.SceneSemanticRequirements(
+        primary_entities=(llm.SemanticTermGroup("cacao", ("cocoa",)),)
+    )
+    valid = llm.SceneQueryPlan(("first",), requirements)
+    unresolved = llm._BatchValidationResult(
+        (), ((2, llm.SemanticPlanDiagnostic.aliases_not_array),)
+    )
+    with patch.object(
+        llm,
+        "_run_semantic_phase",
+        side_effect=[
+            (
+                {
+                    0: (
+                        llm._BatchValidationResult(
+                            ((1, valid),),
+                            ((2, llm.SemanticPlanDiagnostic.aliases_not_array),),
+                        ),
+                        llm.SemanticPlanDiagnostic.aliases_not_array,
+                        True,
+                        False,
+                    )
+                },
+                False,
+            ),
+            (
+                {
+                    0: (
+                        unresolved,
+                        llm.SemanticPlanDiagnostic.aliases_not_array,
+                        True,
+                        False,
+                    )
+                },
+                False,
+            ),
+        ],
+    ):
+        result = llm.generate_scene_query_plan("subject", scenes)
+    assert result.state is llm.SemanticPlanState.partial
+    assert [index for index, _plan in result.plans] == [1]
+    assert result.issues == (
+        llm.SemanticPlanIssue(0, 2, llm.SemanticPlanDiagnostic.aliases_not_array, 2),
+    )
 
 
 def test_dedicated_worker_reaches_mock_provider_and_returns_complete_plan():

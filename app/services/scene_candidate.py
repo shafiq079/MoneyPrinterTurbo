@@ -134,15 +134,62 @@ class SceneCandidateGroup(BaseModel):
     semantic_requirements: SemanticRequirements | None = None
 
 
+class SemanticPlanningIssue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    batch_index: int = Field(ge=0, le=9)
+    scene_index: int | None = Field(default=None, ge=1)
+    reason: str = Field(min_length=3, max_length=48)
+    attempt: int = Field(ge=1, le=2)
+
+    @field_validator("reason")
+    @classmethod
+    def valid_reason(cls, value):
+        try:
+            llm.SemanticPlanDiagnostic(value)
+        except ValueError as exc:
+            raise ValueError("invalid semantic planning reason") from exc
+        return value
+
+
+class SemanticPlanningSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: str
+    issues: list[SemanticPlanningIssue] = Field(max_length=50)
+
+    @field_validator("status")
+    @classmethod
+    def valid_status(cls, value):
+        if value not in {"complete", "partial", "unavailable", "not_required"}:
+            raise ValueError("invalid semantic planning status")
+        return value
+
+    @model_validator(mode="after")
+    def status_matches_issues(self):
+        if (self.status in {"complete", "not_required"}) != (not self.issues):
+            raise ValueError("semantic planning status and issues are inconsistent")
+        return self
+
+
 class SceneCandidateManifest(BaseModel):
-    version: int = 2
+    version: int = 3
     provider: str
     video_aspect: VideoAspect
     candidates_per_scene: int
     provider_search_budget: int
     remote_searches_used: int
     query_generation_warning: str | None = None
+    semantic_planning: SemanticPlanningSummary
     scenes: list[SceneCandidateGroup]
+
+    @model_validator(mode="after")
+    def planning_issue_scenes_exist(self):
+        indexes = {scene.scene_index for scene in self.scenes}
+        if any(
+            issue.scene_index is not None and issue.scene_index not in indexes
+            for issue in self.semantic_planning.issues
+        ):
+            raise ValueError("semantic planning issue references an unknown scene")
+        return self
 
 
 def fallback_scene_query(text: str) -> str:
@@ -280,9 +327,21 @@ def retrieve_scene_candidates_result(
         raise ValueError("provider_search_budget is outside the supported range")
 
     semantic_state = SceneCandidatePlanningState.not_required
+    semantic_planning_status = "not_required"
+    semantic_planning_issues = []
     if semantic_filter_enabled:
         plan_result = llm.generate_scene_query_plan(video_subject, scenes)
         generated = dict(plan_result.plans)
+        semantic_planning_status = plan_result.state.value
+        semantic_planning_issues = [
+            SemanticPlanningIssue(
+                batch_index=issue.batch_index,
+                scene_index=issue.scene_index,
+                reason=issue.reason.value,
+                attempt=issue.attempt,
+            )
+            for issue in plan_result.issues
+        ]
         if plan_result.state is llm.SemanticPlanState.complete:
             semantic_state = SceneCandidatePlanningState.complete
             generation_warning = None
@@ -475,6 +534,10 @@ def retrieve_scene_candidates_result(
         provider_search_budget=provider_search_budget,
         remote_searches_used=remote_used,
         query_generation_warning=generation_warning,
+        semantic_planning=SemanticPlanningSummary(
+            status=semantic_planning_status,
+            issues=semantic_planning_issues,
+        ),
         scenes=groups,
     )
     os.makedirs(task_dir, exist_ok=True)

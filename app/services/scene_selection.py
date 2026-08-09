@@ -288,10 +288,11 @@ def _validate_candidate_manifest(payload: dict) -> dict:
             "provider_search_budget",
             "remote_searches_used",
             "query_generation_warning",
+            "semantic_planning",
             "scenes",
         },
     )
-    if _strict_int(payload["version"], "candidate manifest version", 2, 2) != 2:
+    if _strict_int(payload["version"], "candidate manifest version", 3, 3) != 3:
         _fail("unsupported candidate manifest version")
     provider = _string(payload["provider"], "provider", minimum=1, maximum=32)
     if provider not in SUPPORTED_PROVIDERS:
@@ -318,6 +319,38 @@ def _validate_candidate_manifest(payload: dict) -> dict:
     _optional_string(
         payload["query_generation_warning"], "query_generation_warning", 500
     )
+    planning = _object(
+        payload["semantic_planning"],
+        "semantic planning",
+        {"status", "issues"},
+    )
+    planning_status = _string(
+        planning["status"], "semantic planning status", minimum=7, maximum=12
+    )
+    if planning_status not in {"complete", "partial", "unavailable", "not_required"}:
+        _fail("invalid semantic planning status")
+    planning_issues = _array(planning["issues"], "semantic planning issues")
+    if len(planning_issues) > 50:
+        _fail("too many semantic planning issues")
+    for issue in planning_issues:
+        _object(
+            issue,
+            "semantic planning issue",
+            {"batch_index", "scene_index", "reason", "attempt"},
+        )
+        _strict_int(issue["batch_index"], "semantic batch index", 0, 9)
+        if issue["scene_index"] is not None:
+            _strict_int(issue["scene_index"], "semantic issue scene index", 1)
+        reason = _string(
+            issue["reason"], "semantic planning reason", minimum=3, maximum=48
+        )
+        try:
+            scene_candidate.llm.SemanticPlanDiagnostic(reason)
+        except ValueError:
+            _fail("invalid semantic planning reason")
+        _strict_int(issue["attempt"], "semantic planning attempt", 1, 2)
+    if (planning_status in {"complete", "not_required"}) != (not planning_issues):
+        _fail("semantic planning status and issues are inconsistent")
     scenes = _array(payload["scenes"], "candidate scenes")
     seen_indexes: set[int] = set()
     previous = 0
@@ -439,6 +472,11 @@ def _validate_candidate_manifest(payload: dict) -> dict:
                 _fail("candidate IDs must be unique within a scene")
             seen_candidates.add(candidate["candidate_id"])
     scene_by_index = {scene["scene_index"]: scene for scene in scenes}
+    if any(
+        issue["scene_index"] is not None and issue["scene_index"] not in scene_by_index
+        for issue in planning_issues
+    ):
+        _fail("semantic planning issue references an unknown scene")
     for group in scenes:
         reuse = group["reuse_scene_index"]
         if reuse is None:
@@ -558,7 +596,7 @@ def _validate_preview_manifest(preview: dict, source: dict, source_digest: str) 
         "source candidate binding",
         {"version", "sha256"},
     )
-    _strict_int(binding["version"], "source candidate version", 2, 2)
+    _strict_int(binding["version"], "source candidate version", 3, 3)
     digest = _string(
         binding["sha256"], "source candidate sha256", minimum=64, maximum=64
     )
@@ -1331,7 +1369,7 @@ def create_scene_selections(
 
     payload = {
         "version": MANIFEST_VERSION,
-        "source_candidate_manifest": {"version": 2, "sha256": candidate_digest},
+        "source_candidate_manifest": {"version": 3, "sha256": candidate_digest},
         "source_preview_manifest": {"version": 1, "sha256": preview_digest},
         "provider": candidate_manifest["provider"],
         "video_aspect": candidate_manifest["video_aspect"],

@@ -37,13 +37,14 @@ def _candidate(identifier: str, rank: int) -> dict:
 
 def _candidate_manifest(path: Path) -> bytes:
     payload = {
-        "version": 2,
+        "version": 3,
         "provider": "pexels",
         "video_aspect": "9:16",
         "candidates_per_scene": 6,
         "provider_search_budget": 20,
         "remote_searches_used": 1,
         "query_generation_warning": "query generation used fallback",
+        "semantic_planning": {"status": "not_required", "issues": []},
         "scenes": [
             {
                 "scene_index": 1,
@@ -130,7 +131,7 @@ def _preview_manifest(
     payload = {
         "version": 1,
         "source_candidate_manifest": {
-            "version": 2,
+            "version": 3,
             "sha256": hashlib.sha256(candidate_bytes).hexdigest(),
         },
         "normalization_version": "poster-jpeg-v1",
@@ -699,7 +700,9 @@ def test_ranking_enabled_rejects_missing_primary_evidence_before_vlm(artifacts):
         patch.object(
             scene_selection.utils, "storage_dir", return_value=str(objects.parent)
         ),
-        patch.object(scene_selection.scene_ranking, "request_remote_attempt") as request,
+        patch.object(
+            scene_selection.scene_ranking, "request_remote_attempt"
+        ) as request,
         pytest.raises(ValueError, match="semantic evidence"),
     ):
         scene_selection.create_scene_selections(
@@ -903,3 +906,34 @@ def test_missing_key_cache_miss_falls_back_without_request(artifacts):
     assert data["scenes"][0]["fallback_reason"] == "ranking_not_configured"
     assert data["usage"]["vlm_requests_started"] == 0
     request.assert_not_called()
+
+
+def test_semantic_planning_diagnostics_are_strict_and_bounded(tmp_path):
+    candidate_path = tmp_path / "candidates.json"
+    _candidate_manifest(candidate_path)
+    payload = json.loads(candidate_path.read_text(encoding="utf-8"))
+    payload["semantic_planning"] = {
+        "status": "partial",
+        "issues": [
+            {
+                "batch_index": 0,
+                "scene_index": 1,
+                "reason": "aliases_not_array",
+                "attempt": 2,
+            }
+        ],
+    }
+    assert scene_selection._validate_candidate_manifest(payload) is payload
+    for mutation in ("unknown_reason", "unknown_scene", "extra", "secret_value"):
+        invalid = json.loads(json.dumps(payload))
+        issue = invalid["semantic_planning"]["issues"][0]
+        if mutation == "unknown_reason":
+            issue["reason"] = "provider_response_said_secret"
+        elif mutation == "unknown_scene":
+            issue["scene_index"] = 999
+        elif mutation == "extra":
+            issue["raw_response"] = "secret"
+        else:
+            issue["reason"] = "api-key-secret"
+        with pytest.raises(ValueError):
+            scene_selection._validate_candidate_manifest(invalid)

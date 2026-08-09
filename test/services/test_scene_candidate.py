@@ -535,6 +535,11 @@ def test_unavailable_semantic_plan_prohibits_scene_provider_work(tmp_path):
         1,
         2,
         1,
+        (
+            llm.SemanticPlanIssue(
+                0, None, llm.SemanticPlanDiagnostic.provider_failed, 2
+            ),
+        ),
     )
     with (
         patch.object(
@@ -566,6 +571,65 @@ def test_unavailable_semantic_plan_prohibits_scene_provider_work(tmp_path):
     assert result.scene_query_remote_searches_used == 0
     cache.assert_not_called()
     search.assert_not_called()
+    payload = json.loads(Path(result.artifact_path).read_text(encoding="utf-8"))
+    assert payload["version"] == 3
+    assert payload["semantic_planning"] == {
+        "status": "unavailable",
+        "issues": [
+            {
+                "batch_index": 0,
+                "scene_index": None,
+                "reason": "provider_failed",
+                "attempt": 2,
+            }
+        ],
+    }
+
+
+def test_partial_semantic_diagnostics_preserve_phase_one_downstream_routing(tmp_path):
+    scenes = [_scene(1, "First"), _scene(2, "Second")]
+    requirements = llm.SceneSemanticRequirements(
+        primary_entities=(llm.SemanticTermGroup("cacao", ("cocoa",)),)
+    )
+    partial = llm.SemanticPlanResult(
+        llm.SemanticPlanState.partial,
+        ((1, llm.SceneQueryPlan(("cacao harvest",), requirements)),),
+        llm.SemanticPlanDiagnostic.aliases_not_array,
+        2,
+        1,
+        2,
+        0,
+        (llm.SemanticPlanIssue(0, 2, llm.SemanticPlanDiagnostic.aliases_not_array, 2),),
+    )
+    with (
+        patch.object(
+            scene_candidate.llm, "generate_scene_query_plan", return_value=partial
+        ),
+        patch.object(
+            scene_candidate.material_cache, "load_material_candidate_search_cache"
+        ) as cache,
+        patch.object(
+            scene_candidate.material, "search_video_candidates_with_cache"
+        ) as search,
+    ):
+        result = scene_candidate.retrieve_scene_candidates_result(
+            str(tmp_path),
+            "Subject",
+            scenes,
+            "pexels",
+            VideoAspect.portrait,
+            5,
+            semantic_filter_enabled=True,
+        )
+    assert (
+        result.planning_state
+        is scene_candidate.SceneCandidatePlanningState.semantic_plan_unavailable
+    )
+    cache.assert_not_called()
+    search.assert_not_called()
+    payload = json.loads(Path(result.artifact_path).read_text(encoding="utf-8"))
+    assert payload["semantic_planning"]["status"] == "partial"
+    assert payload["semantic_planning"]["issues"][0]["scene_index"] == 2
 
 
 def test_actions_cannot_replace_missing_primary_entity():
