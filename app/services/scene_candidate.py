@@ -148,8 +148,8 @@ def retrieve_scene_candidates(
     resolved: dict[str, list[ProviderVideoCandidate]] = {}
     skipped: dict[int, int] = {scene.index: 0 for scene in scenes}
     attempted: dict[int, int] = {scene.index: 0 for scene in scenes}
-    found: dict[int, list[tuple[str, ProviderVideoCandidate]]] = {
-        scene.index: [] for scene in scenes
+    found: dict[int, list[list[ProviderVideoCandidate]]] = {
+        scene.index: [[] for _ in queries[scene.index]] for scene in scenes
     }
     remote_used = 0
     max_query_count = max((len(value) for value in queries.values()), default=0)
@@ -189,7 +189,7 @@ def retrieve_scene_candidates(
                     remote_used += int(used_remote)
                 resolved[cache_key] = items
             attempted[scene.index] += 1
-            found[scene.index].extend((query, item) for item in items)
+            found[scene.index][query_position].extend(items)
 
     groups = []
     for position, scene in enumerate(scenes):
@@ -211,13 +211,24 @@ def retrieve_scene_candidates(
             continue
         unique = []
         seen = set()
-        for query, item in found[scene.index]:
-            identity = (item.provider, item.provider_video_id)
-            if identity in seen:
-                continue
-            seen.add(identity)
-            unique.append(_candidate(item, query))
-        unique = unique[:candidates_per_scene]
+        result_groups = found[scene.index]
+        max_result_count = max((len(items) for items in result_groups), default=0)
+        for candidate_position in range(max_result_count):
+            for query_position, items in enumerate(result_groups):
+                if candidate_position >= len(items):
+                    continue
+                item = items[candidate_position]
+                identity = (item.provider, item.provider_video_id)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                unique.append(
+                    _candidate(item, queries[scene.index][query_position])
+                )
+                if len(unique) >= candidates_per_scene:
+                    break
+            if len(unique) >= candidates_per_scene:
+                break
         warning = None
         if skipped[scene.index]:
             if attempted[scene.index]:

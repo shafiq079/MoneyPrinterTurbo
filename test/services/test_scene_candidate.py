@@ -169,6 +169,10 @@ def test_manifest_keeps_holds_combines_queries_and_limits_after_dedup(tmp_path):
         "1",
         "2",
     ]
+    assert [item["matched_query"] for item in data["scenes"][0]["candidates"]] == [
+        "busy train station",
+        "busy train station",
+    ]
     assert data["scenes"][1]["status"] == "hold_no_search"
     assert data["scenes"][1]["queries"] == []
     assert data["scenes"][1]["reuse_scene_index"] == 1
@@ -210,7 +214,208 @@ def test_default_six_limit_is_applied_after_dedup_and_preserves_utf8(tmp_path):
     assert manifest["scenes"][0]["text"] == "城市街道上的行人"
     assert [
         item["provider_video_id"] for item in manifest["scenes"][0]["candidates"]
-    ] == ["1", "2", "3", "4", "5", "6"]
+    ] == ["1", "2", "7", "3", "8", "4"]
+
+
+def test_three_queries_interleave_deterministically_and_preserve_metadata(tmp_path):
+    results = {
+        "first": [_item("a1", 11), _item("a2", 12), _item("a3", 13)],
+        "second": [_item("b1", 21), _item("b2", 22)],
+        "third": [_item("c1", 31), _item("c2", 32)],
+    }
+
+    def search(**kwargs):
+        return results[kwargs["search_term"]], True
+
+    with (
+        patch.object(
+            scene_candidate.llm,
+            "generate_scene_queries",
+            return_value=({1: ["first", "second", "third"]}, None),
+        ),
+        patch.object(
+            scene_candidate.material_cache,
+            "load_material_candidate_search_cache",
+            return_value=None,
+        ),
+        patch.object(
+            scene_candidate.material,
+            "search_video_candidates_with_cache",
+            side_effect=search,
+        ) as provider_search,
+    ):
+        first_target = scene_candidate.retrieve_scene_candidates(
+            str(tmp_path),
+            "Subject",
+            [_scene(1, "Scene")],
+            "pexels",
+            VideoAspect.portrait,
+            5,
+        )
+        first_candidates = json.loads(
+            Path(first_target).read_text(encoding="utf-8")
+        )["scenes"][0]["candidates"]
+        second_target = scene_candidate.retrieve_scene_candidates(
+            str(tmp_path),
+            "Subject",
+            [_scene(1, "Scene")],
+            "pexels",
+            VideoAspect.portrait,
+            5,
+        )
+        second_candidates = json.loads(
+            Path(second_target).read_text(encoding="utf-8")
+        )["scenes"][0]["candidates"]
+
+    assert [item["provider_video_id"] for item in first_candidates] == [
+        "a1",
+        "b1",
+        "c1",
+        "a2",
+        "b2",
+        "c2",
+    ]
+    assert [item["matched_query"] for item in first_candidates] == [
+        "first",
+        "second",
+        "third",
+        "first",
+        "second",
+        "third",
+    ]
+    assert [item["provider_rank"] for item in first_candidates] == [
+        11,
+        21,
+        31,
+        12,
+        22,
+        32,
+    ]
+    assert second_candidates == first_candidates
+    assert provider_search.call_count == 6
+
+
+def test_duplicate_identity_keeps_first_interleaved_occurrence(tmp_path):
+    results = {
+        "first": [_item("a", 1), _item("duplicate", 2), _item("c", 3)],
+        "second": [_item("duplicate", 20), _item("b", 21)],
+    }
+
+    def search(**kwargs):
+        return results[kwargs["search_term"]], True
+
+    with (
+        patch.object(
+            scene_candidate.llm,
+            "generate_scene_queries",
+            return_value=({1: ["first", "second"]}, None),
+        ),
+        patch.object(
+            scene_candidate.material_cache,
+            "load_material_candidate_search_cache",
+            return_value=None,
+        ),
+        patch.object(
+            scene_candidate.material,
+            "search_video_candidates_with_cache",
+            side_effect=search,
+        ),
+    ):
+        target = scene_candidate.retrieve_scene_candidates(
+            str(tmp_path),
+            "Subject",
+            [_scene(1, "Scene")],
+            "pexels",
+            VideoAspect.portrait,
+            5,
+        )
+
+    candidates = json.loads(Path(target).read_text(encoding="utf-8"))["scenes"][0][
+        "candidates"
+    ]
+    assert [item["provider_video_id"] for item in candidates] == [
+        "a",
+        "duplicate",
+        "b",
+        "c",
+    ]
+    duplicate = candidates[1]
+    assert duplicate["matched_query"] == "second"
+    assert duplicate["provider_rank"] == 20
+
+
+def test_empty_query_group_does_not_prevent_filling_candidate_cap(tmp_path):
+    results = {
+        "empty": [],
+        "full": [_item("1", 1), _item("2", 2), _item("3", 3)],
+    }
+
+    def search(**kwargs):
+        return results[kwargs["search_term"]], True
+
+    with (
+        patch.object(
+            scene_candidate.llm,
+            "generate_scene_queries",
+            return_value=({1: ["empty", "full"]}, None),
+        ),
+        patch.object(
+            scene_candidate.material_cache,
+            "load_material_candidate_search_cache",
+            return_value=None,
+        ),
+        patch.object(
+            scene_candidate.material,
+            "search_video_candidates_with_cache",
+            side_effect=search,
+        ),
+    ):
+        target = scene_candidate.retrieve_scene_candidates(
+            str(tmp_path),
+            "Subject",
+            [_scene(1, "Scene")],
+            "pexels",
+            VideoAspect.portrait,
+            5,
+            candidates_per_scene=2,
+        )
+
+    candidates = json.loads(Path(target).read_text(encoding="utf-8"))["scenes"][0][
+        "candidates"
+    ]
+    assert [item["provider_video_id"] for item in candidates] == ["1", "2"]
+    assert [item["matched_query"] for item in candidates] == ["full", "full"]
+
+
+def test_single_query_preserves_provider_order_and_cap(tmp_path):
+    items = [_item(str(index), index) for index in range(1, 5)]
+    with (
+        patch.object(
+            scene_candidate.llm,
+            "generate_scene_queries",
+            return_value=({1: ["only"]}, None),
+        ),
+        patch.object(
+            scene_candidate.material_cache,
+            "load_material_candidate_search_cache",
+            return_value=items,
+        ),
+    ):
+        target = scene_candidate.retrieve_scene_candidates(
+            str(tmp_path),
+            "Subject",
+            [_scene(1, "Scene")],
+            "pexels",
+            VideoAspect.portrait,
+            5,
+            candidates_per_scene=3,
+        )
+
+    candidates = json.loads(Path(target).read_text(encoding="utf-8"))["scenes"][0][
+        "candidates"
+    ]
+    assert [item["provider_video_id"] for item in candidates] == ["1", "2", "3"]
+    assert [item["provider_rank"] for item in candidates] == [1, 2, 3]
 
 
 @pytest.mark.parametrize("limit", [0, -1, scene_candidate.MAX_CANDIDATES_PER_SCENE + 1])
