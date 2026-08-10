@@ -35,6 +35,7 @@ STREAM = False
 PROFILES = ((1200, 960, 72), (1000, 800, 68), (800, 640, 58), (600, 480, 45))
 RETRYABLE = {408, 429, 500, 502, 503, 504}
 _RETRY_AFTER = re.compile(r"^[0-9]{1,3}$")
+_JSON_FENCE = re.compile(r"\A```json(?:\r\n|\n)(.*)(?:\r\n|\n)```\Z", re.DOTALL)
 
 
 class RankingError(Exception):
@@ -315,10 +316,14 @@ def parse_content(
         type(content) is not str
         or not content
         or len(content.encode("utf-8")) > MAX_CONTENT_BYTES
-        or content != content.strip()
-        or content.startswith("```")
     ):
         raise ValueError("invalid response content")
+    content = content.strip()
+    if not content:
+        raise ValueError("invalid response content")
+    fenced = _JSON_FENCE.fullmatch(content)
+    if fenced is not None:
+        content = fenced.group(1)
     payload = json.loads(
         content,
         object_pairs_hook=_no_duplicates,
