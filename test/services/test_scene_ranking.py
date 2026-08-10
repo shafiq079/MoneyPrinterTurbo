@@ -105,7 +105,7 @@ def test_prompt_uses_canonical_json_and_delimiter_text_cannot_escape():
     assert "explicit sexual or nude" in prompt
 
 
-def test_prompt_has_absolute_semantic_rubric_without_assessment_example():
+def test_prompt_has_subject_first_semantic_rubric_without_assessment_example():
     prepared = scene_ranking.prepare(
         _scene(2), [_jpeg(), _jpeg()], "nvidia_hosted", scene_ranking.MODEL, "16:9"
     )
@@ -120,21 +120,21 @@ def test_prompt_has_absolute_semantic_rubric_without_assessment_example():
         "Assess each mapped candidate independently",
         "only what is visibly present",
         "do not copy scores between candidates",
-        "infer objects, ingredients, products, outputs, actions, or processes that are not visible",
-        "Relevance measures visible correspondence to the narration",
-        "primary visible subject",
-        "visible action or process",
-        "relevant setting or context",
-        "Generic visual or category similarity is insufficient",
-        "does not establish an exact narration match",
-        "Mismatch measures visible semantic contradiction",
-        "primary subject, material, crop, food, product, machine output, action, or process differs",
+        "Apply this mandatory hierarchy",
+        "required primary subject, material, crop, food, or product",
+        "exact primary entity is visibly identifiable",
+        "only after that evaluate the visible action or process",
+        "cannot compensate for a wrong, generic, hidden, ambiguous, or absent required primary entity",
+        "relevance must be 0..30 and mismatch must be 70..100",
+        "relevance must be 0..15 and mismatch must be 85..100",
+        "Only a visibly correct primary entity may receive relevance above 50",
+        "relevance above 80 additionally requires",
+        "do not infer hidden contents from a box",
         "Visual_quality measures only visible usability and presentation",
         "independently of semantic relevance",
         "polished but unrelated footage",
     ):
         assert rule in instructions
-
 
 def test_prompt_describes_exact_output_fields_and_complete_label_coverage():
     prepared = scene_ranking.prepare(
@@ -166,12 +166,12 @@ def test_prompt_and_request_are_deterministic_and_bounded():
     assert len(first.request_bytes) <= scene_ranking.MAX_REQUEST_BYTES
 
 
-def test_prompt_v2_invalidates_v1_cache_identity(monkeypatch):
-    assert scene_ranking.PROMPT_VERSION == "nvidia-poster-ranker-v2"
+def test_prompt_v3_invalidates_v2_cache_identity(monkeypatch):
+    assert scene_ranking.PROMPT_VERSION == "nvidia-poster-ranker-v3"
     current = scene_ranking.prepare(
         _scene(1), [_jpeg()], "nvidia_hosted", scene_ranking.MODEL, "16:9"
     ).cache_key
-    monkeypatch.setattr(scene_ranking, "PROMPT_VERSION", "nvidia-poster-ranker-v1")
+    monkeypatch.setattr(scene_ranking, "PROMPT_VERSION", "nvidia-poster-ranker-v2")
     previous = scene_ranking.prepare(
         _scene(1), [_jpeg()], "nvidia_hosted", scene_ranking.MODEL, "16:9"
     ).cache_key
