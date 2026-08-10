@@ -136,6 +136,7 @@ def test_prompt_has_subject_first_semantic_rubric_without_assessment_example():
     ):
         assert rule in instructions
 
+
 def test_prompt_describes_exact_output_fields_and_complete_label_coverage():
     prepared = scene_ranking.prepare(
         _scene(2), [_jpeg(), _jpeg()], "nvidia_hosted", scene_ranking.MODEL, "16:9"
