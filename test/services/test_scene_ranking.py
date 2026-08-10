@@ -181,15 +181,84 @@ def test_exact_request_and_scoring_example():
     assert item.score == 8600
 
 
+def test_parse_content_accepts_raw_json_and_outer_whitespace():
+    expected = _valid(("C01",))
+    content = json.dumps(expected)
+    assert scene_ranking.parse_content(content, 1, ("C01",)) == expected
+    assert scene_ranking.parse_content(f" \n{content}\r\n\t", 1, ("C01",)) == expected
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_parse_content_accepts_exact_whole_response_json_fence(newline):
+    expected = _valid(("C01",))
+    content = f"```json{newline}{json.dumps(expected)}{newline}```"
+    assert scene_ranking.parse_content(f" \t{content}\r\n", 1, ("C01",)) == expected
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.pop("assessments"),
+        lambda payload: payload.update({"extra": None}),
+        lambda payload: payload.update({"scene_index": 2}),
+        lambda payload: payload["assessments"][0].pop("unsafe"),
+        lambda payload: payload["assessments"][0].update({"extra": None}),
+        lambda payload: payload["assessments"][0].update({"label": "C02"}),
+        lambda payload: payload["assessments"].append(payload["assessments"][0].copy()),
+        lambda payload: payload["assessments"].clear(),
+        lambda payload: payload["assessments"][0].update({"relevance": True}),
+        lambda payload: payload["assessments"][0].update({"visual_quality": 101}),
+        lambda payload: payload["assessments"][0].update({"mismatch": -1}),
+        lambda payload: payload["assessments"][0].update({"unsafe": 0}),
+    ],
+)
+def test_fenced_content_still_runs_strict_schema_validation(mutate):
+    payload = _valid(("C01",))
+    mutate(payload)
+    content = f"```json\n{json.dumps(payload)}\n```"
+    with pytest.raises(ValueError):
+        scene_ranking.parse_content(content, 1, ("C01",))
+
+
 @pytest.mark.parametrize(
     "content",
     [
-        "```json\n{}\n```",
-        '{"scene_index":1,"scene_index":1,"assessments":[]}',
-        '{"scene_index":1,"assessments":[{"label":"C01","relevance":NaN,"visual_quality":1,"mismatch":1,"unsafe":false}]}',
+        "prose\n```json\n{}\n```",
+        "```json\n{}\n```\nprose",
+        "```json\n{}",
+        "```json\n{}\n````",
+        "```\n{}\n```",
+        "```JSON\n{}\n```",
+        "```js\n{}\n```",
+        "``` json\n{}\n```",
+        "```json extra\n{}\n```",
+        "```json\n{}\n``` extra",
+        "```json\n{}\n```\n```json\n{}\n```",
+        "```json\n```json\n{}\n```\n```",
+        "```json\n```",
+        "```json\n{}\n{}\n```",
     ],
 )
-def test_strict_content_rejects_fences_duplicates_and_nan(content):
+def test_parse_content_rejects_contaminated_nested_multiple_and_bad_fences(content):
+    with pytest.raises(ValueError):
+        scene_ranking.parse_content(content, 1, ("C01",))
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+@pytest.mark.parametrize("fenced", [False, True])
+def test_strict_content_rejects_duplicate_keys_and_invalid_constants(constant, fenced):
+    duplicate = '{"scene_index":1,"scene_index":1,"assessments":[]}'
+    invalid = f'{{"scene_index":1,"assessments":[{{"label":"C01","relevance":{constant},"visual_quality":1,"mismatch":1,"unsafe":false}}]}}'
+    for content in (duplicate, invalid):
+        if fenced:
+            content = f"```json\n{content}\n```"
+        with pytest.raises(ValueError):
+            scene_ranking.parse_content(content, 1, ("C01",))
+
+
+def test_parse_content_checks_raw_size_before_normalization(monkeypatch):
+    content = f" \n{json.dumps(_valid(('C01',)))}\n "
+    monkeypatch.setattr(scene_ranking, "MAX_CONTENT_BYTES", len(content.encode()) - 1)
     with pytest.raises(ValueError):
         scene_ranking.parse_content(content, 1, ("C01",))
 
@@ -267,6 +336,62 @@ def test_mocked_request_retry_and_envelope_without_secret_in_body():
     assert b"test-key" not in prepared.request_bytes
     assert session.calls[0][1]["headers"]["Authorization"] == "Bearer test-key"
     assert all(call[1]["stream"] is True for call in session.calls)
+
+
+def test_request_remote_accepts_nemotron_style_fenced_response():
+    prepared = scene_ranking.prepare(
+        _scene(1), [_jpeg()], "nvidia_hosted", scene_ranking.MODEL, "16:9"
+    )
+    expected = _valid(prepared.labels)
+    content = f"```json\n{json.dumps(expected)}\n```"
+    response = Response(
+        200,
+        {"choices": [{"finish_reason": "stop", "message": {"content": content}}]},
+    )
+    cfg = SimpleNamespace(
+        max_attempts_per_scene=1, connect_timeout_seconds=10, read_timeout_seconds=45
+    )
+    result, attempts = scene_ranking.request_remote(
+        prepared,
+        1,
+        "x",
+        cfg,
+        session=Session([response]),
+        monotonic=lambda: 1,
+        deadline=100,
+    )
+    assert result == expected
+    assert attempts == 1
+    assert response.closed
+
+
+def test_request_remote_maps_invalid_fenced_content_to_invalid_response():
+    prepared = scene_ranking.prepare(
+        _scene(1), [_jpeg()], "nvidia_hosted", scene_ranking.MODEL, "16:9"
+    )
+    invalid = _valid(("C02",))
+    content = f"```json\n{json.dumps(invalid)}\n```"
+    response = Response(
+        200,
+        {"choices": [{"finish_reason": "stop", "message": {"content": content}}]},
+    )
+    cfg = SimpleNamespace(
+        max_attempts_per_scene=2, connect_timeout_seconds=10, read_timeout_seconds=45
+    )
+    with pytest.raises(scene_ranking.RankingError) as error:
+        scene_ranking.request_remote(
+            prepared,
+            1,
+            "x",
+            cfg,
+            session=Session([response]),
+            monotonic=lambda: 1,
+            deadline=100,
+        )
+    assert error.value.reason == "vlm_response_invalid"
+    assert error.value.attempts == 1
+    assert error.value.retryable is False
+    assert response.closed
 
 
 def test_finish_reason_and_oversized_response_rejected():
