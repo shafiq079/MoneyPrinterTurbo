@@ -401,7 +401,7 @@ def request_remote(
                     prepared.endpoint,
                     headers=(
                         {
-                            "x-api-key": api_key,
+                            "Authorization": f"Bearer {api_key}",
                             "anthropic-version": "2023-06-01",
                             "Content-Type": "application/json",
                         }

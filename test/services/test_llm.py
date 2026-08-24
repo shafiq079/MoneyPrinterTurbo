@@ -44,6 +44,8 @@ def test_agentrouter_llm_uses_anthropic_messages_protocol():
             assert llm._generate_response("prompt") == "visible query"
         _, kwargs = post.call_args
         assert post.call_args.args[0] == "https://co.agentrouter.org/v1/messages"
+        assert kwargs["headers"]["Authorization"] == "Bearer test-key"
+        assert "x-api-key" not in kwargs["headers"]
         assert kwargs["headers"]["anthropic-version"] == "2023-06-01"
         assert kwargs["json"]["model"] == "configured-model-alias"
     finally:
