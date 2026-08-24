@@ -14,7 +14,7 @@ from io import BytesIO
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
-from app.services import scene_ranking_cache
+from app.services import agentrouter, scene_ranking_cache
 
 ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
 PROVIDER = "nvidia_hosted"
@@ -243,8 +243,12 @@ def prepare(
         ).encode("utf-8")
         if len(jpeg) <= MAX_JPEG_BYTES and len(raw) <= MAX_REQUEST_BYTES:
             sheet_digest = hashlib.sha256(jpeg).hexdigest()
-            endpoint = (base_url or ENDPOINT.rsplit("/chat/completions", 1)[0]).rstrip("/")
-            endpoint += "/messages" if provider == "agentrouter_claude" else "/chat/completions"
+            endpoint_base = base_url or ENDPOINT.rsplit("/chat/completions", 1)[0]
+            endpoint = (
+                agentrouter.anthropic_messages_url(endpoint_base)
+                if provider == "agentrouter_claude"
+                else f"{endpoint_base.rstrip('/')}/chat/completions"
+            )
             identity_payload = {
                 "cache_version": scene_ranking_cache.CACHE_VERSION,
                 "provider": provider,

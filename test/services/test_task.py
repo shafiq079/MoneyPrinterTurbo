@@ -215,6 +215,17 @@ class TestTaskService(unittest.TestCase):
             selection.assert_not_called()
             self.assertNotIn("scene_previews_path", result)
 
+    def test_normal_scene_pipeline_passes_configured_candidate_count(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            tm.config,
+            "app",
+            dict(tm.config.app, scene_candidates_per_scene=10),
+        ):
+            _, _, retrieve, preview, *_ = self._run_preview_pipeline(tmp)
+
+        self.assertEqual(retrieve.call_args.kwargs["candidates_per_scene"], 10)
+        self.assertEqual(preview.call_args.kwargs["candidates_per_scene"], 10)
+
     def test_preview_failure_is_nonfatal_and_preserves_renderer_arguments(self):
         with tempfile.TemporaryDirectory() as tmp:
             result, state, _, preview, selection, get_materials, render, materials = (

@@ -92,11 +92,10 @@ LLM_PROVIDER_REGISTRY = (
         "AgentRouter (Claude)",
         adapter="anthropic_messages",
         api_key_url="https://agentrouter.org/",
-        # AgentRouter deployments and Claude model aliases can differ. Requiring
-        # both values avoids silently pinning users to a particular endpoint or
-        # Claude release.
+        # Claude model aliases can differ, so the model remains explicit. The
+        # documented root URL is normalized to /v1/messages by the adapter.
         default_model="",
-        default_base_url="",
+        default_base_url="https://co.agentrouter.org",
     ),
     LLMProviderSpec(
         "gemini",

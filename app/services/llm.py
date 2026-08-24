@@ -11,6 +11,7 @@ from openai.types.chat import ChatCompletion
 
 from app.config import config
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
+from app.services import agentrouter
 
 _max_retries = 5
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
@@ -304,7 +305,7 @@ def _generate_response(prompt: str) -> str:
             # Claude models use the Anthropic Messages protocol through
             # AgentRouter rather than an OpenAI Chat Completions compatibility
             # shim. Keep the gateway URL and model entirely user-configurable.
-            endpoint = f"{base_url.rstrip('/')}/messages"
+            endpoint = agentrouter.anthropic_messages_url(base_url)
             response = requests.post(
                 endpoint,
                 headers={

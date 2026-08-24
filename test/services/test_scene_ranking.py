@@ -188,9 +188,9 @@ def test_agentrouter_uses_anthropic_image_message_and_configured_endpoint():
         "agentrouter_claude",
         "configured-model-alias",
         "16:9",
-        "https://router.example/anthropic/v1",
+        "https://co.agentrouter.org",
     )
-    assert prepared.endpoint == "https://router.example/anthropic/v1/messages"
+    assert prepared.endpoint == "https://co.agentrouter.org/v1/messages"
     assert prepared.provider == "agentrouter_claude"
     assert prepared.request["model"] == "configured-model-alias"
     content = prepared.request["messages"][0]["content"]

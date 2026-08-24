@@ -64,6 +64,10 @@ twelvelabs_rerank_terms = false
 # 默认关闭，开启后会减少随机性，使素材顺序更贴近文案结构。
 match_materials_to_script = false
 
+# Candidate previews retained for each narration scene when scene matching is
+# enabled. Recommended default: 10. Supported range: 1-12.
+scene_candidates_per_scene = 10
+
 # Optional Sonilo video-matched original background music.
 # Create a key at https://platform.sonilo.com/dashboard. The WebUI can also save
 # this value, or you can set the SONILO_API_KEY environment variable instead.
@@ -97,6 +101,7 @@ openai_model_name = ""
 # the project does not pin an AgentRouter deployment URL or a Claude model ID.
 # Never commit your real key.
 agentrouter_api_key = ""
+# Defaults to the documented AgentRouter Anthropic root shown below.
 agentrouter_base_url = ""
 agentrouter_model_name = ""
 
@@ -309,6 +314,7 @@ compute_type = "int8"
 
 # provider may be "nvidia_hosted" or "agentrouter_claude". For Claude, set an
 # AgentRouter Anthropic Messages base URL and a Claude model name explicitly.
+# AgentRouter documented base URL: https://co.agentrouter.org
 [scene_ranking]
 enabled = false
 provider = "nvidia_hosted"

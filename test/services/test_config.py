@@ -26,6 +26,7 @@ class TestConfigPersistence:
         assert example_config["log_level"] == "DEBUG"
         assert app_config["video_source"] in {"pexels", "pixabay", "coverr", "local"}
         assert "match_materials_to_script" in app_config
+        assert app_config["scene_candidates_per_scene"] == 10
         assert example_config["whisper"]["device"] == "cpu"
 
     def test_example_config_covers_llm_provider_registry(self):

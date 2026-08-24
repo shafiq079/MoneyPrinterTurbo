@@ -37,13 +37,13 @@ def test_agentrouter_llm_uses_anthropic_messages_protocol():
         config.app.update({
             "llm_provider": "agentrouter",
             "agentrouter_api_key": "test-key",
-            "agentrouter_base_url": "https://router.example/v1",
+            "agentrouter_base_url": "https://co.agentrouter.org",
             "agentrouter_model_name": "configured-model-alias",
         })
         with patch.object(llm.requests, "post", return_value=Response()) as post:
             assert llm._generate_response("prompt") == "visible query"
         _, kwargs = post.call_args
-        assert post.call_args.args[0] == "https://router.example/v1/messages"
+        assert post.call_args.args[0] == "https://co.agentrouter.org/v1/messages"
         assert kwargs["headers"]["anthropic-version"] == "2023-06-01"
         assert kwargs["json"]["model"] == "configured-model-alias"
     finally:
