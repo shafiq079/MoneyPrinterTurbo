@@ -341,7 +341,9 @@ class SceneRankingConfig:
     enabled: bool
     provider: str
     api_key: str
+    base_url: str
     model: str
+    min_selection_score: int
     max_remote_scene_requests_per_task: int
     connect_timeout_seconds: int
     read_timeout_seconds: int
@@ -353,7 +355,9 @@ _SCENE_RANKING_DEFAULTS = {
     "enabled": False,
     "provider": "nvidia_hosted",
     "api_key": "",
+    "base_url": "https://integrate.api.nvidia.com/v1",
     "model": "nvidia/nemotron-nano-12b-v2-vl",
+    "min_selection_score": 60,
     "max_remote_scene_requests_per_task": 12,
     "connect_timeout_seconds": 10,
     "read_timeout_seconds": 45,
@@ -361,6 +365,7 @@ _SCENE_RANKING_DEFAULTS = {
     "max_attempts_per_scene": 2,
 }
 _SCENE_RANKING_INTEGER_BOUNDS = {
+    "min_selection_score": (0, 100),
     "max_remote_scene_requests_per_task": (0, 60),
     "connect_timeout_seconds": (1, 30),
     "read_timeout_seconds": (1, 120),
@@ -373,24 +378,37 @@ _SCENE_RANKING_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 def get_scene_ranking_config(environ=None) -> SceneRankingConfig:
     """Return a strictly validated, secret-bearing runtime snapshot."""
-    values = {**_SCENE_RANKING_DEFAULTS, **dict(scene_ranking)}
+    configured = dict(scene_ranking)
+    values = {**_SCENE_RANKING_DEFAULTS, **configured}
     if set(values) != set(_SCENE_RANKING_DEFAULTS):
         raise ValueError("scene_ranking contains unsupported settings")
     if type(values["enabled"]) is not bool:
         raise ValueError("scene_ranking.enabled must be a boolean")
-    for name in ("provider", "api_key", "model"):
+    for name in ("provider", "api_key", "base_url", "model"):
         if type(values[name]) is not str:
             raise ValueError(f"scene_ranking.{name} must be a string")
-    if values["provider"] != "nvidia_hosted":
+    if values["provider"] not in {"nvidia_hosted", "agentrouter_claude"}:
         raise ValueError("unsupported scene ranking provider")
-    if values["model"] != "nvidia/nemotron-nano-12b-v2-vl":
-        raise ValueError("unsupported scene ranking model")
+    if values["provider"] == "agentrouter_claude" and not {
+        "base_url",
+        "model",
+    } <= configured.keys():
+        raise ValueError("AgentRouter ranking requires an explicit base_url and model")
+    if not values["model"].strip():
+        raise ValueError("scene_ranking.model must not be empty")
+    if not values["base_url"].strip():
+        raise ValueError("scene_ranking.base_url must not be empty")
     for name, (minimum, maximum) in _SCENE_RANKING_INTEGER_BOUNDS.items():
         value = values[name]
         if type(value) is not int or not minimum <= value <= maximum:
             raise ValueError(f"scene_ranking.{name} is outside the supported range")
     environment = os.environ if environ is None else environ
-    api_key = environment.get("NVIDIA_API_KEY", values["api_key"])
+    env_name = (
+        "NVIDIA_API_KEY"
+        if values["provider"] == "nvidia_hosted"
+        else "AGENTROUTER_API_KEY"
+    )
+    api_key = environment.get(env_name, values["api_key"])
     if (
         type(api_key) is not str
         or api_key != api_key.strip()

@@ -181,6 +181,24 @@ def test_exact_request_and_scoring_example():
     assert item.score == 8600
 
 
+def test_agentrouter_uses_anthropic_image_message_and_configured_endpoint():
+    prepared = scene_ranking.prepare(
+        _scene(1),
+        [_jpeg()],
+        "agentrouter_claude",
+        "configured-model-alias",
+        "16:9",
+        "https://router.example/anthropic/v1",
+    )
+    assert prepared.endpoint == "https://router.example/anthropic/v1/messages"
+    assert prepared.provider == "agentrouter_claude"
+    assert prepared.request["model"] == "configured-model-alias"
+    content = prepared.request["messages"][0]["content"]
+    assert content[0]["type"] == "text"
+    assert content[1]["type"] == "image"
+    assert content[1]["source"]["media_type"] == "image/jpeg"
+
+
 def test_parse_content_accepts_raw_json_and_outer_whitespace():
     expected = _valid(("C01",))
     content = json.dumps(expected)

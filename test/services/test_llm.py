@@ -23,6 +23,33 @@ from app.models.llm_provider import (
 from app.models.schema import VideoScriptRequest, VideoSocialMetadataRequest
 from app.services import llm
 
+
+def test_agentrouter_llm_uses_anthropic_messages_protocol():
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"content": [{"type": "text", "text": "visible query"}]}
+
+    original = dict(config.app)
+    try:
+        config.app.update({
+            "llm_provider": "agentrouter",
+            "agentrouter_api_key": "test-key",
+            "agentrouter_base_url": "https://router.example/v1",
+            "agentrouter_model_name": "configured-model-alias",
+        })
+        with patch.object(llm.requests, "post", return_value=Response()) as post:
+            assert llm._generate_response("prompt") == "visible query"
+        _, kwargs = post.call_args
+        assert post.call_args.args[0] == "https://router.example/v1/messages"
+        assert kwargs["headers"]["anthropic-version"] == "2023-06-01"
+        assert kwargs["json"]["model"] == "configured-model-alias"
+    finally:
+        config.app.clear()
+        config.app.update(original)
+
 RUN_INTEGRATION_TESTS = os.environ.get("MPT_RUN_INTEGRATION_TESTS", "").lower() in {
     "1",
     "true",
@@ -272,6 +299,7 @@ class TestLiteLLMProvider(unittest.TestCase):
             [
                 "moonshot",
                 "openai",
+                "agentrouter",
                 "gemini",
                 "deepseek",
                 "qwen",

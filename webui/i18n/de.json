@@ -276,6 +276,7 @@
     "Coverr": "Coverr",
     "Coverr API Key": "Coverr API-Schlüssel ([API-Schlüssel holen](https://coverr.co/developers?ctx=header_navigation))",
     "Please Enter the Coverr API Key": "Bitte geben Sie den **Coverr API-Schlüssel** ein",
-    "Disabled": "Disabled"
+    "Disabled": "Disabled",
+    "llm_provider_label.agentrouter": "AgentRouter (Claude)"
   }
 }

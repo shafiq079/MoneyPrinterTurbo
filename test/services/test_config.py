@@ -169,6 +169,20 @@ class TestConfigPersistence:
         assert section["enabled"] is False
         assert section["api_key"] == ""
 
+    def test_agentrouter_claude_ranking_configuration(self):
+        values = {
+            "provider": "agentrouter_claude",
+            "base_url": "https://router.example/v1",
+            "model": "account-configured-claude-alias",
+        }
+        with patch.object(config, "scene_ranking", values):
+            settings = config.get_scene_ranking_config(
+                {"AGENTROUTER_API_KEY": "router-key"}
+            )
+        assert settings.provider == "agentrouter_claude"
+        assert settings.api_key == "router-key"
+        assert settings.model == "account-configured-claude-alias"
+
     def test_scene_ranking_strict_types_and_bounds(self):
         bounds = {
             "max_remote_scene_requests_per_task": (0, 60),
@@ -176,6 +190,7 @@ class TestConfigPersistence:
             "read_timeout_seconds": (1, 120),
             "total_deadline_seconds": (1, 900),
             "max_attempts_per_scene": (1, 2),
+            "min_selection_score": (0, 100),
         }
         for name, (lower, upper) in bounds.items():
             for valid in (lower, upper):
@@ -190,7 +205,7 @@ class TestConfigPersistence:
         for values in (
             {"enabled": 1},
             {"provider": "other"},
-            {"model": "other"},
+            {"model": ""},
         ):
             with (
                 patch.object(config, "scene_ranking", values),

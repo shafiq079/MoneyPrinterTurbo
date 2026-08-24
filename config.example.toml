@@ -93,6 +93,13 @@ openai_api_key = ""
 openai_base_url = ""
 openai_model_name = ""
 
+# AgentRouter Claude (Anthropic Messages protocol). Both values are explicit so
+# the project does not pin an AgentRouter deployment URL or a Claude model ID.
+# Never commit your real key.
+agentrouter_api_key = ""
+agentrouter_base_url = ""
+agentrouter_model_name = ""
+
 # Google Gemini
 # API key: https://aistudio.google.com/app/apikey
 gemini_api_key = ""
@@ -297,16 +304,19 @@ compute_type = "int8"
 # https = "http://127.0.0.1:1080"
 
 # =============================================================================
-# Optional NVIDIA Poster Ranking / 可选 NVIDIA 海报排序
+# Optional preview-image ranking / 可选预览图排序
 # =============================================================================
 
-# Enabling this sends scene narration, search queries, and provider poster
-# images to NVIDIA's hosted trial/development service, subject to NVIDIA terms.
+# provider may be "nvidia_hosted" or "agentrouter_claude". For Claude, set an
+# AgentRouter Anthropic Messages base URL and a Claude model name explicitly.
 [scene_ranking]
 enabled = false
 provider = "nvidia_hosted"
 api_key = ""
+base_url = "https://integrate.api.nvidia.com/v1"
 model = "nvidia/nemotron-nano-12b-v2-vl"
+# Safe candidates below this 0-100 score use deterministic provider-rank fallback.
+min_selection_score = 60
 max_remote_scene_requests_per_task = 12
 connect_timeout_seconds = 10
 read_timeout_seconds = 45
