@@ -4,12 +4,14 @@ import re
 from time import perf_counter
 from typing import List
 
+import requests
 from loguru import logger
 from openai import AzureOpenAI, OpenAI
 from openai.types.chat import ChatCompletion
 
 from app.config import config
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
+from app.services import agentrouter
 
 _max_retries = 5
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
@@ -298,6 +300,37 @@ def _generate_response(prompt: str) -> str:
                 messages=[{"role": "user", "content": prompt}],
             )
             return _extract_chat_completion_text(response, llm_provider)
+
+        if adapter == "anthropic_messages":
+            # Claude models use the Anthropic Messages protocol through
+            # AgentRouter rather than an OpenAI Chat Completions compatibility
+            # shim. Keep the gateway URL and model entirely user-configurable.
+            endpoint = agentrouter.anthropic_messages_url(base_url)
+            response = requests.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": model_name,
+                    "max_tokens": 2048,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            blocks = payload.get("content") if isinstance(payload, dict) else None
+            if not isinstance(blocks, list):
+                raise ValueError(f"[{llm_provider}] returned invalid response content")
+            content = "".join(
+                block.get("text", "")
+                for block in blocks
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+            return _normalize_text_response(content, llm_provider)
 
         if adapter == "litellm":
             import litellm
@@ -698,9 +731,12 @@ def generate_scene_queries(
     ]
     prompt = f"""
 # Role: Scene Stock-Footage Query Generator
-Generate 1-{max_queries_per_scene} concrete English stock-footage search queries for
-every narration scene. Describe visible subjects, actions, settings, or shots; do
-not summarize abstract ideas. Return JSON only in this exact shape:
+Generate 1-{max_queries_per_scene} different, concise English stock-footage search
+queries for every narration scene. Each query must name concrete camera-visible
+people, actions, objects, locations/settings, or events. Prefer phrases a person
+would enter into Pexels or Pixabay (usually 3-7 words). Do not use abstract themes,
+emotions without a visible action, narration summaries, metaphors, or near-duplicate
+wording. Return JSON only in this exact shape:
 {{"scenes":[{{"scene_index":1,"queries":["concrete visible footage"]}}]}}
 
 Video subject: {video_subject}

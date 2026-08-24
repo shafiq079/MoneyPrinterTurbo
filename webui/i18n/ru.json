@@ -276,6 +276,7 @@
     "Please enter a value between 0 and 100": "Введите значение от 0 до 100",
     "Please enter a valid number": "Введите корректное число",
     "Please Select a Valid Video Source": "Выберите поддерживаемый источник материалов",
-    "Disabled": "Disabled"
+    "Disabled": "Disabled",
+    "llm_provider_label.agentrouter": "AgentRouter (Claude)"
   }
 }

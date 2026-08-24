@@ -691,7 +691,7 @@ def _fallback(scene: dict, reason: str) -> None:
         row["safety_excluded"] = None
 
 
-def _apply_ranking(scene: dict, response: dict) -> None:
+def _apply_ranking(scene: dict, response: dict, min_selection_score: int = 0) -> None:
     by_label = {item["label"]: item for item in response["assessments"]}
     safe_positions = []
     for position, row in enumerate(scene["candidates"]):
@@ -732,6 +732,9 @@ def _apply_ranking(scene: dict, response: dict) -> None:
     for local_order, position in enumerate(order, 1):
         scene["candidates"][position]["local_order"] = local_order
     winner = scene["candidates"][order[0]]
+    if winner["score_basis_points"] < min_selection_score * 100:
+        _fallback(scene, "ranking_score_below_threshold")
+        return
     original = scene["selected_candidate"]
     if original is None or original["candidate_id"] != winner["candidate_id"]:
         # Candidate public fields are recovered from the row's source-independent
@@ -945,12 +948,18 @@ def create_scene_selections(
                 ],
             }
             try:
+                ranking_provider = getattr(
+                    ranking_config, "provider", scene_ranking.PROVIDER
+                )
+                ranking_model = getattr(ranking_config, "model", scene_ranking.MODEL)
+                ranking_base_url = getattr(ranking_config, "base_url", None)
                 prepared = scene_ranking.prepare(
                     ranking_scene,
                     [row["_preview_bytes"] for row in scene["candidates"]],
-                    scene_ranking.PROVIDER,
-                    scene_ranking.MODEL,
+                    ranking_provider,
+                    ranking_model,
                     candidate_manifest["video_aspect"],
+                    ranking_base_url,
                 )
             except scene_ranking.RankingError as exc:
                 _fallback(scene, exc.reason)
@@ -967,13 +976,15 @@ def create_scene_selections(
                 manifest_warnings.append("ranking_cache_corrupt")
             if cached is not None:
                 ranking_usage["ranking_cache_hits"] += 1
-                _apply_ranking(scene, cached)
+                _apply_ranking(
+                    scene, cached, getattr(ranking_config, "min_selection_score", 0)
+                )
             else:
                 ranking_usage["ranking_cache_misses"] += 1
                 prepared_misses.append((scene, prepared))
         budget = (
             ranking_config.max_remote_scene_requests_per_task
-            if ranking_config is not None
+            if ranking_enabled and ranking_config is not None
             else 0
         )
         selected_positions = (
@@ -1006,7 +1017,9 @@ def create_scene_selections(
                 )
                 ranking_usage["vlm_requests_started"] += int(attempts > 0)
                 ranking_usage["vlm_attempts_started"] += attempts
-                _apply_ranking(scene, response)
+                _apply_ranking(
+                    scene, response, getattr(ranking_config, "min_selection_score", 0)
+                )
                 try:
                     scene_ranking_cache.store(prepared.cache_key, response)
                 except (OSError, ValueError):
@@ -1035,8 +1048,12 @@ def create_scene_selections(
             else SELECTION_POLICY_VERSION
         ),
         "ranking": {
-            "provider": scene_ranking.PROVIDER if ranking_enabled else None,
-            "model": scene_ranking.MODEL if ranking_enabled else None,
+            "provider": getattr(ranking_config, "provider", scene_ranking.PROVIDER)
+            if ranking_enabled and ranking_config is not None
+            else None,
+            "model": getattr(ranking_config, "model", scene_ranking.MODEL)
+            if ranking_enabled and ranking_config is not None
+            else None,
             "prompt_version": scene_ranking.PROMPT_VERSION if ranking_enabled else None,
             "response_schema_version": scene_ranking.RESPONSE_SCHEMA_VERSION
             if ranking_enabled

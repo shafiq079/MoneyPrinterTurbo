@@ -88,6 +88,16 @@ LLM_PROVIDER_REGISTRY = (
         default_base_url="https://api.openai.com/v1",
     ),
     LLMProviderSpec(
+        "agentrouter",
+        "AgentRouter (Claude)",
+        adapter="anthropic_messages",
+        api_key_url="https://agentrouter.org/",
+        # Claude model aliases can differ, so the model remains explicit. The
+        # documented root URL is normalized to /v1/messages by the adapter.
+        default_model="",
+        default_base_url="https://co.agentrouter.org",
+    ),
+    LLMProviderSpec(
         "gemini",
         "Google Gemini",
         adapter="gemini",

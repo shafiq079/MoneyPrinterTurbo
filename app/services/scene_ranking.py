@@ -1,4 +1,4 @@
-"""Deterministic poster contact sheets and bounded NVIDIA hosted ranking."""
+"""Deterministic poster contact sheets and bounded configurable VLM ranking."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from io import BytesIO
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
-from app.services import scene_ranking_cache
+from app.services import agentrouter, scene_ranking_cache
 
 ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
 PROVIDER = "nvidia_hosted"
@@ -68,6 +68,8 @@ class PreparedRanking:
     request: dict
     request_bytes: bytes
     cache_key: str
+    provider: str
+    endpoint: str
 
 
 def labels(count: int) -> tuple[str, ...]:
@@ -104,8 +106,30 @@ def _prompt(
     )
 
 
-def _request(model: str, prompt: str, jpeg: bytes) -> dict:
+def _request(model: str, prompt: str, jpeg: bytes, provider: str = PROVIDER) -> dict:
     url = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
+    if provider == "agentrouter_claude":
+        return {
+            "model": model,
+            "max_tokens": MAX_TOKENS,
+            "temperature": TEMPERATURE,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": base64.b64encode(jpeg).decode("ascii"),
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
     return {
         "model": model,
         "messages": [
@@ -195,6 +219,7 @@ def prepare(
     provider: str,
     model: str,
     video_aspect: str,
+    base_url: str | None = None,
 ) -> PreparedRanking:
     candidate_count = len(scene["candidates"])
     candidate_labels = labels(candidate_count)
@@ -212,16 +237,22 @@ def prepare(
     prompt = _prompt(scene["scene_index"], scene["text"], scene["queries"], mapping)
     for width, height, quality in PROFILES:
         jpeg = _sheet(preview_bytes, width, height, quality)
-        request = _request(model, prompt, jpeg)
+        request = _request(model, prompt, jpeg, provider)
         raw = json.dumps(
             request, ensure_ascii=False, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
         if len(jpeg) <= MAX_JPEG_BYTES and len(raw) <= MAX_REQUEST_BYTES:
             sheet_digest = hashlib.sha256(jpeg).hexdigest()
+            endpoint_base = base_url or ENDPOINT.rsplit("/chat/completions", 1)[0]
+            endpoint = (
+                agentrouter.anthropic_messages_url(endpoint_base)
+                if provider == "agentrouter_claude"
+                else f"{endpoint_base.rstrip('/')}/chat/completions"
+            )
             identity_payload = {
                 "cache_version": scene_ranking_cache.CACHE_VERSION,
                 "provider": provider,
-                "endpoint": ENDPOINT,
+                "endpoint": endpoint,
                 "model": model,
                 "temperature": TEMPERATURE,
                 "seed": SEED,
@@ -263,6 +294,8 @@ def prepare(
                 request,
                 raw,
                 scene_ranking_cache.identity(identity_payload),
+                provider,
+                endpoint,
             )
     raise RankingError("ranking_derivative_too_large")
 
@@ -365,11 +398,19 @@ def request_remote(
             try:
                 attempts += 1
                 response = client.post(
-                    ENDPOINT,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
+                    prepared.endpoint,
+                    headers=(
+                        {
+                            "Authorization": f"Bearer {api_key}",
+                            "anthropic-version": "2023-06-01",
+                            "Content-Type": "application/json",
+                        }
+                        if prepared.provider == "agentrouter_claude"
+                        else {
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        }
+                    ),
                     data=prepared.request_bytes,
                     stream=True,
                     timeout=(
@@ -389,6 +430,16 @@ def request_remote(
                         ValueError(value)
                     ),
                 )
+                if prepared.provider == "agentrouter_claude":
+                    blocks = envelope.get("content") if type(envelope) is dict else None
+                    if type(blocks) is not list:
+                        raise RankingError("vlm_response_invalid")
+                    content = "".join(
+                        block.get("text", "")
+                        for block in blocks
+                        if type(block) is dict and block.get("type") == "text"
+                    )
+                    return parse_content(content, scene_index, prepared.labels), attempts
                 choices = envelope.get("choices") if type(envelope) is dict else None
                 if (
                     type(choices) is not list

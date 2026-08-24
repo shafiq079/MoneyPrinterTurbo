@@ -276,6 +276,7 @@
     "Video Encoder": "Codificador de vídeo",
     "Default Video Encoder": "Predeterminado (recomendado)",
     "Video Encoder Help": "Opción avanzada. Predeterminado sigue la política estable de la aplicación, actualmente libx264. Si un codificador de hardware no está disponible, la aplicación vuelve automáticamente a libx264.",
-    "Disabled": "Disabled"
+    "Disabled": "Disabled",
+    "llm_provider_label.agentrouter": "AgentRouter (Claude)"
   }
 }

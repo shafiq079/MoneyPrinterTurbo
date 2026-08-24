@@ -553,7 +553,7 @@ def test_failed_remote_request_usage_is_exact(
     "invalid_setting",
     [
         {"provider": "unsupported"},
-        {"model": "unsupported"},
+        {"model": ""},
         {"api_key": "malformed\nvalue"},
     ],
 )
@@ -651,6 +651,35 @@ def test_mixed_safety_and_all_tie_breaks():
     assert [row["local_order"] for row in candidates] == [3, 1, 2, None]
     assert candidates[3]["safety_excluded"] is True
     assert scene["selected_candidate_id"] == "pexels:b"
+
+
+def test_below_minimum_score_uses_existing_deterministic_fallback():
+    source = {
+        "candidate_id": "pexels:first",
+        "provider": "pexels",
+        "provider_video_id": "first",
+        "provider_page_url": "https://example.invalid/first",
+        "video_url": "https://example.invalid/first.mp4",
+        "provider_rank": 1,
+    }
+    scene = {
+        "candidates": [{
+            "candidate_id": source["candidate_id"], "provider_rank": 1,
+            "manifest_position": 0, "local_order": 1,
+            "preview_sha256": "0" * 64, "_source": source,
+        }],
+        "selected_candidate": source.copy(),
+        "selected_candidate_id": source["candidate_id"],
+        "warnings": [],
+    }
+    response = {"assessments": [{
+        "label": "C01", "relevance": 20, "visual_quality": 30,
+        "mismatch": 70, "unsafe": False,
+    }]}
+    scene_selection._apply_ranking(scene, response, min_selection_score=60)
+    assert scene["status"] == "provider_rank_fallback"
+    assert scene["fallback_reason"] == "ranking_score_below_threshold"
+    assert scene["selected_candidate_id"] == "pexels:first"
 
 
 def test_missing_key_cache_miss_falls_back_without_request(artifacts):

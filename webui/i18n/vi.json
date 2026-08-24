@@ -276,6 +276,7 @@
     "Video Encoder": "Bộ Mã Hóa Video",
     "Default Video Encoder": "Mặc định (Khuyên dùng)",
     "Video Encoder Help": "Tùy chọn nâng cao. Mặc định tuân theo chính sách mã hóa ổn định của ứng dụng, hiện là libx264. Nếu bộ mã hóa phần cứng không khả dụng, ứng dụng tự động chuyển về libx264.",
-    "Disabled": "Disabled"
+    "Disabled": "Disabled",
+    "llm_provider_label.agentrouter": "AgentRouter (Claude)"
   }
 }

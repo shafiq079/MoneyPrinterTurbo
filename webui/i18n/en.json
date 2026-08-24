@@ -303,6 +303,8 @@
     "llm_provider_tips.minimax": "##### MiniMax Configuration\n- **API Key**: create one on the [China platform](https://platform.minimaxi.com/) or [international platform](https://platform.minimax.io/)\n- **Base Url**: use `https://api.minimaxi.com/v1` for China or `{default_base_url}` for international access (default)\n- **Model Name**: defaults to `{default_model}`; you can also enter another model ID available to your account\n\nMake sure the API Key and Base Url belong to the same platform, or authentication may fail.",
     "llm_provider_tips.pollinations": "##### Pollinations AI Configuration\n- **API Key**: create one on [Pollinations]({api_key_url})\n- **Base Url**: defaults to `{default_base_url}`\n- **Model Name**: defaults to `{default_model}`; you can also enter another model ID from the [model catalog](https://gen.pollinations.ai/v1/models) that supports Chat Completions",
     "llm_provider_tips.litellm": "##### LiteLLM Configuration\n- **API Key**: not entered here; configure the target Provider key through environment variables\n- **Base Url**: not required\n- **Model Name**: defaults to `{default_model}`; use the `provider/model` format and see the [Provider list](https://docs.litellm.ai/docs/providers)",
-    "Disabled": "Disabled"
+    "Disabled": "Disabled",
+    "llm_provider_label.agentrouter": "AgentRouter (Claude)",
+    "llm_provider_tips.agentrouter": "##### AgentRouter Claude Configuration\n- **API Key**: create one at [AgentRouter]({api_key_url})\n- **Base Url**: required; enter your AgentRouter Anthropic Messages API base URL\n- **Model Name**: required; enter the Claude model ID enabled for your AgentRouter account"
   }
 }

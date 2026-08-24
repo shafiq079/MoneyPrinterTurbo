@@ -1407,6 +1407,22 @@ def _run_pipeline(
                     scene_timeline.NarrationScene.model_validate(item)
                     for item in timeline_data
                 ]
+                candidates_per_scene = config.app.get(
+                    "scene_candidates_per_scene",
+                    scene_candidate.DEFAULT_PIPELINE_CANDIDATES_PER_SCENE,
+                )
+                if (
+                    type(candidates_per_scene) is not int
+                    or not 1
+                    <= candidates_per_scene
+                    <= scene_candidate.MAX_CANDIDATES_PER_SCENE
+                ):
+                    logger.warning(
+                        "invalid scene_candidates_per_scene; using the default"
+                    )
+                    candidates_per_scene = (
+                        scene_candidate.DEFAULT_PIPELINE_CANDIDATES_PER_SCENE
+                    )
                 scene_candidates_path = scene_candidate.retrieve_scene_candidates(
                     task_dir=utils.task_dir(task_id),
                     video_subject=params.video_subject,
@@ -1414,11 +1430,13 @@ def _run_pipeline(
                     source=params.video_source,
                     video_aspect=params.video_aspect,
                     minimum_duration=params.video_clip_duration,
+                    candidates_per_scene=candidates_per_scene,
                 )
                 if scene_candidates_path and os.path.isfile(scene_candidates_path):
                     try:
                         scene_previews_path = scene_preview.prepare_scene_previews(
-                            scene_candidates_path
+                            scene_candidates_path,
+                            candidates_per_scene=candidates_per_scene,
                         )
                         if scene_previews_path and os.path.isfile(
                             scene_previews_path

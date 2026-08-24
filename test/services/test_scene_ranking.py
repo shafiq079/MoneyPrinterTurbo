@@ -181,6 +181,24 @@ def test_exact_request_and_scoring_example():
     assert item.score == 8600
 
 
+def test_agentrouter_uses_anthropic_image_message_and_configured_endpoint():
+    prepared = scene_ranking.prepare(
+        _scene(1),
+        [_jpeg()],
+        "agentrouter_claude",
+        "configured-model-alias",
+        "16:9",
+        "https://co.agentrouter.org",
+    )
+    assert prepared.endpoint == "https://co.agentrouter.org/v1/messages"
+    assert prepared.provider == "agentrouter_claude"
+    assert prepared.request["model"] == "configured-model-alias"
+    content = prepared.request["messages"][0]["content"]
+    assert content[0]["type"] == "text"
+    assert content[1]["type"] == "image"
+    assert content[1]["source"]["media_type"] == "image/jpeg"
+
+
 def test_parse_content_accepts_raw_json_and_outer_whitespace():
     expected = _valid(("C01",))
     content = json.dumps(expected)
@@ -335,7 +353,46 @@ def test_mocked_request_retry_and_envelope_without_secret_in_body():
     assert attempts == 2
     assert b"test-key" not in prepared.request_bytes
     assert session.calls[0][1]["headers"]["Authorization"] == "Bearer test-key"
+    assert "x-api-key" not in session.calls[0][1]["headers"]
     assert all(call[1]["stream"] is True for call in session.calls)
+
+
+def test_agentrouter_request_uses_bearer_auth_and_anthropic_response():
+    prepared = scene_ranking.prepare(
+        _scene(1),
+        [_jpeg()],
+        "agentrouter_claude",
+        "configured-model-alias",
+        "16:9",
+        "https://co.agentrouter.org",
+    )
+    expected = _valid(prepared.labels)
+    session = Session(
+        [Response(200, {"content": [{"type": "text", "text": json.dumps(expected)}]})]
+    )
+    cfg = SimpleNamespace(
+        max_attempts_per_scene=1, connect_timeout_seconds=10, read_timeout_seconds=45
+    )
+
+    result, attempts = scene_ranking.request_remote(
+        prepared,
+        1,
+        "test-key",
+        cfg,
+        session=session,
+        monotonic=lambda: 1.0,
+        sleep=lambda _: None,
+        deadline=100,
+    )
+
+    headers = session.calls[0][1]["headers"]
+    assert result == expected
+    assert attempts == 1
+    assert session.calls[0][0][0] == "https://co.agentrouter.org/v1/messages"
+    assert headers["Authorization"] == "Bearer test-key"
+    assert headers["anthropic-version"] == "2023-06-01"
+    assert headers["Content-Type"] == "application/json"
+    assert "x-api-key" not in headers
 
 
 def test_request_remote_accepts_nemotron_style_fenced_response():

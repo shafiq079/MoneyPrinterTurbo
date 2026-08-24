@@ -14,6 +14,7 @@ from app.services import llm, material, material_cache
 from app.services.scene_timeline import NarrationScene
 
 DEFAULT_CANDIDATES_PER_SCENE = 6
+DEFAULT_PIPELINE_CANDIDATES_PER_SCENE = 10
 MAX_CANDIDATES_PER_SCENE = 12
 DEFAULT_PROVIDER_SEARCH_BUDGET = 20
 MAX_PROVIDER_SEARCH_BUDGET = 60

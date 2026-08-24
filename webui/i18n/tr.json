@@ -276,6 +276,7 @@
     "Video Encoder": "Video Kodlayıcı",
     "Default Video Encoder": "Varsayılan (Önerilen)",
     "Video Encoder Help": "Gelişmiş seçenek. Varsayılan, uygulamanın kararlı kodlayıcı politikasını izler; şu anda libx264 kullanılır. Donanım kodlayıcı kullanılamıyorsa uygulama otomatik olarak libx264'e döner.",
-    "Disabled": "Disabled"
+    "Disabled": "Disabled",
+    "llm_provider_label.agentrouter": "AgentRouter (Claude)"
   }
 }
