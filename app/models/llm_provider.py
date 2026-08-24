@@ -88,6 +88,13 @@ LLM_PROVIDER_REGISTRY = (
         default_base_url="https://api.openai.com/v1",
     ),
     LLMProviderSpec(
+        "agentrouter",
+        "AgentRouter",
+        api_key_url="https://co.agentrouter.org/portal/guide",
+        default_model="",
+        default_base_url="https://co.agentrouter.org/v1",
+    ),
+    LLMProviderSpec(
         "gemini",
         "Google Gemini",
         adapter="gemini",
